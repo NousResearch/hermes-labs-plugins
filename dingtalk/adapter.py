@@ -191,8 +191,8 @@ def ensure_dingtalk_deps() -> bool:
     if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
         return True
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("platform.dingtalk", prompt=False)
+        from pm import ensure_import as _lazy_ensure
+        _lazy_ensure("dingtalk")
     except Exception:
         return False
     try:
