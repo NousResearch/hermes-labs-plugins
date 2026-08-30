@@ -596,7 +596,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         # Seed agent identity from SOUL.md in background
         soul_path = hermes_home_path / "SOUL.md"
         if soul_path.exists():
-            soul_content = soul_path.read_text(encoding="utf-8", errors="replace").strip()
+            soul_content = soul_path.read_text(encoding="utf-8-sig", errors="replace").strip()
             if soul_content:
                 threading.Thread(
                     target=self._seed_soul,
