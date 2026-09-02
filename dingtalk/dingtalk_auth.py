@@ -1,15 +1,4 @@
-"""
-DingTalk Device Flow authorization.
-
-Implements the same 3-step registration flow as dingtalk-openclaw-connector:
-  1. POST /app/registration/init   → get nonce
-  2. POST /app/registration/begin  → get device_code + verification_uri_complete
-  3. POST /app/registration/poll   → poll until SUCCESS → get client_id + client_secret
-
-The verification_uri_complete is rendered as a QR code in the terminal so the
-user can scan it with DingTalk to authorize, yielding AppKey + AppSecret
-automatically.
-"""
+"""DingTalk Device Flow authorization."""
 
 from __future__ import annotations
 
@@ -58,11 +47,7 @@ def _api_post(path: str, payload: dict) -> dict:
 # ── Core flow ──────────────────────────────────────────────────────────────
 
 def begin_registration() -> dict:
-    """Start a device-flow registration.
-
-    Returns a dict with keys:
-        device_code, verification_uri_complete, expires_in, interval
-    """
+    """Start a device-flow registration."""
     # Step 1: init → nonce
     init_data = _api_post("/app/registration/init", {"source": REGISTRATION_SOURCE})
     nonce = str(init_data.get("nonce", "")).strip()
@@ -87,20 +72,15 @@ def begin_registration() -> dict:
 
 
 def poll_registration(device_code: str) -> dict:
-    """Poll the registration status once.
-
-    Returns a dict with keys:  status, client_id?, client_secret?, fail_reason?
-    """
+    """Poll the registration status once."""
     data = _api_post("/app/registration/poll", {"device_code": device_code})
     status_raw = str(data.get("status", "")).strip().upper()
     if status_raw not in {"WAITING", "SUCCESS", "FAIL", "EXPIRED"}:
         status_raw = "UNKNOWN"
-    return {
-        "status": status_raw,
-        "client_id": str(data.get("client_id", "")).strip() or None,
-        "client_secret": str(data.get("client_secret", "")).strip() or None,
-        "fail_reason": str(data.get("fail_reason", "")).strip() or None,
-    }
+    result = {"status": status_raw}
+    for key in ("client_id", "client_secret", "fail_reason"):
+        result[key] = str(data.get(key, "")).strip() or None
+    return result
 
 
 def wait_for_registration_success(
@@ -109,10 +89,7 @@ def wait_for_registration_success(
     expires_in: int = 7200,
     on_waiting: Optional[callable] = None,
 ) -> Tuple[str, str]:
-    """Block until the registration succeeds or times out.
-
-    Returns (client_id, client_secret).
-    """
+    """Block until the registration succeeds or times out."""
     deadline = time.monotonic() + expires_in
     retry_window = 120  # 2 minutes for transient errors
     retry_start = 0.0
@@ -176,10 +153,7 @@ def _ensure_qrcode_installed() -> bool:
 
 
 def render_qr_to_terminal(url: str) -> bool:
-    """Render *url* as a compact QR code in the terminal.
-
-    Returns True if the QR code was printed, False if the library is missing.
-    """
+    """Render *url* as a compact QR code in the terminal."""
     try:
         import qrcode
     except ImportError:
@@ -199,25 +173,14 @@ def render_qr_to_terminal(url: str) -> bool:
     rows = len(matrix)
     lines: list[str] = []
 
-    TOP_HALF = "\u2580"      # ▀
-    BOTTOM_HALF = "\u2584"   # ▄
-    FULL_BLOCK = "\u2588"    # █
-    EMPTY = " "
+    # (top, bottom) -> ▀ ▄ █ or space
+    glyph = {(True, True): "\u2588", (True, False): "\u2580",
+             (False, True): "\u2584", (False, False): " "}
 
     for r in range(0, rows, 2):
-        line_chars: list[str] = []
-        for c in range(len(matrix[r])):
-            top = matrix[r][c]
-            bottom = matrix[r + 1][c] if r + 1 < rows else False
-            if top and bottom:
-                line_chars.append(FULL_BLOCK)
-            elif top:
-                line_chars.append(TOP_HALF)
-            elif bottom:
-                line_chars.append(BOTTOM_HALF)
-            else:
-                line_chars.append(EMPTY)
-        lines.append("    " + "".join(line_chars))
+        bottom_row = matrix[r + 1] if r + 1 < rows else [False] * len(matrix[r])
+        lines.append("    " + "".join(
+            glyph[(bool(top), bool(bottom))] for top, bottom in zip(matrix[r], bottom_row)))
 
     print("\n".join(lines))
     return True
@@ -226,11 +189,7 @@ def render_qr_to_terminal(url: str) -> bool:
 # ── High-level entry point for the setup wizard ───────────────────────────
 
 def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
-    """Run the interactive QR-code device-flow authorization.
-
-    Returns (client_id, client_secret) on success, or None if the user
-    cancelled or the flow failed.
-    """
+    """Run the interactive QR-code device-flow authorization."""
     from hermes_cli.setup import print_info, print_success, print_warning, print_error
 
     print()
