@@ -1,18 +1,15 @@
 """
 yuanbao_media.py — 元宝平台媒体处理模块
 
-提供 COS 上传、文件下载、TIM 媒体消息构建等功能。
-移植自 TypeScript 版 media.ts（yuanbao-openclaw-plugin），
-使用 httpx 替代 cos-nodejs-sdk-v5，避免引入额外 SDK 依赖。
+提供 COS 上传、文件下载、TIM 媒体消息构建等功能。移植自 TypeScript 版 media.ts
+（yuanbao-openclaw-plugin），使用 httpx 替代 cos-nodejs-sdk-v5。
 
 COS 上传流程：
-  1. 调用 genUploadInfo 获取临时凭证（tmpSecretId/tmpSecretKey/sessionToken）
-  2. 用临时凭证通过 HMAC-SHA1 签名构建 Authorization 头
+  1. genUploadInfo 获取临时凭证（tmpSecretId/tmpSecretKey/sessionToken）
+  2. 临时凭证 HMAC-SHA1 签名构建 Authorization 头
   3. HTTP PUT 上传到 COS
 
-TIM 消息体构建：
-  - buildImageMsgBody() → TIMImageElem
-  - buildFileMsgBody()  → TIMFileElem
+TIM 消息体：build_image_msg_body() → TIMImageElem，build_file_msg_body() → TIMFileElem
 """
 
 from __future__ import annotations
@@ -31,30 +28,19 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# ============ 常量 ============
-
 UPLOAD_INFO_PATH = "/api/resource/genUploadInfo"
 DEFAULT_API_DOMAIN = "yuanbao.tencent.com"
 DEFAULT_MAX_SIZE_MB = 50
 
-# COS 加速域名后缀（优先使用全球加速）
+# COS 加速域名（优先使用全球加速）
 COS_USE_ACCELERATE = True
-
-# ============ 类型映射 ============
 
 # MIME → image_format 数字（TIM 协议字段）
 _MIME_TO_IMAGE_FORMAT: dict[str, int] = {
-    "image/jpeg": 1,
-    "image/jpg": 1,
-    "image/gif": 2,
-    "image/png": 3,
-    "image/bmp": 4,
-    "image/webp": 255,
-    "image/heic": 255,
-    "image/tiff": 255,
+    "image/jpeg": 1, "image/jpg": 1, "image/gif": 2, "image/png": 3, "image/bmp": 4,
+    "image/webp": 255, "image/heic": 255, "image/tiff": 255,
 }
 
-# 文件扩展名 → MIME
 _EXT_TO_MIME: dict[str, str] = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -82,22 +68,17 @@ _EXT_TO_MIME: dict[str, str] = {
     ".ogg": "audio/ogg",
     ".webm": "video/webm",
 }
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff", ".ico"}
 
-
-# ============ 工具函数 ============
 
 def guess_mime_type(filename: str) -> str:
     """根据文件扩展名猜测 MIME 类型。"""
-    ext = os.path.splitext(filename)[-1].lower()
-    return _EXT_TO_MIME.get(ext, "application/octet-stream")
+    return _EXT_TO_MIME.get(os.path.splitext(filename)[-1].lower(), "application/octet-stream")
 
 
 def is_image(filename: str, mime_type: str = "") -> bool:
-    """判断是否为图片类型。"""
-    if mime_type.startswith("image/"):
-        return True
-    ext = os.path.splitext(filename)[-1].lower()
-    return ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff", ".ico"}
+    """判断是否为图片类型（MIME 前缀或扩展名）。"""
+    return mime_type.startswith("image/") or os.path.splitext(filename)[-1].lower() in _IMAGE_EXTS
 
 
 def get_image_format(mime_type: str) -> int:
@@ -106,39 +87,29 @@ def get_image_format(mime_type: str) -> int:
 
 
 def md5_hex(data: bytes) -> str:
-    """计算 MD5 十六进制摘要。"""
     return hashlib.md5(data).hexdigest()
 
 
 def generate_file_id() -> str:
-    """生成随机文件 ID（32 位 hex）。"""
+    """随机文件 ID（32 位 hex）。"""
     return secrets.token_hex(16)
-
 
 
 # ============ 图片尺寸解析（纯 Python，无需 Pillow） ============
 
 def parse_image_size(data: bytes) -> Optional[dict[str, int]]:
-    """
-    解析图片宽高（支持 JPEG/PNG/GIF/WebP），无需第三方依赖。
-    返回 {"width": w, "height": h} 或 None（无法识别）。
-    """
-    return (
-        _parse_png_size(data)
-        or _parse_jpeg_size(data)
-        or _parse_gif_size(data)
-        or _parse_webp_size(data)
-    )
+    """解析图片宽高（JPEG/PNG/GIF/WebP），返回 {"width", "height"} 或 None。"""
+    return _parse_png_size(data) or _parse_jpeg_size(data) or _parse_gif_size(data) or _parse_webp_size(data)
+
+
+def _wh(w: int, h: int) -> dict[str, int]:
+    return {"width": w, "height": h}
 
 
 def _parse_png_size(buf: bytes) -> Optional[dict[str, int]]:
-    if len(buf) < 24:
+    if len(buf) < 24 or buf[:4] != b"\x89PNG":
         return None
-    if buf[:4] != b"\x89PNG":
-        return None
-    w = struct.unpack(">I", buf[16:20])[0]
-    h = struct.unpack(">I", buf[20:24])[0]
-    return {"width": w, "height": h}
+    return _wh(*struct.unpack(">II", buf[16:24]))
 
 
 def _parse_jpeg_size(buf: bytes) -> Optional[dict[str, int]]:
@@ -149,11 +120,9 @@ def _parse_jpeg_size(buf: bytes) -> Optional[dict[str, int]]:
         if buf[i] != 0xFF:
             i += 1
             continue
-        marker = buf[i + 1]
-        if marker in {0xC0, 0xC2}:
-            h = struct.unpack(">H", buf[i + 5: i + 7])[0]
-            w = struct.unpack(">H", buf[i + 7: i + 9])[0]
-            return {"width": w, "height": h}
+        if buf[i + 1] in {0xC0, 0xC2}:  # SOF0 / SOF2: height then width
+            h, w = struct.unpack(">HH", buf[i + 5: i + 9])
+            return _wh(w, h)
         if i + 3 < len(buf):
             i += 2 + struct.unpack(">H", buf[i + 2: i + 4])[0]
         else:
@@ -162,64 +131,40 @@ def _parse_jpeg_size(buf: bytes) -> Optional[dict[str, int]]:
 
 
 def _parse_gif_size(buf: bytes) -> Optional[dict[str, int]]:
-    if len(buf) < 10:
+    if len(buf) < 10 or buf[:6].decode("ascii", errors="replace") not in {"GIF87a", "GIF89a"}:
         return None
-    sig = buf[:6].decode("ascii", errors="replace")
-    if sig not in {"GIF87a", "GIF89a"}:
-        return None
-    w = struct.unpack("<H", buf[6:8])[0]
-    h = struct.unpack("<H", buf[8:10])[0]
-    return {"width": w, "height": h}
+    return _wh(*struct.unpack("<HH", buf[6:10]))
 
 
 def _parse_webp_size(buf: bytes) -> Optional[dict[str, int]]:
-    if len(buf) < 16:
-        return None
-    if buf[:4] != b"RIFF" or buf[8:12] != b"WEBP":
+    if len(buf) < 16 or buf[:4] != b"RIFF" or buf[8:12] != b"WEBP":
         return None
     chunk = buf[12:16].decode("ascii", errors="replace")
     if chunk == "VP8 ":
-        if len(buf) >= 30 and buf[23] == 0x9D and buf[24] == 0x01 and buf[25] == 0x2A:
-            w = struct.unpack("<H", buf[26:28])[0] & 0x3FFF
-            h = struct.unpack("<H", buf[28:30])[0] & 0x3FFF
-            return {"width": w, "height": h}
+        if len(buf) >= 30 and buf[23:26] == b"\x9d\x01\x2a":
+            w, h = struct.unpack("<HH", buf[26:30])
+            return _wh(w & 0x3FFF, h & 0x3FFF)
     elif chunk == "VP8L":
         if len(buf) >= 25 and buf[20] == 0x2F:
             bits = struct.unpack("<I", buf[21:25])[0]
-            w = (bits & 0x3FFF) + 1
-            h = ((bits >> 14) & 0x3FFF) + 1
-            return {"width": w, "height": h}
-    elif chunk == "VP8X":
-        if len(buf) >= 30:
-            w = (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1
-            h = (buf[27] | (buf[28] << 8) | (buf[29] << 16)) + 1
-            return {"width": w, "height": h}
+            return _wh((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    elif chunk == "VP8X" and len(buf) >= 30:
+        return _wh(int.from_bytes(buf[24:27], "little") + 1, int.from_bytes(buf[27:30], "little") + 1)
     return None
 
 
 # ============ URL 下载 ============
 
-async def download_url(
-    url: str,
-    max_size_mb: int = DEFAULT_MAX_SIZE_MB,
-) -> tuple[bytes, str]:
-    """
-    下载 URL 内容，返回 (bytes, content_type)。
-
-    Args:
-        url:          HTTP(S) URL
-        max_size_mb:  最大允许大小（MB），超过则抛出异常
-
-    Returns:
-        (data_bytes, content_type_string)
+async def download_url(url: str, max_size_mb: int = DEFAULT_MAX_SIZE_MB) -> tuple[bytes, str]:
+    """下载 URL 内容，返回 (bytes, content_type)。
 
     Raises:
-        ValueError:  内容超过大小限制
+        ValueError: 内容超过 max_size_mb，或 URL / 重定向目标被 SSRF 防护拦截
         httpx.HTTPError: 网络/HTTP 错误
     """
-    # SSRF protection: yuanbao downloads model-supplied and inbound URLs
-    # server-side. Reject private/internal targets up front, and re-validate
-    # every redirect hop so a public URL can't 302 to http://169.254.169.254/.
+    # SSRF protection: yuanbao downloads model-supplied and inbound URLs server-side.
+    # Reject private/internal targets up front, and re-validate every redirect hop so a
+    # public URL can't 302 to http://169.254.169.254/.
     from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
     if not is_safe_url(url):
@@ -229,48 +174,45 @@ async def download_url(
         if response.is_redirect and response.next_request:
             redirect_url = str(response.next_request.url)
             if not is_safe_url(redirect_url):
-                raise ValueError(
-                    f"Blocked redirect to private/internal address: {redirect_url}"
-                )
+                raise ValueError(f"Blocked redirect to private/internal address: {redirect_url}")
 
     max_bytes = max_size_mb * 1024 * 1024
     async with create_ssrf_safe_async_client(
-        timeout=30.0,
-        follow_redirects=True,
-        event_hooks={"response": [_redirect_guard]},
+        timeout=30.0, follow_redirects=True, event_hooks={"response": [_redirect_guard]},
     ) as client:
-        # 先 HEAD 检查大小
+        # HEAD 预检大小；部分服务器不支持 HEAD，忽略
         try:
             head = await client.head(url)
             content_length = int(head.headers.get("content-length", 0) or 0)
             if content_length > 0 and content_length > max_bytes:
-                raise ValueError(
-                    f"文件过大: {content_length / 1024 / 1024:.1f} MB > {max_size_mb} MB"
-                )
+                raise ValueError(f"文件过大: {content_length / 1024 / 1024:.1f} MB > {max_size_mb} MB")
         except httpx.HTTPStatusError:
-            pass  # 部分服务器不支持 HEAD，忽略
+            pass
 
-        # GET 下载（流式读取，防止超限）
+        # 流式 GET，防止超限
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
-
             content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-
             chunks: list[bytes] = []
             downloaded = 0
             async for chunk in resp.aiter_bytes(65536):
                 downloaded += len(chunk)
                 if downloaded > max_bytes:
-                    raise ValueError(
-                        f"文件过大: 已超过 {max_size_mb} MB 限制"
-                    )
+                    raise ValueError(f"文件过大: 已超过 {max_size_mb} MB 限制")
                 chunks.append(chunk)
-
-        data = b"".join(chunks)
-        return data, content_type
+        return b"".join(chunks), content_type
 
 
 # ============ COS 鉴权（HMAC-SHA1） ============
+
+def _hmac_sha1_hex(key: str, msg: str) -> str:
+    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha1).hexdigest()
+
+
+def _sorted_kv(d: dict[str, str]) -> list[tuple[str, str]]:
+    """签名用 (小写 key, URL-encoded value) 按字典序排列"""
+    return sorted((k.lower(), urllib.parse.quote(str(v), safe="")) for k, v in d.items())
+
 
 def _cos_sign(
     method: str,
@@ -282,74 +224,39 @@ def _cos_sign(
     start_time: Optional[int] = None,
     expire_seconds: int = 3600,
 ) -> str:
-    """
-    构建 COS 请求签名（q-sign-algorithm=sha1 方案）。
-    参考：https://cloud.tencent.com/document/product/436/7778
+    """构建 COS 请求签名（q-sign-algorithm=sha1；https://cloud.tencent.com/document/product/436/7778）。
 
     Args:
-        method:         HTTP 方法（小写，如 "put"）
-        path:           URL 路径（URL encode 后的小写）
-        params:         URL 查询参数 dict（用于签名）
-        headers:        参与签名的请求头 dict（key 需小写）
-        secret_id:      临时 SecretId（tmpSecretId）
-        secret_key:     临时 SecretKey（tmpSecretKey）
-        start_time:     签名起始 Unix 时间戳（默认 now）
-        expire_seconds: 签名有效期（秒，默认 3600）
+        method / path: HTTP 方法（小写）与 URL-encoded 路径
+        params / headers: 参与签名的查询参数与请求头（key 会被小写）
+        secret_id / secret_key: 临时 tmpSecretId / tmpSecretKey
+        start_time: 签名起始 Unix 时间戳（默认 now）；expire_seconds: 有效期（秒）
 
     Returns:
-        Authorization header 值（完整字符串）
+        Authorization header 值
     """
     now = int(time.time())
     q_sign_time = f"{start_time or now};{(start_time or now) + expire_seconds}"
-
-    # Step 1: SignKey = HMAC-SHA1(SecretKey, q-sign-time)
-    sign_key = hmac.new(
-        secret_key.encode("utf-8"),
-        q_sign_time.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-
-    # Step 2: HttpString
-    # 参数和头部需按字典序排列，key 小写
-    sorted_params = sorted((k.lower(), urllib.parse.quote(str(v), safe="") ) for k, v in params.items())
-    sorted_headers = sorted((k.lower(), urllib.parse.quote(str(v), safe="") ) for k, v in headers.items())
-
-    url_param_list = ";".join(k for k, _ in sorted_params)
-    url_params = "&".join(f"{k}={v}" for k, v in sorted_params)
-    header_list = ";".join(k for k, _ in sorted_headers)
-    header_str = "&".join(f"{k}={v}" for k, v in sorted_headers)
-
+    # SignKey = HMAC-SHA1(SecretKey, q-sign-time)
+    sign_key = _hmac_sha1_hex(secret_key, q_sign_time)
+    sorted_params = _sorted_kv(params)
+    sorted_headers = _sorted_kv(headers)
     http_string = "\n".join([
         method.lower(),
         path,
-        url_params,
-        header_str,
+        "&".join(f"{k}={v}" for k, v in sorted_params),
+        "&".join(f"{k}={v}" for k, v in sorted_headers),
         "",
     ])
-
-    # Step 3: StringToSign = sha1 hash of HttpString
-    sha1_of_http = hashlib.sha1(http_string.encode("utf-8")).hexdigest()
-    string_to_sign = "\n".join([
-        "sha1",
-        q_sign_time,
-        sha1_of_http,
-        "",
-    ])
-
-    # Step 4: Signature = HMAC-SHA1(SignKey, StringToSign)
-    signature = hmac.new(
-        sign_key.encode("utf-8"),
-        string_to_sign.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-
+    string_to_sign = "\n".join(["sha1", q_sign_time, hashlib.sha1(http_string.encode("utf-8")).hexdigest(), ""])
+    signature = _hmac_sha1_hex(sign_key, string_to_sign)
     return (
         f"q-sign-algorithm=sha1"
         f"&q-ak={secret_id}"
         f"&q-sign-time={q_sign_time}"
         f"&q-key-time={q_sign_time}"
-        f"&q-header-list={header_list}"
-        f"&q-url-param-list={url_param_list}"
+        f"&q-header-list={';'.join(k for k, _ in sorted_headers)}"
+        f"&q-url-param-list={';'.join(k for k, _ in sorted_params)}"
         f"&q-signature={signature}"
     )
 
@@ -365,52 +272,26 @@ async def get_cos_credentials(
     bot_id: str = "",
     route_env: str = "",
 ) -> dict:
-    """
-    调用 genUploadInfo 接口获取 COS 临时密钥及上传配置。
+    """调用 genUploadInfo 获取 COS 临时密钥及上传配置。
 
     Args:
-        app_key:        应用 Key（用于 X-ID 头）
-        api_domain:     API 域名（如 https://bot.yuanbao.tencent.com）
-        token:          当前有效的签票 token（X-Token 头）
-        filename:       待上传的文件名（含扩展名）
-        file_id:        客户端生成的唯一文件 ID（不传则自动生成）
-        bot_id:         Bot 账号 ID（用于 X-ID 头）
+        app_key / bot_id: X-ID 头（bot_id 优先）; api_domain: 如 https://bot.yuanbao.tencent.com
+        token: 当前有效签票 token（X-Token 头）; file_id: 不传则自动生成
 
     Returns:
-        COS 上传配置 dict，包含以下字段：
-            bucketName         (str)  — COS Bucket 名称
-            region             (str)  — COS 地域
-            location           (str)  — 上传 Key（对象路径）
-            encryptTmpSecretId (str)  — 临时 SecretId
-            encryptTmpSecretKey(str)  — 临时 SecretKey
-            encryptToken       (str)  — SessionToken
-            startTime          (int)  — 凭证起始时间戳（Unix）
-            expiredTime        (int)  — 凭证过期时间戳（Unix）
-            resourceUrl        (str)  — 上传后的公网访问 URL
-            resourceID         (str)  — 资源 ID（可选）
+        接口 data dict：bucketName, region, location (COS key), encryptTmpSecretId,
+        encryptTmpSecretKey, encryptToken, startTime, expiredTime, resourceUrl, resourceID(可选)
 
     Raises:
-        RuntimeError: 接口返回非 0 code 或字段缺失
+        RuntimeError: 接口返回非 0 code 或 bucketName/location 缺失
     """
     if file_id is None:
         file_id = generate_file_id()
-
     upload_url = f"{api_domain.rstrip('/')}{UPLOAD_INFO_PATH}"
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Token": token,
-        "X-ID": bot_id or app_key,
-        "X-Source": "web",
-    }
+    headers = {"Content-Type": "application/json", "X-Token": token, "X-ID": bot_id or app_key, "X-Source": "web"}
     if route_env:
         headers["X-Route-Env"] = route_env
-    body = {
-        "fileName": filename,
-        "fileId": file_id,
-        "docFrom": "localDoc",
-        "docOpenId": "",
-    }
+    body = {"fileName": filename, "fileId": file_id, "docFrom": "localDoc", "docOpenId": ""}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(upload_url, json=body, headers=headers)
@@ -419,18 +300,11 @@ async def get_cos_credentials(
 
     code = result.get("code")
     if code != 0 and code is not None:
-        raise RuntimeError(
-            f"genUploadInfo 失败: code={code}, msg={result.get('msg', '')}"
-        )
-
+        raise RuntimeError(f"genUploadInfo 失败: code={code}, msg={result.get('msg', '')}")
     data = result.get("data") or result
-    required_fields = ["bucketName", "location"]
-    missing = [f for f in required_fields if not data.get(f)]
+    missing = [f for f in ["bucketName", "location"] if not data.get(f)]
     if missing:
-        raise RuntimeError(
-            f"genUploadInfo 返回字段不完整: 缺少字段 {missing}"
-        )
-
+        raise RuntimeError(f"genUploadInfo 返回字段不完整: 缺少字段 {missing}")
     return data
 
 
@@ -442,36 +316,19 @@ async def upload_to_cos(
     bucket: str,
     region: str,
 ) -> dict:
-    """
-    通过 httpx PUT 请求将文件上传到 COS。
-    使用临时凭证（tmpSecretId/tmpSecretKey/sessionToken）构建 HMAC-SHA1 签名。
+    """用临时凭证 HMAC-SHA1 签名，httpx PUT 上传到 COS。
 
     Args:
-        file_bytes:   文件二进制内容
-        filename:     文件名（用于辅助计算 MIME、UUID）
-        content_type: MIME 类型（如 "image/jpeg"）
-        credentials:  get_cos_credentials() 返回的 dict，包含：
-                        encryptTmpSecretId  → tmpSecretId
-                        encryptTmpSecretKey → tmpSecretKey
-                        encryptToken        → sessionToken
-                        location            → COS key（对象路径）
-                        resourceUrl         → 上传后公网 URL
-                        startTime           → 凭证起始时间（Unix）
-                        expiredTime         → 凭证过期时间（Unix）
-        bucket:       COS Bucket 名称（如 chatbot-1234567890）
-        region:       COS 地域（如 ap-guangzhou）
+        credentials: get_cos_credentials() 返回的 dict（encryptTmpSecretId/Key, encryptToken,
+                     location, resourceUrl, startTime, expiredTime）
+        bucket / region: 如 chatbot-1234567890 / ap-guangzhou
 
     Returns:
-        上传结果 dict，包含：
-            url       (str)           — COS 公网访问 URL
-            uuid      (str)           — 文件内容 MD5
-            size      (int)           — 文件大小（字节）
-            width     (int, optional) — 图片宽度（仅图片）
-            height    (int, optional) — 图片高度（仅图片）
+        {url, uuid (内容 MD5), size, width?, height? (仅图片)}
 
     Raises:
-        httpx.HTTPStatusError: COS 返回非 2xx 状态
-        RuntimeError:          credentials 字段缺失
+        httpx.HTTPStatusError: COS 返回非 2xx
+        RuntimeError: credentials 字段缺失
     """
     secret_id: str = credentials.get("encryptTmpSecretId", "")
     secret_key: str = credentials.get("encryptTmpSecretKey", "")
@@ -487,90 +344,45 @@ async def upload_to_cos(
             f"secretKey={bool(secret_key)}, location={bool(cos_key)}"
         )
 
-    # 构建 COS 上传 URL（优先使用全球加速域名）
-    if COS_USE_ACCELERATE:
-        cos_host = f"{bucket}.cos.accelerate.myqcloud.com"
-    else:
-        cos_host = f"{bucket}.cos.{region}.myqcloud.com"
+    cos_host = f"{bucket}.cos.accelerate.myqcloud.com" if COS_USE_ACCELERATE else f"{bucket}.cos.{region}.myqcloud.com"
+    encoded_key = urllib.parse.quote(cos_key, safe="/").lstrip("/")
+    cos_url = f"https://{cos_host}/{encoded_key}"
 
-    # URL encode cos_key（保留 /）
-    encoded_key = urllib.parse.quote(cos_key, safe="/")
-    cos_url = f"https://{cos_host}/{encoded_key.lstrip('/')}"
-
-    # 确定 Content-Type
     if not content_type or content_type == "application/octet-stream":
-        if is_image(filename):
-            content_type = guess_mime_type(filename)
-        else:
-            content_type = "application/octet-stream"
+        content_type = guess_mime_type(filename) if is_image(filename) else "application/octet-stream"
 
-    # 计算文件 MD5 + size
     file_uuid = md5_hex(file_bytes)
     file_size = len(file_bytes)
 
-    # 参与签名的请求头
-    sign_headers = {
-        "host": cos_host,
-        "content-type": content_type,
-        "x-cos-security-token": session_token,
-    }
-
-    # 计算签名有效期
     now = int(time.time())
-    sign_start = start_time if start_time else now
-    sign_expire = (expired_time - now) if expired_time and expired_time > now else 3600
-
     authorization = _cos_sign(
         method="put",
-        path=f"/{encoded_key.lstrip('/')}",
+        path=f"/{encoded_key}",
         params={},
-        headers=sign_headers,
+        headers={"host": cos_host, "content-type": content_type, "x-cos-security-token": session_token},
         secret_id=secret_id,
         secret_key=secret_key,
-        start_time=sign_start,
-        expire_seconds=sign_expire,
+        start_time=start_time if start_time else now,
+        expire_seconds=(expired_time - now) if expired_time and expired_time > now else 3600,
     )
+    put_headers = {"Authorization": authorization, "Content-Type": content_type, "x-cos-security-token": session_token}
 
-    put_headers = {
-        "Authorization": authorization,
-        "Content-Type": content_type,
-        "x-cos-security-token": session_token,
-    }
-
-    logger.info(
-        "COS PUT: bucket=%s region=%s key=%s size=%d mime=%s",
-        bucket, region, cos_key, file_size, content_type,
-    )
-
+    logger.info("COS PUT: bucket=%s region=%s key=%s size=%d mime=%s", bucket, region, cos_key, file_size, content_type)
     async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.put(
-            cos_url,
-            content=file_bytes,
-            headers=put_headers,
-        )
+        resp = await client.put(cos_url, content=file_bytes, headers=put_headers)
         resp.raise_for_status()
 
-    # 解析图片尺寸（仅图片类型）
-    result: dict[str, Any] = {
-        "url": resource_url or cos_url,
-        "uuid": file_uuid,
-        "size": file_size,
-    }
-
+    result: dict[str, Any] = {"url": resource_url or cos_url, "uuid": file_uuid, "size": file_size}
     if content_type.startswith("image/"):
         size_info = parse_image_size(file_bytes)
         if size_info:
             result["width"] = size_info["width"]
             result["height"] = size_info["height"]
-
-    logger.info(
-        "COS 上传成功: url=%s size=%d",
-        result["url"], file_size,
-    )
+    logger.info("COS 上传成功: url=%s size=%d", result["url"], file_size)
     return result
 
 
-# ============ TIM 媒体消息构建 ============
+# ============ TIM 媒体消息构建（https://cloud.tencent.com/document/product/269/2720） ============
 
 def build_image_msg_body(
     url: str,
@@ -581,85 +393,29 @@ def build_image_msg_body(
     height: int = 0,
     mime_type: str = "",
 ) -> list[dict]:
-    """
-    构建腾讯 IM TIMImageElem 消息体。
-    参考：https://cloud.tencent.com/document/product/269/2720
-
-    Args:
-        url:       图片公网访问 URL（COS resourceUrl）
-        uuid:      文件 UUID（MD5 或其他唯一标识）
-        filename:  文件名（uuid 为空时作为备用）
-        size:      文件大小（字节）
-        width:     图片宽度（像素）
-        height:    图片高度（像素）
-        mime_type: MIME 类型（用于确定 image_format）
-
-    Returns:
-        TIMImageElem 消息体列表（适合直接放入 msg_body）
-    """
-    _uuid = uuid or filename or _basename_from_url(url) or "image"
-    image_format = get_image_format(mime_type) if mime_type else 255
-
-    return [
-        {
-            "msg_type": "TIMImageElem",
-            "msg_content": {
-                "uuid": _uuid,
-                "image_format": image_format,
-                "image_info_array": [
-                    {
-                        "type": 1,       # 1 = 原图
-                        "size": size,
-                        "width": width,
-                        "height": height,
-                        "url": url,
-                    }
-                ],
-            },
-        }
-    ]
+    """构建 TIMImageElem 消息体（可直接放入 msg_body）。uuid 缺省依次退到 filename / URL basename / "image"。"""
+    return [{
+        "msg_type": "TIMImageElem",
+        "msg_content": {
+            "uuid": uuid or filename or _basename_from_url(url) or "image",
+            "image_format": get_image_format(mime_type) if mime_type else 255,
+            "image_info_array": [
+                {"type": 1, "size": size, "width": width, "height": height, "url": url},  # type 1 = 原图
+            ],
+        },
+    }]
 
 
-def build_file_msg_body(
-    url: str,
-    filename: str,
-    uuid: Optional[str] = None,
-    size: int = 0,
-) -> list[dict]:
-    """
-    构建腾讯 IM TIMFileElem 消息体。
-    参考：https://cloud.tencent.com/document/product/269/2720
+def build_file_msg_body(url: str, filename: str, uuid: Optional[str] = None, size: int = 0) -> list[dict]:
+    """构建 TIMFileElem 消息体（可直接放入 msg_body）。uuid 缺省使用 filename。"""
+    return [{
+        "msg_type": "TIMFileElem",
+        "msg_content": {"uuid": uuid or filename, "file_name": filename, "file_size": size, "url": url},
+    }]
 
-    Args:
-        url:      文件公网访问 URL（COS resourceUrl）
-        filename: 文件名（含扩展名）
-        uuid:     文件 UUID（MD5 或其他唯一标识，不传则使用 filename）
-        size:     文件大小（字节）
-
-    Returns:
-        TIMFileElem 消息体列表（适合直接放入 msg_body）
-    """
-    _uuid = uuid or filename
-
-    return [
-        {
-            "msg_type": "TIMFileElem",
-            "msg_content": {
-                "uuid": _uuid,
-                "file_name": filename,
-                "file_size": size,
-                "url": url,
-            },
-        }
-    ]
-
-
-# ============ 内部工具 ============
 
 def _basename_from_url(url: str) -> str:
-    """从 URL 提取文件名。"""
     try:
-        parsed = urllib.parse.urlparse(url)
-        return os.path.basename(parsed.path)
+        return os.path.basename(urllib.parse.urlparse(url).path)
     except Exception:
         return ""
