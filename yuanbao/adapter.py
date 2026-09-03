@@ -1497,7 +1497,7 @@ class MediaResolveMiddleware(InboundMiddleware):
         order-preserving, exception-isolated contract as :meth:`_resolve_ybres_refs`."""
         media_urls: List[str] = []
         media_types: List[str] = []
-        active: List[Tuple[str, str, str, str]] = []
+        active: List[Tuple[str, str, str, str]] = []  # (kind, filename, rid, url)
         for ref in media_refs:
             kind = str(ref.get("kind") or "").strip().lower()
             url = str(ref.get("url") or "").strip()
@@ -1506,54 +1506,43 @@ class MediaResolveMiddleware(InboundMiddleware):
             rid = ExtractContentMiddleware._parse_resource_id(url)
             if rid and cls._append_cached_resource(adapter, rid, media_urls, media_types):
                 continue
-            active.append((kind, url, str(ref.get("name") or "").strip(), rid or ""))
-        if not active:
-            return media_urls, media_types
-
-        async def _resolve_one(kind: str, url: str, filename: str, rid: str) -> Optional[Tuple[str, str]]:
-            return await cls._fetch_and_cache(
-                adapter, lambda: cls._resolve_download_url(adapter, url), kind, filename, rid,
-                fail_log=("[%s] inbound media resolve failed: kind=%s url=%s err=%s", (adapter.name, kind, url)),
-                log_tag=f"placeholder_url={url[:80]}",
+            active.append((kind, str(ref.get("name") or "").strip(), rid or "", url))
+        if active:
+            await cls._gather_resolve(
+                adapter, active, "media", media_urls, media_types,
+                get_url=lambda url: cls._resolve_download_url(adapter, url),
+                fail_fmt="[%s] inbound media resolve failed: kind=%s url=%s err=%s", fail_args=lambda kind, url: (kind, url),
+                crash_fmt="[%s] inbound media resolve crashed: kind=%s url=%s err=%s", crash_args=lambda kind, url: (kind, url[:80]),
+                log_tag=lambda url: f"placeholder_url={url[:80]}",
             )
-
-        def _crash_msg(item, result):
-            kind, url, _filename, _rid = item
-            return "[%s] inbound media resolve crashed: kind=%s url=%s err=%s", (adapter.name, kind, url[:80], result)
-        await cls._gather_resolve(adapter, active, _resolve_one, _crash_msg, "media", media_urls, media_types)
         return media_urls, media_types
 
     @classmethod
-    async def _fetch_and_cache(cls, adapter, get_url, kind: str, filename: str, rid: str, *, fail_log, log_tag: str) -> Optional[Tuple[str, str]]:
-        """``await get_url()`` for a fetchable URL (log *fail_log* + err and return None on failure), then download+cache."""
-        try:
-            fetch_url = await get_url()
-        except Exception as exc:
-            fmt, args = fail_log
-            logger.warning(fmt, *args, exc)
-            return None
-        return await cls._download_and_cache(
-            adapter, fetch_url=fetch_url, kind=kind, file_name=filename or None, log_tag=log_tag, resource_id=rid,
-        )
-
-    @staticmethod
-    async def _gather_resolve(adapter, active, resolve_one, crash_msg, scope, out_paths, out_mimes) -> None:
-        """Run *resolve_one(*item)* over *active* under bounded concurrency; append successes in
-        input order. ``return_exceptions=True`` isolates per-item failures; the batch summary line
-        keeps stable fields (concurrency vs elapsed_ms) for offline aggregation."""
+    async def _gather_resolve(cls, adapter, active, scope, out_paths, out_mimes, *,
+                              get_url, fail_fmt, fail_args, crash_fmt, crash_args, log_tag) -> None:
+        """Resolve ``(kind, filename, rid, key)`` items under bounded concurrency — ``await get_url(key)``
+        then download+cache — appending successes in input order. ``return_exceptions=True`` isolates
+        per-item failures; the batch summary line keeps stable fields (concurrency vs elapsed_ms) for
+        offline aggregation."""
         semaphore = asyncio.Semaphore(adapter.media_resolve_concurrency)
 
-        async def _guarded(item):
+        async def _one(kind: str, filename: str, rid: str, key: str) -> Optional[Tuple[str, str]]:
             async with semaphore:
-                return await resolve_one(*item)
+                try:
+                    fetch_url = await get_url(key)
+                except Exception as exc:
+                    logger.warning(fail_fmt, adapter.name, *fail_args(kind, key), exc)
+                    return None
+                return await cls._download_and_cache(
+                    adapter, fetch_url=fetch_url, kind=kind, file_name=filename or None, log_tag=log_tag(key), resource_id=rid,
+                )
         _t0 = time.monotonic()
-        results = await asyncio.gather(*(_guarded(item) for item in active), return_exceptions=True)
+        results = await asyncio.gather(*(_one(*item) for item in active), return_exceptions=True)
         _elapsed_ms = int((time.monotonic() - _t0) * 1000)
         _failed = 0
-        for item, result in zip(active, results):
+        for (kind, _filename, _rid, key), result in zip(active, results):
             if isinstance(result, BaseException):
-                fmt, args = crash_msg(item, result)
-                logger.warning(fmt, *args)
+                logger.warning(crash_fmt, adapter.name, *crash_args(kind, key), result)
             if result is None or isinstance(result, BaseException):
                 _failed += 1
             else:
@@ -1570,22 +1559,16 @@ class MediaResolveMiddleware(InboundMiddleware):
         input order preserved, per-rid failures isolated). Cache hits are served without a fetch."""
         media_paths: List[str] = []
         mimes: List[str] = []
-        active = [(rid, kind, filename) for rid, kind, filename in refs
+        active = [(kind, filename, rid, rid) for rid, kind, filename in refs
                   if kind in _RESOLVABLE_MEDIA_KINDS and not cls._append_cached_resource(adapter, rid, media_paths, mimes)]
-        if not active:
-            return media_paths, mimes
-
-        async def _resolve_one(rid: str, kind: str, filename: str) -> Optional[Tuple[str, str]]:
-            return await cls._fetch_and_cache(
-                adapter, lambda: cls._fetch_resource_url(adapter, rid), kind, filename, rid,
-                fail_log=("[%s] %s resolve failed: rid=%s kind=%s err=%s", (adapter.name, log_prefix, rid, kind)),
-                log_tag=f"{log_prefix} rid={rid}",
+        if active:
+            await cls._gather_resolve(
+                adapter, active, "ybres", media_paths, mimes,
+                get_url=lambda rid: cls._fetch_resource_url(adapter, rid),
+                fail_fmt="[%s] %s resolve failed: rid=%s kind=%s err=%s", fail_args=lambda kind, rid: (log_prefix, rid, kind),
+                crash_fmt="[%s] %s resolve crashed: rid=%s kind=%s err=%s", crash_args=lambda kind, rid: (log_prefix, rid, kind),
+                log_tag=lambda rid: f"{log_prefix} rid={rid}",
             )
-
-        def _crash_msg(item, result):
-            rid, kind, _filename = item
-            return "[%s] %s resolve crashed: rid=%s kind=%s err=%s", (adapter.name, log_prefix, rid, kind, result)
-        await cls._gather_resolve(adapter, active, _resolve_one, _crash_msg, "ybres", media_paths, mimes)
         return media_paths, mimes
 
     @classmethod
