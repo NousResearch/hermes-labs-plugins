@@ -241,12 +241,11 @@ class SignManager:
                         raise ValueError(f"Sign token response missing 'data' field: {result_data}")
                     logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
                     return data
-                if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
-                    logger.warning("Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
-                                   code, cls.RETRY_DELAY_S, attempt + 1, cls.MAX_RETRIES)
-                    await asyncio.sleep(cls.RETRY_DELAY_S)
-                    continue
-                raise RuntimeError(f"Sign token error: code={code}, msg={result_data.get('msg', '')}")
+                if code != cls.RETRYABLE_CODE or attempt >= cls.MAX_RETRIES:
+                    raise RuntimeError(f"Sign token error: code={code}, msg={result_data.get('msg', '')}")
+                logger.warning("Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
+                               code, cls.RETRY_DELAY_S, attempt + 1, cls.MAX_RETRIES)
+                await asyncio.sleep(cls.RETRY_DELAY_S)
         raise RuntimeError("Sign token failed: max retries exceeded")
 
     @classmethod
@@ -785,19 +784,23 @@ class AutoSetHomeMiddleware(InboundMiddleware):
             if ctx.chat_type == "dm":
                 adapter._auto_sethome_done = True  # DM seen — no further upgrades needed
             if _should_set:
-                try:
-                    from hermes_constants import get_hermes_home
-                    from hermes_cli.config import atomic_config_write, read_user_config_raw
-                    config_path = get_hermes_home() / "config.yaml"
-                    # Raw read: merged defaults must not be persisted to the user's file.
-                    user_config: dict = read_user_config_raw(config_path)
-                    user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
-                    atomic_config_write(config_path, user_config)
-                    os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
-                    logger.info("[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel", adapter.name, ctx.chat_id, ctx.chat_name)
-                except Exception as e:
-                    logger.warning("[%s] Auto-sethome failed: %s", adapter.name, e)
+                self._persist_home(adapter, ctx)
         await next_fn()
+
+    @staticmethod
+    def _persist_home(adapter, ctx: InboundContext) -> None:
+        try:
+            from hermes_constants import get_hermes_home
+            from hermes_cli.config import atomic_config_write, read_user_config_raw
+            config_path = get_hermes_home() / "config.yaml"
+            # Raw read: merged defaults must not be persisted to the user's file.
+            user_config: dict = read_user_config_raw(config_path)
+            user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
+            atomic_config_write(config_path, user_config)
+            os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
+            logger.info("[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel", adapter.name, ctx.chat_id, ctx.chat_name)
+        except Exception as e:
+            logger.warning("[%s] Auto-sethome failed: %s", adapter.name, e)
 
 
 def _iter_custom_elems(msg_body: list) -> Iterator[Tuple[Any, dict]]:
@@ -864,9 +867,7 @@ class ExtractContentMiddleware(InboundMiddleware):
             link = parsed.get("link") if isinstance(parsed, dict) else None
         except (json.JSONDecodeError, TypeError):
             link = None
-        if not link or not isinstance(link, str):
-            return None
-        return f"[link: {link} | visit link for full content]"
+        return f"[link: {link} | visit link for full content]" if link and isinstance(link, str) else None
 
     @staticmethod
     def _parse_resource_id(url: str) -> str:
@@ -884,13 +885,8 @@ class ExtractContentMiddleware(InboundMiddleware):
     def _pick_image_url(content: dict) -> str:
         """URL of the medium image (index 1), falling back to index 0, else ""."""
         arr = content.get("image_info_array")
-        if not isinstance(arr, list):
-            arr = []
-        image_info = None
-        if len(arr) > 1 and isinstance(arr[1], dict):
-            image_info = arr[1]
-        elif len(arr) > 0 and isinstance(arr[0], dict):
-            image_info = arr[0]
+        arr = arr if isinstance(arr, list) else []
+        image_info = arr[1] if len(arr) > 1 and isinstance(arr[1], dict) else arr[0] if arr and isinstance(arr[0], dict) else None
         return str((image_info or {}).get("url") or "").strip()
 
     @classmethod
@@ -1067,8 +1063,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
             logger.info("[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s", adapter.name, ctx.chat_id, ctx.from_account, matched_cmd)
             adapter._track_task(asyncio.create_task(
                 adapter.send(ctx.chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
-                name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
-            ))
+                name=f"yuanbao-owner-cmd-denial-{matched_cmd}"))
             return  # Stop pipeline
         if matched_cmd and is_owner and cmd_line:
             logger.info("[%s] Bot owner slash command: chat=%s from=%s cmd=%s", adapter.name, ctx.chat_id, ctx.from_account, matched_cmd)
@@ -1222,12 +1217,10 @@ class QuoteContextMiddleware(InboundMiddleware):
 
     def _extract_quote_context(self, cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
         """(quote_id, quote_text) from cloud_custom_data → MessageEvent.reply_to_*."""
-        if not cloud_custom_data:
-            return None, None
         try:
-            parsed = json.loads(cloud_custom_data)
+            parsed = json.loads(cloud_custom_data) if cloud_custom_data else None
         except (json.JSONDecodeError, TypeError):
-            return None, None
+            parsed = None
         quote = parsed.get("quote") if isinstance(parsed, dict) else None
         if not isinstance(quote, dict):
             return None, None
@@ -1321,30 +1314,26 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
             if not isinstance(msg, dict):
                 continue
             plain_text = msg.get("plainText", "")
-            msg_contents = msg.get("msgContent", []) or []
             refs: List[Dict[str, str]] = []
-            if not msg_contents:
-                rendered = plain_text
-            else:
-                parts: List[str] = []
-                for mc in msg_contents:
-                    if not isinstance(mc, dict):
-                        continue
-                    mc_type = mc.get("type", 0)  # EnumMsgContentType: 1 TEXT, 2 MULTIMEDIA, 3 nested FORWARD
-                    if mc_type == 1:
-                        parts.append(mc.get("text", ""))
-                    elif mc_type == 2:
-                        for media in mc.get("multimedia", []) or []:
-                            if isinstance(media, dict):
-                                marker, ref = cls._media_marker(media, plain_text)
-                                parts.append(marker)
-                                if ref is not None:
-                                    refs.append(ref)
-                    elif mc_type == 3:
-                        parts.append("[嵌套聊天记录]")
-                    elif plain_text:
-                        parts.append(plain_text)
-                rendered = "  ".join(p for p in parts if p) or plain_text
+            parts: List[str] = []
+            for mc in msg.get("msgContent", []) or []:
+                if not isinstance(mc, dict):
+                    continue
+                mc_type = mc.get("type", 0)  # EnumMsgContentType: 1 TEXT, 2 MULTIMEDIA, 3 nested FORWARD
+                if mc_type == 1:
+                    parts.append(mc.get("text", ""))
+                elif mc_type == 2:
+                    for media in mc.get("multimedia", []) or []:
+                        if isinstance(media, dict):
+                            marker, ref = cls._media_marker(media, plain_text)
+                            parts.append(marker)
+                            if ref is not None:
+                                refs.append(ref)
+                elif mc_type == 3:
+                    parts.append("[嵌套聊天记录]")
+                elif plain_text:
+                    parts.append(plain_text)
+            rendered = "  ".join(p for p in parts if p) or plain_text
             if len(rendered) > cls.FORWARD_MSG_TEXT_MAX_CHARS:
                 rendered = rendered[: cls.FORWARD_MSG_TEXT_MAX_CHARS] + "…(已截断)"
             yield msg.get("sender", ""), rendered, refs
@@ -1457,13 +1446,7 @@ class MediaResolveMiddleware(InboundMiddleware):
     async def _resolve_download_url(adapter, url: str) -> str:
         """Resolve a Yuanbao resource placeholder URL (``…/api/resource/download?resourceId=…``,
         which 401s on direct GET) to a fetchable URL via the business API; passthrough otherwise."""
-        try:
-            parsed = urllib.parse.urlparse(url)
-        except Exception:
-            return url
-        query = urllib.parse.parse_qs(parsed.query)
-        resource_ids = query.get("resourceId") or query.get("resourceid") or []
-        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        resource_id = ExtractContentMiddleware._parse_resource_id(url)
         if not resource_id:
             return url
         try:
@@ -1621,29 +1604,25 @@ class MediaResolveMiddleware(InboundMiddleware):
         except Exception as exc:
             logger.warning("[%s] Observed-media hydration setup failed: %s", adapter.name, exc)
             return [], []
-        if not history:
-            return [], []
         # Walk newest→oldest (matches within a message too) so the per-turn cap keeps the
         # *latest* refs; ``order`` is reversed back to chronological before resolving.
         order: List[Tuple[str, str, str]] = []  # (rid, kind, filename)
         seen: set = set()
-        for msg in reversed(history[-OBSERVED_MEDIA_BACKFILL_LOOKBACK:]):
+        for msg in reversed((history or [])[-OBSERVED_MEDIA_BACKFILL_LOOKBACK:]):
             content = msg.get("content")
             if not isinstance(content, str) or "|ybres:" not in content:
                 continue
             for rid, kind, filename in _iter_ybres_refs(reversed(list(_YB_RES_REF_RE.finditer(content)))):
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                order.append((rid, kind, filename))
+                if rid not in seen:
+                    seen.add(rid)
+                    order.append((rid, kind, filename))
                 if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
                     break
             if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
                 break
-        order.reverse()
         if not order:
             return [], []
-        return await cls._resolve_ybres_refs(adapter, order, log_prefix="observed-media")
+        return await cls._resolve_ybres_refs(adapter, order[::-1], log_prefix="observed-media")
 
     @classmethod
     async def _resolve_quote_media(cls, adapter, quote_media_refs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str]]:
@@ -2027,8 +2006,7 @@ class ConnectionManager:
                     continue
                 try:
                     msg_id = str(uuid.uuid4())
-                    pong_future: asyncio.Future = asyncio.get_running_loop().create_future()
-                    self._pending_pong = pong_future
+                    self._pending_pong = pong_future = asyncio.get_running_loop().create_future()
                     self._pending_acks[msg_id] = pong_future
                     await self._ws.send(encode_ping(msg_id))
                     logger.debug("[%s] PING sent (msg_id=%s)", adapter.name, msg_id)
@@ -2346,14 +2324,13 @@ class StickerHandler(MediaSendHandler):
             get_sticker_by_name, get_random_sticker, build_face_msg_body, build_sticker_msg_body,
         )
         sticker_name = kwargs.get("sticker_name")
-        face_index = kwargs.get("face_index")
         if sticker_name is not None:
             sticker = get_sticker_by_name(sticker_name)
             if sticker is None:
                 raise ValueError(f"Sticker not found: {sticker_name!r}")
             return build_sticker_msg_body(sticker)
-        if face_index is not None:
-            return build_face_msg_body(face_index=face_index)
+        if kwargs.get("face_index") is not None:
+            return build_face_msg_body(face_index=kwargs["face_index"])
         return build_sticker_msg_body(get_random_sticker())
 
 
