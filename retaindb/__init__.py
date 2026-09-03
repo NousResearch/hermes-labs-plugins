@@ -2,9 +2,8 @@
 
 Cross-session memory via the RetainDB cloud API: durable SQLite write-behind queue, semantic
 search + profile, context overlay, dialectic/agent self-model prefetch, shared file store tools.
-
-Config (env vars, or config.yaml ``memory.retaindb`` for the non-secret ones): RETAINDB_API_KEY (required),
-RETAINDB_BASE_URL (default https://api.retaindb.com), RETAINDB_PROJECT (optional; defaults to "default").
+Config: RETAINDB_API_KEY (required, scoped secret), RETAINDB_BASE_URL (default https://api.retaindb.com),
+RETAINDB_PROJECT (optional; defaults to "default"); the non-secret two also read config.yaml ``memory.retaindb``.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable
 from urllib.parse import quote
 
 from agent.memory_provider import MemoryProvider
@@ -35,19 +34,18 @@ _ASYNC_SHUTDOWN = object()
 _TEXT_EXTS = (".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html")
 
 
-def _load_retaindb_config() -> Dict[str, Any]:
+def _load_retaindb_config() -> dict[str, Any]:
     """``memory.retaindb`` block from config.yaml (empty on error): Dashboard-persisted base_url/project; api_key stays in scoped secrets."""
     try:
         from hermes_cli.config import load_config_readonly
 
-        provider_config = load_config_readonly().get("memory", {}).get("retaindb", {})
-        return dict(provider_config) if isinstance(provider_config, dict) else {}
+        block = load_config_readonly().get("memory", {}).get("retaindb", {})
+        return dict(block) if isinstance(block, dict) else {}
     except Exception:
         return {}
 
 
 def _config_str(value: Any) -> str:
-    """Stripped string for a config value, else ``""``."""
     return value.strip() if isinstance(value, str) else ""
 
 
@@ -55,66 +53,54 @@ def _q(s: str) -> str:
     return quote(s, safe="")
 
 
-# ── Tool schemas ─────────────────────────────────────────────────────────────
+def _quiet(label: str, fn: Callable[[], Any]) -> Any:
+    """Run *fn*; on any exception log "RetainDB <label> failed" at debug and return None."""
+    try:
+        return fn()
+    except Exception as exc:
+        logger.debug("RetainDB %s failed: %s", label, exc)
+        return None
+
 
 def _schema(name: str, description: str, properties: dict | None = None, required: tuple = ()) -> dict:
-    return {
-        "name": name,
-        "description": description,
-        "parameters": {"type": "object", "properties": properties or {}, "required": list(required)},
-    }
+    return {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties or {}, "required": list(required)}}
 
 
-def _prop(type_: str, description: str, **extra) -> dict:
+def _p(description: str, type_: str = "string", **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
 
-def _s(description: str, **extra) -> dict:
-    return _prop("string", description, **extra)
-
-
-PROFILE_SCHEMA = _schema(
-    "retaindb_profile", "Get the user's stable profile — preferences, facts, and patterns recalled from long-term memory.")
-SEARCH_SCHEMA = _schema(
-    "retaindb_search", "Semantic search across stored memories. Returns ranked results with relevance scores.",
-    {"query": _s("What to search for."), "top_k": _prop("integer", "Max results (default: 8, max: 20).")}, ("query",))
-CONTEXT_SCHEMA = _schema(
-    "retaindb_context", "Synthesized context block — what matters most for the current task, pulled from long-term memory.",
-    {"query": _s("Current task or question.")}, ("query",))
-REMEMBER_SCHEMA = _schema(
-    "retaindb_remember", "Persist an explicit fact, preference, or decision to long-term memory.",
-    {"content": _s("The fact to remember."),
-     "memory_type": _s("Category (default: factual).", enum=["factual", "preference", "goal", "instruction", "event", "opinion"]),
-     "importance": _prop("number", "Importance 0-1 (default: 0.7).")}, ("content",))
-FORGET_SCHEMA = _schema("retaindb_forget", "Delete a specific memory by ID.", {"memory_id": _s("Memory ID to delete.")}, ("memory_id",))
-FILE_UPLOAD_SCHEMA = _schema(
-    "retaindb_upload_file", "Upload a file to the shared RetainDB file store. Returns an rdb:// URI any agent can reference.",
-    {"local_path": _s("Local file path to upload."), "remote_path": _s("Destination path, e.g. /reports/q1.pdf"),
-     "scope": _s("Access scope (default: PROJECT).", enum=["USER", "PROJECT", "ORG"]),
-     "ingest": _prop("boolean", "Also extract memories from file after upload (default: false).")}, ("local_path",))
-FILE_LIST_SCHEMA = _schema(
-    "retaindb_list_files", "List files in the shared file store.",
-    {"prefix": _s("Path prefix to filter by, e.g. /reports/"), "limit": _prop("integer", "Max results (default: 50).")})
-FILE_READ_SCHEMA = _schema(
-    "retaindb_read_file", "Read the text content of a stored file by its file ID.",
-    {"file_id": _s("File ID returned from upload or list.")}, ("file_id",))
-FILE_INGEST_SCHEMA = _schema(
-    "retaindb_ingest_file", "Chunk, embed, and extract memories from a stored file. Makes its contents searchable.",
-    {"file_id": _s("File ID to ingest.")}, ("file_id",))
-FILE_DELETE_SCHEMA = _schema("retaindb_delete_file", "Delete a stored file.", {"file_id": _s("File ID to delete.")}, ("file_id",))
 _SCHEMAS = (
-    PROFILE_SCHEMA, SEARCH_SCHEMA, CONTEXT_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA,
-    FILE_UPLOAD_SCHEMA, FILE_LIST_SCHEMA, FILE_READ_SCHEMA, FILE_INGEST_SCHEMA, FILE_DELETE_SCHEMA,
+    _schema("retaindb_profile", "Get the user's stable profile — preferences, facts, and patterns recalled from long-term memory."),
+    _schema("retaindb_search", "Semantic search across stored memories. Returns ranked results with relevance scores.",
+            {"query": _p("What to search for."), "top_k": _p("Max results (default: 8, max: 20).", "integer")}, ("query",)),
+    _schema("retaindb_context", "Synthesized context block — what matters most for the current task, pulled from long-term memory.",
+            {"query": _p("Current task or question.")}, ("query",)),
+    _schema("retaindb_remember", "Persist an explicit fact, preference, or decision to long-term memory.",
+            {"content": _p("The fact to remember."),
+             "memory_type": _p("Category (default: factual).", enum=["factual", "preference", "goal", "instruction", "event", "opinion"]),
+             "importance": _p("Importance 0-1 (default: 0.7).", "number")}, ("content",)),
+    _schema("retaindb_forget", "Delete a specific memory by ID.", {"memory_id": _p("Memory ID to delete.")}, ("memory_id",)),
+    _schema("retaindb_upload_file", "Upload a file to the shared RetainDB file store. Returns an rdb:// URI any agent can reference.",
+            {"local_path": _p("Local file path to upload."), "remote_path": _p("Destination path, e.g. /reports/q1.pdf"),
+             "scope": _p("Access scope (default: PROJECT).", enum=["USER", "PROJECT", "ORG"]),
+             "ingest": _p("Also extract memories from file after upload (default: false).", "boolean")}, ("local_path",)),
+    _schema("retaindb_list_files", "List files in the shared file store.",
+            {"prefix": _p("Path prefix to filter by, e.g. /reports/"), "limit": _p("Max results (default: 50).", "integer")}),
+    _schema("retaindb_read_file", "Read the text content of a stored file by its file ID.",
+            {"file_id": _p("File ID returned from upload or list.")}, ("file_id",)),
+    _schema("retaindb_ingest_file", "Chunk, embed, and extract memories from a stored file. Makes its contents searchable.",
+            {"file_id": _p("File ID to ingest.")}, ("file_id",)),
+    _schema("retaindb_delete_file", "Delete a stored file.", {"file_id": _p("File ID to delete.")}, ("file_id",)),
 )
 
 
-# ── HTTP client ──────────────────────────────────────────────────────────────
-
 class _Client:
+    """Thin HTTP client over the RetainDB REST API (lazy ``requests`` import)."""
+
     def __init__(self, api_key: str, base_url: str, project: str):
-        self.api_key = api_key
-        self.base_url = re.sub(r"/+$", "", base_url)
-        self.project = project
+        self.api_key, self.base_url, self.project = api_key, re.sub(r"/+$", "", base_url), project
 
     def _headers(self, path: str, json_body: bool = True) -> dict:
         token = self.api_key.replace("Bearer ", "").strip()
@@ -125,13 +111,14 @@ class _Client:
             **({"X-API-Key": token} if path.startswith(("/v1/memory", "/v1/context")) else {}),
         }
 
-    def request(self, method: str, path: str, *, params=None, json_body=None, timeout: float = 8.0) -> Any:
+    def _http(self, method: str, path: str, *, json_body: bool = True, timeout: float = 30, **kwargs):
         import requests
+        return requests.request(method, f"{self.base_url}{path}", headers=self._headers(path, json_body), timeout=timeout, **kwargs)
+
+    def request(self, method: str, path: str, *, params=None, json_body=None, timeout: float = 8.0) -> Any:
+        """JSON request; raises RuntimeError carrying the server message on a non-2xx response."""
         method = method.upper()
-        resp = requests.request(
-            method, f"{self.base_url}{path}", params=params, json=json_body if method not in {"GET", "DELETE"} else None,
-            headers=self._headers(path), timeout=timeout,
-        )
+        resp = self._http(method, path, params=params, json=json_body if method not in {"GET", "DELETE"} else None, timeout=timeout)
         try:
             payload = resp.json()
         except Exception:
@@ -140,6 +127,12 @@ class _Client:
             msg = str(payload.get("message") or payload.get("error") or "") if isinstance(payload, dict) else ""
             raise RuntimeError(f"RetainDB {method} {path} failed ({resp.status_code}): {msg or payload}")
         return payload
+
+    def _raw(self, method: str, path: str, **kwargs) -> Any:
+        """Non-JSON request (multipart upload / binary download); raises on HTTP error."""
+        resp = self._http(method, path, json_body=False, **kwargs)
+        resp.raise_for_status()
+        return resp
 
     @staticmethod
     def _with_fallback(primary: Callable[[], dict], fallback: Callable[[], dict]) -> dict:
@@ -152,144 +145,106 @@ class _Client:
     def _scoped(self, user_id: str, session_id: str, **extra) -> dict:
         return {"project": self.project, "user_id": user_id, "session_id": session_id, **extra}
 
-    # Memory
-
+    # Memory routes (one endpoint per method; bodies are the wire payloads)
     def query_context(self, user_id: str, session_id: str, query: str, max_tokens: int = 1200) -> dict:
-        body = self._scoped(user_id, session_id, query=query, include_memories=True, max_tokens=max_tokens)
-        return self.request("POST", "/v1/context/query", json_body=body)
-
+        return self.request("POST", "/v1/context/query", json_body=self._scoped(user_id, session_id, query=query, include_memories=True, max_tokens=max_tokens))
     def search(self, user_id: str, session_id: str, query: str, top_k: int = 8) -> dict:
-        body = self._scoped(user_id, session_id, query=query, top_k=top_k, include_pending=True)
-        return self.request("POST", "/v1/memory/search", json_body=body)
-
+        return self.request("POST", "/v1/memory/search", json_body=self._scoped(user_id, session_id, query=query, top_k=top_k, include_pending=True))
     def get_profile(self, user_id: str) -> dict:
         return self._with_fallback(
             lambda: self.request("GET", f"/v1/memory/profile/{_q(user_id)}", params={"project": self.project, "include_pending": "true"}),
-            lambda: self.request("GET", "/v1/memories", params={"project": self.project, "user_id": user_id, "limit": "200"}),
-        )
-
+            lambda: self.request("GET", "/v1/memories", params={"project": self.project, "user_id": user_id, "limit": "200"}))
     def add_memory(self, user_id: str, session_id: str, content: str, memory_type: str = "factual", importance: float = 0.7) -> dict:
         body = self._scoped(user_id, session_id, content=content, memory_type=memory_type, importance=importance)
         return self._with_fallback(
             lambda: self.request("POST", "/v1/memory", json_body={**body, "write_mode": "sync"}, timeout=5.0),
-            lambda: self.request("POST", "/v1/memories", json_body=body, timeout=5.0),
-        )
-
+            lambda: self.request("POST", "/v1/memories", json_body=body, timeout=5.0))
     def delete_memory(self, memory_id: str) -> dict:
         return self._with_fallback(
             lambda: self.request("DELETE", f"/v1/memory/{_q(memory_id)}", timeout=5.0),
-            lambda: self.request("DELETE", f"/v1/memories/{_q(memory_id)}", timeout=5.0),
-        )
-
+            lambda: self.request("DELETE", f"/v1/memories/{_q(memory_id)}", timeout=5.0))
     def ingest_session(self, user_id: str, session_id: str, messages: list, timeout: float = 15.0) -> dict:
-        body = self._scoped(user_id, session_id, messages=messages, write_mode="sync")
-        return self.request("POST", "/v1/memory/ingest/session", json_body=body, timeout=timeout)
-
+        return self.request("POST", "/v1/memory/ingest/session", json_body=self._scoped(user_id, session_id, messages=messages, write_mode="sync"), timeout=timeout)
     def ask_user(self, user_id: str, query: str, reasoning_level: str = "low") -> dict:
-        body = {"project": self.project, "query": query, "reasoning_level": reasoning_level}
-        return self.request("POST", f"/v1/memory/profile/{_q(user_id)}/ask", json_body=body, timeout=8.0)
-
+        return self.request("POST", f"/v1/memory/profile/{_q(user_id)}/ask", json_body={"project": self.project, "query": query, "reasoning_level": reasoning_level}, timeout=8.0)
     def get_agent_model(self, agent_id: str) -> dict:
         return self.request("GET", f"/v1/memory/agent/{_q(agent_id)}/model", params={"project": self.project}, timeout=4.0)
-
     def seed_agent_identity(self, agent_id: str, content: str, source: str = "soul_md") -> dict:
-        body = {"project": self.project, "content": content, "source": source}
-        return self.request("POST", f"/v1/memory/agent/{_q(agent_id)}/seed", json_body=body, timeout=20.0)
+        return self.request("POST", f"/v1/memory/agent/{_q(agent_id)}/seed", json_body={"project": self.project, "content": content, "source": source}, timeout=20.0)
 
-    # Files
-
-    def _raw(self, method: str, path: str, **kwargs) -> Any:
-        """Non-JSON request (multipart upload / binary download); raises on HTTP error."""
-        import requests
-        resp = requests.request(method, f"{self.base_url}{path}", headers=self._headers(path, json_body=False), timeout=30, **kwargs)
-        resp.raise_for_status()
-        return resp
-
+    # File routes
     def upload_file(self, data: bytes, filename: str, remote_path: str, mime_type: str, scope: str, project_id: str | None) -> dict:
         import io
         fields = {"path": remote_path, "scope": scope.upper(), **({"project_id": project_id} if project_id else {})}
         return self._raw("POST", "/v1/files", files={"file": (filename, io.BytesIO(data), mime_type)}, data=fields).json()
-
     def list_files(self, prefix: str | None = None, limit: int = 50) -> dict:
         return self.request("GET", "/v1/files", params={"limit": limit, **({"prefix": prefix} if prefix else {})})
-
     def get_file(self, file_id: str) -> dict:
         return self.request("GET", f"/v1/files/{_q(file_id)}")
-
     def read_file_content(self, file_id: str) -> bytes:
         return self._raw("GET", f"/v1/files/{_q(file_id)}/content", allow_redirects=True).content
-
     def ingest_file(self, file_id: str, user_id: str | None = None, agent_id: str | None = None) -> dict:
         body = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id)) if v}
         return self.request("POST", f"/v1/files/{_q(file_id)}/ingest", json_body=body, timeout=60.0)
-
     def delete_file(self, file_id: str) -> dict:
         return self.request("DELETE", f"/v1/files/{_q(file_id)}", timeout=5.0)
 
-
-# ── Durable write-behind queue ───────────────────────────────────────────────
 
 class _WriteQueue:
     """SQLite-backed async write queue. Survives crashes — pending rows replay on startup."""
 
     def __init__(self, client: _Client, db_path: Path):
-        self._client = client
-        self._db_path = db_path
+        self._client, self._db_path = client, db_path
         self._q: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="retaindb-writer", daemon=True)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()  # one cached connection per thread
         self._connections: set[sqlite3.Connection] = set()
-        self._connections_lock = threading.Lock()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown = False
+        self._connections_lock, self._shutdown_lock, self._shutdown = threading.Lock(), threading.Lock(), False
         conn = self._execute(
             "CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
             "session_id TEXT, messages_json TEXT, created_at TEXT, last_error TEXT)"
         ).connection
         self._thread.start()
-        # Replay any rows left from a previous crash
-        for row_id, user_id, session_id, msgs_json in conn.execute(
+        for row_id, user_id, session_id, msgs_json in conn.execute(  # replay rows left from a previous crash
             "SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200"
         ).fetchall():
             self._q.put((row_id, user_id, session_id, json.loads(msgs_json)))
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Return a cached connection for the current thread."""
+        """Cached connection for the current thread (tracked so shutdown can close stragglers)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
+            conn = self._local.conn = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            self._local.conn = conn
             with self._connections_lock:
                 self._connections.add(conn)
         return conn
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        """Execute + commit on this thread's connection."""
         cur = self._get_conn().execute(sql, params)
         cur.connection.commit()
         return cur
 
-    def _close_thread_conn(self) -> None:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            return
-        self._local.conn = None
+    def _close(self, conn: sqlite3.Connection) -> None:
         with self._connections_lock:
             self._connections.discard(conn)
         with suppress(Exception):
             conn.close()
+
+    def _close_thread_conn(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
+            self._close(conn)
 
     def enqueue(self, user_id: str, session_id: str, messages: list) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._shutdown_lock:
             if self._shutdown:
                 return
-            cur = self._execute(
-                "INSERT INTO pending (user_id, session_id, messages_json, created_at) VALUES (?,?,?,?)",
-                (user_id, session_id, json.dumps(messages, ensure_ascii=False), now),
-            )
+            cur = self._execute("INSERT INTO pending (user_id, session_id, messages_json, created_at) VALUES (?,?,?,?)",
+                                (user_id, session_id, json.dumps(messages, ensure_ascii=False), now))
             self._q.put((cur.lastrowid, user_id, session_id, messages))
 
     def _flush_row(self, row_id: int, user_id: str, session_id: str, messages: list) -> None:
@@ -323,13 +278,10 @@ class _WriteQueue:
             # Executor workers that already exited may have left tracked handles;
             # check_same_thread=False lets shutdown close them deterministically.
             with self._connections_lock:
-                connections, self._connections = list(self._connections), set()
-            for conn in connections:
-                with suppress(Exception):
-                    conn.close()
+                stragglers = list(self._connections)
+            for conn in stragglers:
+                self._close(conn)
 
-
-# ── Overlay formatter ────────────────────────────────────────────────────────
 
 def _compact(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()[:320]
@@ -362,8 +314,6 @@ def _build_overlay(profile: dict, query_result: dict, local_entries: list[str] |
     )
 
 
-# ── Provider ─────────────────────────────────────────────────────────────────
-
 # Agent self-model keys -> prefetch line formatter, in display order.
 _AGENT_MODEL_FIELDS = (
     ("persona", lambda v: f"Persona: {v}"),
@@ -392,7 +342,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         return bool(get_secret("RETAINDB_API_KEY"))
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
+    def get_config_schema(self) -> list[dict[str, Any]]:
         return [
             {"key": "api_key", "description": "RetainDB API key", "secret": True, "required": True, "env_var": "RETAINDB_API_KEY", "url": "https://retaindb.com"},
             {"key": "base_url", "description": "API endpoint", "default": _DEFAULT_BASE_URL},
@@ -401,33 +351,26 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         # Non-secret fields resolve env -> config.yaml (written by the Dashboard) -> default.
-        provider_config = _load_retaindb_config()
-        base_url = re.sub(r"/+$", "", os.environ.get("RETAINDB_BASE_URL") or _config_str(provider_config.get("base_url")) or _DEFAULT_BASE_URL)
+        cfg = _load_retaindb_config()
+        base_url = re.sub(r"/+$", "", os.environ.get("RETAINDB_BASE_URL") or _config_str(cfg.get("base_url")) or _DEFAULT_BASE_URL)
         # Project: RETAINDB_PROJECT > config.yaml > hermes-<profile> > "default" (API auto-creates "default").
-        project = os.environ.get("RETAINDB_PROJECT") or _config_str(provider_config.get("project"))
+        project = os.environ.get("RETAINDB_PROJECT") or _config_str(cfg.get("project"))
         if not project:
             profile_name = os.path.basename(str(kwargs.get("hermes_home", "")))
             project = f"hermes-{profile_name}" if profile_name not in {"", ".hermes"} else "default"
-
         self._client = _Client(get_secret("RETAINDB_API_KEY", "") or "", base_url, project)
         self._session_id = session_id
         self._user_id = kwargs.get("user_id", "default") or "default"
         self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
 
         from hermes_constants import get_hermes_home
-        hermes_home_path = get_hermes_home()
-        self._queue = _WriteQueue(self._client, hermes_home_path / "retaindb_queue.db")
-        # Seed agent identity from SOUL.md in background
-        soul_path = hermes_home_path / "SOUL.md"
-        soul_content = soul_path.read_text(encoding="utf-8", errors="replace").strip() if soul_path.exists() else ""
-        if soul_content:
-            threading.Thread(target=self._seed_soul, args=(soul_content,), name="retaindb-soul-seed", daemon=True).start()
-
-    def _seed_soul(self, content: str) -> None:
-        try:
-            self._client.seed_agent_identity(self._agent_id, content, source="soul_md")
-        except Exception as exc:
-            logger.debug("RetainDB soul seed failed: %s", exc)
+        home = get_hermes_home()
+        self._queue = _WriteQueue(self._client, home / "retaindb_queue.db")
+        soul_path = home / "SOUL.md"
+        soul = soul_path.read_text(encoding="utf-8", errors="replace").strip() if soul_path.exists() else ""
+        if soul:  # seed agent identity from SOUL.md in background
+            seed = lambda: self._client.seed_agent_identity(self._agent_id, soul, source="soul_md")  # noqa: E731
+            threading.Thread(target=_quiet, args=("soul seed", seed), name="retaindb-soul-seed", daemon=True).start()
 
     def system_prompt_block(self) -> str:
         project = self._client.project if self._client else "retaindb"
@@ -449,38 +392,34 @@ class RetainDBMemoryProvider(MemoryProvider):
         if any(t.is_alive() for t in self._prefetch_threads):
             logger.debug("RetainDB prefetch still running; skipping new batch")
             return
-        jobs = (
-            ("retaindb-ctx", "context", lambda: ("_context_result", self._context_overlay(query)["context"])),
-            ("retaindb-dialectic", "dialectic", lambda: self._fetch_dialectic(query)),
-            ("retaindb-agent-model", "agent model", self._fetch_agent_model),
+        jobs = (  # (thread name, log label, cache attr, fetch)
+            ("retaindb-ctx", "context", "_context_result", lambda: self._context_overlay(query)["context"]),
+            ("retaindb-dialectic", "dialectic", "_dialectic_result", lambda: self._fetch_dialectic(query)),
+            ("retaindb-agent-model", "agent model", "_agent_model", self._fetch_agent_model),
         )
-        threads = [threading.Thread(target=self._store, args=(label, fetch), name=name, daemon=True) for name, label, fetch in jobs]
-        self._prefetch_threads = threads
-        for t in threads:
+        self._prefetch_threads = [threading.Thread(target=self._store, args=(label, attr, fetch), name=name, daemon=True)
+                                  for name, label, attr, fetch in jobs]
+        for t in self._prefetch_threads:
             t.start()
 
     def _context_overlay(self, query: str) -> dict:
         query_result = self._client.query_context(self._user_id, self._session_id, query)
-        profile = self._client.get_profile(self._user_id)
-        return {"context": _build_overlay(profile, query_result), "raw": query_result}
+        return {"context": _build_overlay(self._client.get_profile(self._user_id), query_result), "raw": query_result}
 
-    def _fetch_dialectic(self, query: str) -> tuple[str, str | None]:
+    def _fetch_dialectic(self, query: str) -> str | None:
         result = self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query))
-        return "_dialectic_result", str(result.get("answer") or "") or None
+        return str(result.get("answer") or "") or None
 
-    def _fetch_agent_model(self) -> tuple[str, dict | None]:
+    def _fetch_agent_model(self) -> dict | None:
         model = self._client.get_agent_model(self._agent_id)
-        return "_agent_model", model if model.get("memory_count", 0) > 0 else None
+        return model if model.get("memory_count", 0) > 0 else None
 
-    def _store(self, label: str, fetch: Callable[[], tuple[str, Any]]) -> None:
-        """Run one prefetch job; store (attr, value) under the lock unless value is None; log failures at debug."""
-        try:
-            attr, value = fetch()
-            if value is not None:
-                with self._lock:
-                    setattr(self, attr, value)
-        except Exception as exc:
-            logger.debug("RetainDB %s prefetch failed: %s", label, exc)
+    def _store(self, label: str, attr: str, fetch: Callable[[], Any]) -> None:
+        """Run one prefetch job; cache its value under the lock unless None (failures log at debug)."""
+        value = _quiet(f"{label} prefetch", fetch)
+        if value is not None:
+            with self._lock:
+                setattr(self, attr, value)
 
     @staticmethod
     def _reasoning_level(query: str) -> str:
@@ -512,7 +451,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             {"role": "assistant", "content": assistant_content, "timestamp": now},
         ])
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -566,11 +505,8 @@ class RetainDBMemoryProvider(MemoryProvider):
         """Mirror built-in memory writes to RetainDB."""
         if action != "add" or not content or not self._client:
             return
-        try:
-            memory_type = "preference" if target == "user" else "factual"
-            self._client.add_memory(self._user_id, self._session_id, content, memory_type=memory_type)
-        except Exception as exc:
-            logger.debug("RetainDB memory mirror failed: %s", exc)
+        _quiet("memory mirror", lambda: self._client.add_memory(
+            self._user_id, self._session_id, content, memory_type="preference" if target == "user" else "factual"))
 
     def shutdown(self) -> None:
         for t in self._prefetch_threads:
@@ -582,7 +518,7 @@ class RetainDBMemoryProvider(MemoryProvider):
 
 
 # tool name -> (required arg or None, handler(provider, args, required_value)); missing arg -> "<arg> is required"
-_TOOLS: Dict[str, tuple[str | None, Callable[..., Any]]] = {
+_TOOLS: dict[str, tuple[str | None, Callable[..., Any]]] = {
     "retaindb_profile": (None, lambda p, a, _: p._client.get_profile(p._user_id)),
     "retaindb_search": ("query", lambda p, a, q: p._client.search(p._user_id, p._session_id, q, top_k=min(int(a.get("top_k", 8)), 20))),
     "retaindb_context": ("query", lambda p, a, q: p._context_overlay(q)),
