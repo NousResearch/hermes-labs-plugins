@@ -80,8 +80,8 @@ def _session_env(name: str) -> str:
         return ""
 
 
-def _nick(m: dict) -> str:
-    return m.get("nickname", m.get("nick_name", ""))
+def _nick(m: dict, default: str = "") -> str:
+    return m.get("nickname", m.get("nick_name", default))
 
 
 async def _members(adapter, group_code: str) -> list:
@@ -101,10 +101,8 @@ async def _resolve_dm_recipient(adapter, group_code: str, name: str) -> Tuple[st
     if not name:
         raise _YbError("name is required when user_id is not provided")
     filt = name.strip().lower()
-    matched = [
-        m for m in await _members(adapter, group_code)
-        if filt in (m.get("nickname") or m.get("nick_name") or "").lower()
-    ]
+    matched = [m for m in await _members(adapter, group_code)
+               if filt in (m.get("nickname") or m.get("nick_name") or "").lower()]
     if not matched:
         raise _YbError(f'No member matching "{name}" found in group {group_code}.')
     if len(matched) > 1:
@@ -113,7 +111,7 @@ async def _resolve_dm_recipient(adapter, group_code: str, name: str) -> Tuple[st
             candidates=[{"user_id": m.get("user_id", ""), "nickname": _nick(m)} for m in matched],
         )
     m = matched[0]
-    return m.get("user_id", ""), m.get("nickname", m.get("nick_name", name))
+    return m.get("user_id", ""), _nick(m, name)
 
 
 @_yb_tool("get_group_info")
@@ -146,11 +144,8 @@ async def query_group_members(args) -> dict:
     if not group_code:
         return _err("group_code is required")
     all_members = [
-        {
-            "user_id": m.get("user_id", ""),
-            "nickname": _nick(m),
-            "role": _USER_TYPE_LABEL.get(m.get("user_type", m.get("role", 0)), "unknown"),
-        }
+        {"user_id": m.get("user_id", ""), "nickname": _nick(m),
+         "role": _USER_TYPE_LABEL.get(m.get("user_type", m.get("role", 0)), "unknown")}
         for m in await _members(_adapter(), group_code)
     ]
     if not all_members:
@@ -189,13 +184,8 @@ async def search_sticker(args) -> dict:
         safe_limit = 10
     matches = search_stickers(query or "", limit=safe_limit)
     return {
-        "success": True,
-        "query": query or "",
-        "count": len(matches),
-        "results": [
-            {k: s.get(k, "") for k in ("sticker_id", "name", "description", "package_id")}
-            for s in matches
-        ],
+        "success": True, "query": query or "", "count": len(matches),
+        "results": [{k: s.get(k, "") for k in ("sticker_id", "name", "description", "package_id")} for s in matches],
     }
 
 
@@ -217,24 +207,21 @@ async def send_sticker(args) -> dict:
     if not raw:
         sticker_obj = get_random_sticker()
     else:
-        sticker_obj = get_sticker_by_id(raw) if raw.isdigit() else None
-        if sticker_obj is None:
-            sticker_obj = get_sticker_by_name(raw)
+        sticker_obj = (get_sticker_by_id(raw) if raw.isdigit() else None) or get_sticker_by_name(raw)
     if sticker_obj is None:
         return _err(f"Sticker not found: {raw!r}. Use search_sticker first to discover available stickers.")
 
     result = await adapter.send_sticker(
         chat_id=target, sticker_name=sticker_obj.get("name", ""), reply_to=args.get("reply_to", "") or None,
     )
-    if getattr(result, "success", False):
-        return {
-            "success": True,
-            "chat_id": target,
-            "sticker": {"sticker_id": sticker_obj.get("sticker_id", ""), "name": sticker_obj.get("name", "")},
-            "message_id": getattr(result, "message_id", None),
-            "note": "Sticker delivered to the chat. If you have additional text to say, reply now; otherwise end your turn without generating text.",
-        }
-    return _err(getattr(result, "error", "send_sticker failed"))
+    if not getattr(result, "success", False):
+        return _err(getattr(result, "error", "send_sticker failed"))
+    return {
+        "success": True, "chat_id": target,
+        "sticker": {"sticker_id": sticker_obj.get("sticker_id", ""), "name": sticker_obj.get("name", "")},
+        "message_id": getattr(result, "message_id", None),
+        "note": "Sticker delivered to the chat. If you have additional text to say, reply now; otherwise end your turn without generating text.",
+    }
 
 
 @_yb_tool("send_dm")
@@ -294,16 +281,11 @@ async def send_dm(args) -> dict:
     if errors and not last_result.success:
         return _err("; ".join(errors))
 
-    result = {
-        "success": True,
-        "user_id": resolved_user_id,
-        "nickname": resolved_nickname,
-        "message_id": last_result.message_id,
-        "note": f'DM sent to "{resolved_nickname}" successfully.',
-    }
+    note = f'DM sent to "{resolved_nickname}" successfully.'
     if errors:
-        result["note"] += f" (partial failure: {'; '.join(errors)})"
-    return result
+        note += f" (partial failure: {'; '.join(errors)})"
+    return {"success": True, "user_id": resolved_user_id, "nickname": resolved_nickname,
+            "message_id": last_result.message_id, "note": note}
 
 
 def _check_yuanbao():
