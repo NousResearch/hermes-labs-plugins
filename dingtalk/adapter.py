@@ -50,13 +50,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
-from plugins.platforms.dingtalk.inbound import (  # noqa: F401 — re-exported names
-    DINGTALK_TYPE_MAPPING,
-    EXT_MAP,
-    collect_download_codes,
-    extract_media,
-    extract_text,
-)
+from plugins.platforms.dingtalk.inbound import collect_download_codes, extract_media, extract_text
 
 
 logger = logging.getLogger(__name__)
