@@ -62,8 +62,7 @@ def _get_active_adapter():
 
 
 def _adapter():
-    adapter = _get_active_adapter()
-    if adapter is None:
+    if (adapter := _get_active_adapter()) is None:
         raise _YbError("Yuanbao adapter is not connected")
     return adapter
 
