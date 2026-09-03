@@ -11,6 +11,7 @@ import asyncio
 import base64
 import binascii
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import hmac
@@ -133,10 +134,8 @@ def _cancel_all(tasks: Dict[str, asyncio.Task]) -> None:
 async def _cancel_task(task: asyncio.Task) -> None:
     """Cancel *task* and wait for it to unwind (swallowing the CancelledError)."""
     task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await task
-    except asyncio.CancelledError:
-        pass
 
 
 class MarkdownProcessor:
@@ -171,7 +170,6 @@ class SignManager:
     RETRY_DELAY_S = 1.0
     CACHE_REFRESH_MARGIN_S = 60  # treat as expiring this many seconds early
     HTTP_TIMEOUT_S = 10.0
-
     _cache: dict[str, dict[str, Any]] = {}  # app_key → {"token", "bot_id", "expire_ts", ...}
     # Per-app_key refresh locks, created lazily from async context so they bind to the running
     # loop; disconnect() clears them to avoid stale locks across reconnects.
@@ -526,7 +524,6 @@ class RecallGuardMiddleware(InboundMiddleware):
     """Recall callbacks (Group.CallbackAfterRecallMsg / C2C.CallbackAfterMsgWithDraw).
     A: in transcript → redact; B: not in transcript → system note; C: being processed → interrupt + delayed redact."""
     name = "recall_guard"
-
     _RECALL_COMMANDS = frozenset({"Group.CallbackAfterRecallMsg", "C2C.CallbackAfterMsgWithDraw"})
     _REDACTED = "[This message was recalled/withdrawn by the sender; original content removed]"
 
@@ -833,7 +830,6 @@ def _media_ref(kind: str, url: str, name: str = "") -> Dict[str, str]:
 class ExtractContentMiddleware(InboundMiddleware):
     """Extract raw text, media refs and forwarded records from msg_body."""
     name = "extract-content"
-
     _CARD_CONTENT_MAX_LENGTH = 1000
     _UNSUPPORTED = "[unsupported message type]"
 
@@ -1007,7 +1003,6 @@ class ExtractContentMiddleware(InboundMiddleware):
 class PlaceholderFilterMiddleware(InboundMiddleware):
     """Skip pure placeholder messages (e.g. '[image]' with no media)."""
     name = "placeholder-filter"
-
     SKIPPABLE_PLACEHOLDERS: frozenset = frozenset({"[image]", "[图片]", "[file]", "[文件]", "[video]", "[视频]", "[voice]", "[语音]"})
 
     @classmethod
@@ -1024,9 +1019,7 @@ class PlaceholderFilterMiddleware(InboundMiddleware):
 class OwnerCommandMiddleware(InboundMiddleware):
     """Bot-owner slash commands in groups: allowlisted commands skip @Bot; non-owner attempts are rejected."""
     name = "owner-command"
-
     ALLOWLIST: frozenset = frozenset({"/new", "/reset", "/retry", "/undo", "/stop", "/approve", "/deny", "/bg", "/btw", "/queue", "/q"})
-
     _rewrite_slash_command = staticmethod(ExtractContentMiddleware._rewrite_slash_command)
 
     @classmethod
@@ -1274,10 +1267,8 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
     @staticmethod
     async def _send_loading_heartbeat(ctx: InboundContext) -> None:
         """Best-effort RUNNING heartbeat so the user sees a loading bubble."""
-        try:
+        with contextlib.suppress(Exception):
             await ctx.adapter._outbound.heartbeat.send_heartbeat_once(ctx.chat_id, WS_HEARTBEAT_RUNNING)
-        except Exception:
-            pass
 
     @classmethod
     def _media_marker(cls, media: dict, plain_text: str = "") -> Tuple[str, Optional[Dict[str, str]]]:
@@ -1353,7 +1344,6 @@ class MediaResolveMiddleware(InboundMiddleware):
     private IPs (tripping vision_tools' SSRF guard), so we download ourselves and hand the model
     local paths."""
     name = "media-resolve"
-
     # Resource download cache keyed by resourceId: rid -> (local_path, mime, ts)
     _resource_cache: ClassVar[Dict[str, Tuple[str, str, float]]] = {}
     _RESOURCE_CACHE_TTL_S: ClassVar[int] = 24 * 60 * 60
@@ -1729,7 +1719,7 @@ class DispatchMiddleware(InboundMiddleware):
             if ctx.msg_id and ctx.raw_text:
                 cache = adapter._msg_content_cache
                 cache[ctx.msg_id] = ctx.raw_text
-                for k in list(cache)[:max(0, len(cache) - 200)]:
+                for k in list(cache)[:max(0, len(cache) - 200)]:  # bounded: drop oldest
                     del cache[k]
             await adapter.handle_message(event)
         if ctx.chat_type == "group":
@@ -2082,20 +2072,16 @@ class ConnectionManager:
 
     def _extract_sender_key(self, raw_data: bytes) -> str:
         """Debounce key 'from_account:group_code' (JSON or protobuf), else a unique fallback."""
-        try:
+        with contextlib.suppress(Exception):
             parsed = json.loads(raw_data.decode("utf-8"))
             if isinstance(parsed, dict):
                 from_account, group_code = DecodeMiddleware.json_sender_fields(parsed)
                 if from_account:
                     return f"{from_account}:{group_code}"
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             push = decode_inbound_push(raw_data)
             if push:
                 return f"{push.get('from_account', '')}:{push.get('group_code', '')}"
-        except Exception:
-            pass
         return f"__unknown_{id(raw_data)}"
 
     def _push_to_inbound(self, raw_data: bytes) -> None:
@@ -2356,9 +2342,8 @@ class HeartbeatManager:
             await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
             while True:
                 await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
-                if time.time() - self._reply_hb_last_active.get(chat_id, 0) > REPLY_HEARTBEAT_TIMEOUT_S:
-                    break
-                if self._adapter._connection.ws is None:
+                if (time.time() - self._reply_hb_last_active.get(chat_id, 0) > REPLY_HEARTBEAT_TIMEOUT_S
+                        or self._adapter._connection.ws is None):
                     break
                 await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
         except asyncio.CancelledError:
@@ -2455,10 +2440,8 @@ class MessageSender:
                 result = await self.send_text_chunk(chat_id, chunk, reply_to if i == 0 else None, group_code=group_code)
                 if not result.success:
                     return result
-        try:  # delivery done → FINISH heartbeat (ordering: RUNNING… → message → FINISH)
+        with contextlib.suppress(Exception):  # delivery done → FINISH heartbeat (RUNNING… → message → FINISH)
             await adapter._outbound.heartbeat.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-        except Exception:
-            pass
         return SendResult(success=True)
 
     async def send_media(self, chat_id: str, handler_name: str, reply_to: Optional[str] = None,
@@ -2655,7 +2638,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
     MEDIA_MAX_SIZE_MB: int = 50
     DM_MAX_CHARS = 10000
-
     _active_instance: ClassVar[Optional["YuanbaoAdapter"]] = None
 
     @classmethod
@@ -2771,19 +2753,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return {"name": chat_id, "type": "group" if chat_id.startswith("group:") else "dm"}
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
-        """Start the RUNNING heartbeat."""
-        try:
+        """Start the RUNNING heartbeat (best effort)."""
+        with contextlib.suppress(Exception):
             await self._outbound.heartbeat.start(chat_id)
-        except Exception:
-            pass
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop RUNNING without FINISH — send() emits FINISH after delivery so ordering is
         RUNNING… → message → FINISH."""
-        try:
+        with contextlib.suppress(Exception):
             await self._outbound.heartbeat.stop(chat_id, send_finish=False)
-        except Exception:
-            pass
 
     async def _process_message_background(self, event, session_key: str) -> None:
         """Wrap base class processing with a slow-response notifier."""
