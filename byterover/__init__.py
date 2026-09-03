@@ -126,8 +126,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._auto_extract = _coerce_bool(self._config.get("auto_extract"), True)
-        self._cwd = self._session_id = ""
-        self._turn_count = 0
+        self._cwd, self._session_id, self._turn_count = "", "", 0
         self._sync_thread: Optional[threading.Thread] = None
 
     @property
@@ -199,8 +198,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
             return
         if self._sync_thread and self._sync_thread.is_alive():  # wait for the previous sync so curates don't pile up
             self._sync_thread.join(timeout=5.0)
-        combined = f"User: {user_content[:2000]}\nAssistant: {assistant_content[:2000]}"
-        self._sync_thread = self._curate_in_background(combined, name="brv-sync", what="sync")
+        self._sync_thread = self._curate_in_background(f"User: {user_content[:2000]}\nAssistant: {assistant_content[:2000]}",
+                                                       name="brv-sync", what="sync")
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to ByteRover."""
@@ -230,9 +229,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         if arg and not value:
             return tool_error(f"{arg} is required")
         result = run(self, value)
-        if not result["success"]:
-            return tool_error(result.get("error", fail_msg))
-        return json.dumps(on_ok(result.get("output", "")))
+        return json.dumps(on_ok(result.get("output", ""))) if result["success"] else tool_error(result.get("error", fail_msg))
 
     def shutdown(self) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
