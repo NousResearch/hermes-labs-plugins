@@ -84,6 +84,12 @@ MAX_RECONNECT_ATTEMPTS = 100
 DEFAULT_SEND_TIMEOUT = 30.0  # WS biz request timeout
 # Caps the WS close handshake: websockets' own 5s close_timeout waits for a close echo an idle
 # server never sends, stalling shutdown; a responsive server finishes well under 1s.
+# Upper bound on the WS close handshake during teardown (#40383). The websockets connection's own
+# close_timeout (5s) blocks until the server echoes the close frame; an idle/unresponsive server never
+# replies, stalling gateway shutdown by the full timeout. Bounding the close await here keeps teardown fast
+# — a responsive server completes the handshake in well under a second, so this only caps the pathological
+# hang. Also bounds the reconnect / connect-failure cleanup paths that reuse _cleanup_ws(), where a graceful
+# close is unnecessary anyway (the socket is being discarded to redial).
 WS_CLOSE_TIMEOUT_S = 1.0
 NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}  # permanent errors — never reconnect
 HEARTBEAT_TIMEOUT_THRESHOLD = 2  # consecutive missed pongs before reconnect
@@ -645,6 +651,11 @@ class RecallGuardMiddleware(InboundMiddleware):
             logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
             return
         try:
+            # Load transcript from canonical store (state.db). Since PR #29278 added a
+            # ``platform_message_id`` column to the messages table and ``append_to_transcript`` wires the
+            # incoming dict's ``message_id`` into it, ``load_transcript`` returns rows with ``message_id``
+            # set for any message that was observed with one — Branch A1 (exact id match) is the canonical
+            # path again.
             transcript = store.load_transcript(sid)
         except TranscriptReadError as exc:
             # Not an empty transcript — the rows are unreadable, so recall has
@@ -1686,6 +1697,10 @@ class DispatchMiddleware(InboundMiddleware):
 
         async def _dispatch_inbound_event() -> None:
             if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types):
+                # Classification: DOCUMENT wins over PHOTO/VIDEO/AUDIO for mixed attachments — run.py's
+                # image handling keys off the per-path image/* mime types regardless of message_type, but
+                # document-context injection gates strictly on MessageType.DOCUMENT (same precedence as
+                # Email/Signal, PR #44695).
                 msg_type = MessageType.DOCUMENT
             else:  # yuanbao-local subtypes (CHAT_RECORD) are deep-parsed into text → TEXT downstream
                 msg_type = ctx.msg_type if isinstance(ctx.msg_type, MessageType) else MessageType.TEXT
