@@ -1915,6 +1915,9 @@ class InboundPipelineBuilder:
 class ConnectionManager:
     """WebSocket lifecycle: open/close, AUTH_BIND, ping/pong heartbeat, receive loop, backoff reconnect."""
 
+    _DEBOUNCE_WINDOW: float = 1.5  # seconds to wait for companion frames of a multi-part message
+    _LOOPS = (("_heartbeat_task", "_heartbeat_loop", "heartbeat"), ("_recv_task", "_receive_loop", "recv"))
+
     def __init__(self, adapter: "YuanbaoAdapter") -> None:
         self._adapter = adapter
         self._ws = None  # websockets connection
@@ -1936,6 +1939,7 @@ class ConnectionManager:
 
     @property
     def is_connected(self) -> bool:
+        """``ws.open`` may be a bool (websockets <14) or a method (>=14)."""
         if self._ws is None:
             return False
         open_attr = getattr(self._ws, "open", None)
@@ -1968,34 +1972,22 @@ class ConnectionManager:
             return False
         try:
             logger.info("[%s] Fetching sign token from %s", adapter.name, adapter._api_domain)
-            token_data = await SignManager.get_token(
-                adapter._app_key, adapter._app_secret, adapter._api_domain,
-                route_env=adapter._route_env,
-            )
+            token_data = await adapter._get_cached_token()
             self._apply_bot_id(token_data)
             logger.info("[%s] Connecting to %s", adapter.name, adapter._ws_url)
             if not await self._dial(token_data):
                 return False
-            self._reconnect_attempts = 0
-            adapter._mark_connected()
             adapter._loop = asyncio.get_running_loop()
-            self._start_loops(cancel_existing=False)
-            logger.info(
-                "[%s] Connected. connectId=%s botId=%s",
-                adapter.name, self._connect_id, adapter._bot_id,
-            )
-            YuanbaoAdapter.set_active(adapter)
+            self._connected(cancel_existing=False)
+            logger.info("[%s] Connected. connectId=%s botId=%s", adapter.name, self._connect_id, adapter._bot_id)
             return True
         except asyncio.TimeoutError:
             logger.error("[%s] Connection timed out", adapter.name)
-            await self._cleanup_ws()
-            adapter._release_platform_lock()
-            return False
         except Exception as exc:
             logger.error("[%s] connect() failed: %s", adapter.name, exc, exc_info=True)
-            await self._cleanup_ws()
-            adapter._release_platform_lock()
-            return False
+        await self._cleanup_ws()
+        adapter._release_platform_lock()
+        return False
 
     def _apply_bot_id(self, token_data: dict) -> None:
         """Adopt bot_id returned by the sign-token API, if any."""
@@ -2015,7 +2007,13 @@ class ConnectionManager:
             return False
         return True
 
-    _LOOPS = (("_heartbeat_task", "_heartbeat_loop", "heartbeat"), ("_recv_task", "_receive_loop", "recv"))
+    def _connected(self, *, cancel_existing: bool) -> None:
+        """Post-AUTH bookkeeping shared by open() and reconnect: mark connected, (re)start loops,
+        register as the active adapter."""
+        self._reconnect_attempts = 0
+        self._adapter._mark_connected()
+        self._start_loops(cancel_existing=cancel_existing)
+        YuanbaoAdapter.set_active(self._adapter)
 
     def _start_loops(self, *, cancel_existing: bool) -> None:
         """(Re)start the heartbeat and receive loops for the current connect_id."""
@@ -2023,9 +2021,7 @@ class ConnectionManager:
             old = getattr(self, attr)
             if cancel_existing and old and not old.done():
                 old.cancel()
-            setattr(self, attr, asyncio.create_task(
-                getattr(self, coro_name)(), name=f"yuanbao-{tag}-{self._connect_id}",
-            ))
+            setattr(self, attr, asyncio.create_task(getattr(self, coro_name)(), name=f"yuanbao-{tag}-{self._connect_id}"))
 
     async def close(self) -> None:
         """Cancel background tasks, fail pending futures, and close the WebSocket."""
@@ -2051,23 +2047,13 @@ class ConnectionManager:
         adapter = self._adapter
         if self._ws is None:
             return False
-        token = token_data.get("token", "")
         uid = adapter._bot_id or token_data.get("bot_id", "")
-        source = token_data.get("source") or "bot"
-        route_env = adapter._route_env or token_data.get("route_env", "") or ""
         msg_id = str(uuid.uuid4())
-        auth_bytes = encode_auth_bind(
-            biz_id="ybBot",
-            uid=uid,
-            source=source,
-            token=token,
-            msg_id=msg_id,
-            app_version=_APP_VERSION,
-            operation_system=_OPERATION_SYSTEM,
-            bot_version=_BOT_VERSION,
-            route_env=route_env,
-        )
-        await self._ws.send(auth_bytes)
+        await self._ws.send(encode_auth_bind(
+            biz_id="ybBot", uid=uid, source=token_data.get("source") or "bot", token=token_data.get("token", ""),
+            msg_id=msg_id, app_version=_APP_VERSION, operation_system=_OPERATION_SYSTEM, bot_version=_BOT_VERSION,
+            route_env=adapter._route_env or token_data.get("route_env", "") or "",
+        ))
         logger.debug("[%s] AUTH_BIND sent (msg_id=%s uid=%s)", adapter.name, msg_id, uid)
         try:
             _loop = asyncio.get_running_loop()
@@ -2085,23 +2071,19 @@ class ConnectionManager:
                 except Exception:
                     continue
                 head = msg.get("head", {})
-                cmd_type = head.get("cmd_type", -1)
-                cmd = head.get("cmd", "")
-                if cmd_type == CMD_TYPE["Response"] and cmd == "auth-bind":
+                if head.get("cmd_type", -1) == CMD_TYPE["Response"] and head.get("cmd", "") == "auth-bind":
                     connect_id = self._extract_connect_id(msg)
-                    if connect_id:
-                        self._connect_id = connect_id
-                        logger.info("[%s] BIND_ACK received: connectId=%s", adapter.name, connect_id)
-                        return True
-                    else:
+                    if not connect_id:
                         logger.error("[%s] BIND_ACK missing connectId", adapter.name)
                         return False
+                    self._connect_id = connect_id
+                    logger.info("[%s] BIND_ACK received: connectId=%s", adapter.name, connect_id)
+                    return True
         except asyncio.TimeoutError:
             logger.error("[%s] AUTH_BIND timeout", adapter.name)
-            return False
         except Exception as exc:
             logger.error("[%s] AUTH_BIND error: %s", adapter.name, exc, exc_info=True)
-            return False
+        return False
 
     def _pop_pending(self, msg_id: str) -> Optional[asyncio.Future]:
         """Pop the not-yet-done future registered for *msg_id*, if any."""
@@ -2112,7 +2094,7 @@ class ConnectionManager:
         return None
 
     def _extract_connect_id(self, decoded_msg: dict) -> Optional[str]:
-        """Extract connectId from decoded BIND_ACK message."""
+        """connectId from a decoded BIND_ACK, or None (logs AuthBindRsp errors)."""
         data: bytes = decoded_msg.get("data", b"")
         if not data:
             return None
@@ -2120,20 +2102,15 @@ class ConnectionManager:
             fdict = _fields_to_dict(_parse_fields(data))
             code = _get_varint(fdict, 1)
             if code != 0:
-                message = _get_string(fdict, 2)
-                logger.error(
-                    "[%s] AuthBindRsp error: code=%d message=%r",
-                    self._adapter.name, code, message,
-                )
+                logger.error("[%s] AuthBindRsp error: code=%d message=%r", self._adapter.name, code, _get_string(fdict, 2))
                 return None
-            connect_id = _get_string(fdict, 3)
-            return connect_id if connect_id else None
+            return _get_string(fdict, 3) or None
         except Exception as exc:
             logger.warning("[%s] Failed to extract connectId: %s", self._adapter.name, exc)
             return None
 
     async def _heartbeat_loop(self) -> None:
-        """Send HEARTBEAT (ping) every 30s; trigger reconnect after threshold misses."""
+        """Send PING every HEARTBEAT_INTERVAL_SECONDS; reconnect after HEARTBEAT_TIMEOUT_THRESHOLD misses."""
         adapter = self._adapter
         try:
             while adapter._running:
@@ -2142,12 +2119,10 @@ class ConnectionManager:
                     continue
                 try:
                     msg_id = str(uuid.uuid4())
-                    ping_bytes = encode_ping(msg_id)
-                    loop = asyncio.get_running_loop()
-                    pong_future: asyncio.Future = loop.create_future()
+                    pong_future: asyncio.Future = asyncio.get_running_loop().create_future()
                     self._pending_pong = pong_future
                     self._pending_acks[msg_id] = pong_future
-                    await self._ws.send(ping_bytes)
+                    await self._ws.send(encode_ping(msg_id))
                     logger.debug("[%s] PING sent (msg_id=%s)", adapter.name, msg_id)
                     try:
                         await asyncio.wait_for(pong_future, timeout=10.0)
@@ -2155,10 +2130,7 @@ class ConnectionManager:
                     except asyncio.TimeoutError:
                         self._pending_acks.pop(msg_id, None)
                         self._consecutive_hb_timeouts += 1
-                        logger.warning(
-                            "[%s] PONG timeout (%d/%d)",
-                            adapter.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD,
-                        )
+                        logger.warning("[%s] PONG timeout (%d/%d)", adapter.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD)
                         if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
                             logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", adapter.name)
                             self.schedule_reconnect()
@@ -2172,26 +2144,19 @@ class ConnectionManager:
             pass
 
     async def _receive_loop(self) -> None:
-        """Read WS frames and dispatch by cmd_type."""
+        """Read WS frames and dispatch by cmd_type; schedule reconnect unless the close code is permanent."""
         adapter = self._adapter
         try:
             async for raw in self._ws:  # type: ignore[union-attr]
-                if not isinstance(raw, (bytes, bytearray)):
-                    continue
-                await self._handle_frame(bytes(raw))
+                if isinstance(raw, (bytes, bytearray)):
+                    await self._handle_frame(bytes(raw))
         except asyncio.CancelledError:
             pass
         except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
             close_code = getattr(close_exc, 'code', None)
-            logger.warning(
-                "[%s] WebSocket connection closed: code=%s reason=%s",
-                adapter.name, close_code, getattr(close_exc, 'reason', ''),
-            )
+            logger.warning("[%s] WebSocket connection closed: code=%s reason=%s", adapter.name, close_code, getattr(close_exc, 'reason', ''))
             if close_code and close_code in NO_RECONNECT_CLOSE_CODES:
-                logger.error(
-                    "[%s] Close code %d is non-recoverable, NOT reconnecting",
-                    adapter.name, close_code,
-                )
+                logger.error("[%s] Close code %d is non-recoverable, NOT reconnecting", adapter.name, close_code)
                 adapter._mark_disconnected()
             else:
                 self.schedule_reconnect()
@@ -2200,7 +2165,6 @@ class ConnectionManager:
             self.schedule_reconnect()
 
     async def _handle_frame(self, raw: bytes) -> None:
-        """Handle a single WebSocket frame."""
         adapter = self._adapter
         try:
             msg = decode_conn_msg(raw)
@@ -2211,25 +2175,20 @@ class ConnectionManager:
         cmd_type = head.get("cmd_type", -1)
         cmd = head.get("cmd", "")
         msg_id = head.get("msg_id", "")
-        need_ack = head.get("need_ack", False)
         data: bytes = msg.get("data", b"")
-        # HEARTBEAT_ACK
-        if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
-            logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", adapter.name, msg_id)
-            if self._pending_pong is not None and not self._pending_pong.done():
-                self._pending_pong.set_result(True)
-            else:
-                fut = self._pop_pending(msg_id)
-                if fut is not None:
-                    fut.set_result(True)
-            return
-        # Fire-and-forget heartbeat ACKs: nobody awaits them; discard to avoid "Unmatched" noise.
-        if cmd_type == CMD_TYPE["Response"] and cmd in {"send_group_heartbeat", "send_private_heartbeat"}:
-            logger.debug("[%s] Heartbeat ACK received: cmd=%s msg_id=%s", adapter.name, cmd, msg_id)
-            return
-        # Response to an outbound RPC call
         if cmd_type == CMD_TYPE["Response"]:
-            if msg_id and msg_id in self._pending_acks:
+            if cmd == "ping":  # HEARTBEAT_ACK
+                logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", adapter.name, msg_id)
+                if self._pending_pong is not None and not self._pending_pong.done():
+                    self._pending_pong.set_result(True)
+                else:
+                    fut = self._pop_pending(msg_id)
+                    if fut is not None:
+                        fut.set_result(True)
+            elif cmd in {"send_group_heartbeat", "send_private_heartbeat"}:
+                # Fire-and-forget heartbeat ACKs: nobody awaits them; discard to avoid "Unmatched" noise.
+                logger.debug("[%s] Heartbeat ACK received: cmd=%s msg_id=%s", adapter.name, cmd, msg_id)
+            elif msg_id and msg_id in self._pending_acks:  # response to an outbound RPC
                 fut = self._pop_pending(msg_id)
                 if fut is not None:
                     result = {"head": head}
@@ -2239,13 +2198,11 @@ class ConnectionManager:
             else:
                 logger.debug("[%s] Unmatched Response: cmd=%s msg_id=%s", adapter.name, cmd, msg_id)
             return
-        # Server-initiated Push
         if cmd_type == CMD_TYPE["Push"]:
             logger.info("[%s] Push received: cmd=%s msg_id=%s data_len=%d", adapter.name, cmd, msg_id, len(data))
-            if need_ack and self._ws is not None:
+            if head.get("need_ack", False) and self._ws is not None:
                 try:
-                    ack_bytes = encode_push_ack(head)
-                    await self._ws.send(ack_bytes)
+                    await self._ws.send(encode_push_ack(head))
                 except Exception as ack_exc:
                     logger.debug("[%s] Failed to send PushAck: %s", adapter.name, ack_exc)
             if msg_id and msg_id in self._pending_acks:
@@ -2257,18 +2214,10 @@ class ConnectionManager:
                         fut.set_exception(exc)
                 return
             if data:  # genuine inbound message — dispatch to AI
-                logger.info(
-                    "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
-                    adapter.name, cmd, len(data),
-                )
+                logger.info("[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d", adapter.name, cmd, len(data))
                 self._push_to_inbound(data)
             return
-        logger.debug(
-            "[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s",
-            adapter.name, cmd_type, cmd, msg_id,
-        )
-
-    _DEBOUNCE_WINDOW: float = 1.5  # seconds to wait for companion messages
+        logger.debug("[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s", adapter.name, cmd_type, cmd, msg_id)
 
     def _extract_sender_key(self, raw_data: bytes) -> str:
         """Debounce key 'from_account:group_code' (JSON or protobuf), else a unique fallback."""
@@ -2296,37 +2245,25 @@ class ConnectionManager:
         if existing_timer:
             existing_timer.cancel()
         self._inbound_buffer.setdefault(key, []).append(raw_data)
-        logger.debug(
-            "[%s] Debounce: buffered frame for key=%s, count=%d",
-            self._adapter.name, key, len(self._inbound_buffer[key]),
-        )
-        loop = asyncio.get_running_loop()
-        self._inbound_timers[key] = loop.call_later(self._DEBOUNCE_WINDOW, self._flush_inbound_buffer, key)
+        logger.debug("[%s] Debounce: buffered frame for key=%s, count=%d", self._adapter.name, key, len(self._inbound_buffer[key]))
+        self._inbound_timers[key] = asyncio.get_running_loop().call_later(self._DEBOUNCE_WINDOW, self._flush_inbound_buffer, key)
 
     def _flush_inbound_buffer(self, key: str) -> None:
-        """Flush the debounce buffer for a given key — execute the pipeline."""
+        """Run the pipeline over the buffered frames for *key*."""
         self._inbound_timers.pop(key, None)
         data_list = self._inbound_buffer.pop(key, [])
         if not data_list:
             return
         adapter = self._adapter
-        logger.info(
-            "[%s] Debounce flush: key=%s, aggregated %d frames",
-            adapter.name, key, len(data_list),
-        )
+        logger.info("[%s] Debounce flush: key=%s, aggregated %d frames", adapter.name, key, len(data_list))
         ctx = InboundContext(adapter=adapter, raw_frames=data_list)
-        adapter._track_task(asyncio.create_task(
-            adapter._inbound_pipeline.execute(ctx), name=f"yuanbao-pipeline-{key}",
-        ))
+        adapter._track_task(asyncio.create_task(adapter._inbound_pipeline.execute(ctx), name=f"yuanbao-pipeline-{key}"))
 
-    async def send_biz_request(
-        self, encoded_conn_msg: bytes, req_id: str, timeout: float = DEFAULT_SEND_TIMEOUT,
-    ) -> dict:
+    async def send_biz_request(self, encoded_conn_msg: bytes, req_id: str, timeout: float = DEFAULT_SEND_TIMEOUT) -> dict:
         """Send a business request and await its response future (pending_acks[req_id]), cleaning up on exit."""
         if self._ws is None:
             raise RuntimeError("Not connected")
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_acks[req_id] = future
         try:
             await self._ws.send(encoded_conn_msg)
@@ -2340,7 +2277,6 @@ class ConnectionManager:
             asyncio.create_task(self._reconnect_with_backoff())
 
     async def _reconnect_with_backoff(self) -> bool:
-        """Reconnect with exponential backoff (1s, 2s, 4s, … up to 60s)."""
         if self._reconnecting:
             logger.debug("[%s] Reconnect already in progress, skipping", self._adapter.name)
             return False
@@ -2351,45 +2287,31 @@ class ConnectionManager:
             self._reconnecting = False
 
     async def _do_reconnect(self) -> bool:
-        """Internal reconnect loop, called under the _reconnecting guard."""
+        """Reconnect loop (under the _reconnecting guard) with exponential backoff 1s, 2s, 4s, … capped at 60s."""
         adapter = self._adapter
         for attempt in range(MAX_RECONNECT_ATTEMPTS):
             self._reconnect_attempts = attempt + 1
             wait = min(2 ** attempt, 60)
-            logger.info(
-                "[%s] Reconnect attempt %d/%d in %ds",
-                adapter.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait,
-            )
+            logger.info("[%s] Reconnect attempt %d/%d in %ds", adapter.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait)
             await asyncio.sleep(wait)
             await self._cleanup_ws()
             try:
                 token_data = await SignManager.force_refresh(
-                    adapter._app_key, adapter._app_secret, adapter._api_domain,
-                    route_env=adapter._route_env,
+                    adapter._app_key, adapter._app_secret, adapter._api_domain, route_env=adapter._route_env,
                 )
                 self._apply_bot_id(token_data)
                 if not await self._dial(token_data):
                     logger.warning("[%s] Re-auth failed on attempt %d", adapter.name, attempt + 1)
                     continue
-                self._reconnect_attempts = 0
                 self._consecutive_hb_timeouts = 0
-                adapter._mark_connected()
-                self._start_loops(cancel_existing=True)
-                logger.info(
-                    "[%s] Reconnected on attempt %d. connectId=%s",
-                    adapter.name, attempt + 1, self._connect_id,
-                )
-                YuanbaoAdapter.set_active(adapter)
+                self._connected(cancel_existing=True)
+                logger.info("[%s] Reconnected on attempt %d. connectId=%s", adapter.name, attempt + 1, self._connect_id)
                 return True
             except asyncio.TimeoutError:
                 logger.warning("[%s] Reconnect attempt %d timed out", adapter.name, attempt + 1)
             except Exception as exc:
-                logger.warning(
-                    "[%s] Reconnect attempt %d failed: %s", adapter.name, attempt + 1, exc
-                )
-        logger.error(
-            "[%s] Giving up after %d reconnect attempts", adapter.name, MAX_RECONNECT_ATTEMPTS
-        )
+                logger.warning("[%s] Reconnect attempt %d failed: %s", adapter.name, attempt + 1, exc)
+        logger.error("[%s] Giving up after %d reconnect attempts", adapter.name, MAX_RECONNECT_ATTEMPTS)
         adapter._mark_disconnected()
         return False
 
@@ -2402,41 +2324,42 @@ class ConnectionManager:
                 await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 # No close-frame echo in time; websockets force-closes the transport on cancel.
-                logger.debug(
-                    "[%s] WS close handshake exceeded %.1fs — dropping connection",
-                    self._adapter.name, WS_CLOSE_TIMEOUT_S,
-                )
+                logger.debug("[%s] WS close handshake exceeded %.1fs — dropping connection", self._adapter.name, WS_CLOSE_TIMEOUT_S)
             except Exception:
                 pass
+
+
+def _read_local_file(adapter, label: str, path: str, default_name: str, default_mime: str,
+                     filename: Optional[str] = None) -> Tuple[bytes, str, str]:
+    """(bytes, filename, content_type) for a local file; ValueError when missing."""
+    if not os.path.isfile(path):
+        raise ValueError(f"File not found: {path}")
+    logger.info("[%s] %s: reading %s", adapter.name, label, path)
+    with open(path, "rb") as f:
+        file_bytes = f.read()
+    filename = filename or os.path.basename(path) or default_name
+    return file_bytes, filename, guess_mime_type(filename) or default_mime
+
 
 class MediaSendHandler(ABC):
     """Media send strategy: subclasses provide acquire_file() and build_msg_body(); handle() runs
     the shared flow (check ws → cancel notifier → validate → COS upload → lock → dispatch)."""
 
+    def needs_cos_upload(self) -> bool:
+        """Override to return False for non-COS media (sticker)."""
+        return True
+
     @abstractmethod
     async def acquire_file(self, adapter: "YuanbaoAdapter", **kwargs: Any) -> Tuple[bytes, str, str]:
-        """Return (file_bytes, filename, content_type); raise ValueError when unobtainable."""
+        """(file_bytes, filename, content_type); raise ValueError when unobtainable."""
 
     @abstractmethod
     def build_msg_body(self, upload_result: dict, **kwargs: Any) -> list:
-        """Build platform-specific MsgBody list from COS upload result."""
+        """Platform-specific MsgBody list from the COS upload result."""
 
-    def needs_cos_upload(self) -> bool:
-        """Override to return False for non-COS media (e.g. sticker)."""
-        return True
-
-    async def handle(
-        self,
-        adapter: "YuanbaoAdapter",
-        chat_id: str,
-        reply_to: Optional[str] = None,
-        caption: Optional[str] = None,
-        **kwargs: Any,
-    ) -> "SendResult":
-        """Template method: shared media send flow."""
-        conn = adapter._connection
-        sender = adapter._outbound.sender
-        if conn.ws is None:
+    async def handle(self, adapter: "YuanbaoAdapter", chat_id: str, reply_to: Optional[str] = None,
+                     caption: Optional[str] = None, **kwargs: Any) -> "SendResult":
+        if adapter._connection.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
         adapter._outbound.cancel_slow_notifier(chat_id)
         try:
@@ -2448,33 +2371,24 @@ class MediaSendHandler(ABC):
                     return SendResult(success=False, error=validation_err)
                 token_data = await adapter._get_cached_token()
                 credentials = await get_cos_credentials(
-                    app_key=adapter._app_key,
-                    api_domain=adapter._api_domain,
-                    token=token_data.get("token", ""),
-                    filename=filename,
-                    bot_id=token_data.get("bot_id", "") or adapter._bot_id or "",
+                    app_key=adapter._app_key, api_domain=adapter._api_domain, token=token_data.get("token", ""),
+                    filename=filename, bot_id=token_data.get("bot_id", "") or adapter._bot_id or "",
                     route_env=adapter._route_env,
                 )
                 upload_result = await upload_to_cos(
-                    file_bytes=file_bytes,
-                    filename=filename,
-                    content_type=content_type,
-                    credentials=credentials,
-                    bucket=credentials["bucketName"],
-                    region=credentials["region"],
+                    file_bytes=file_bytes, filename=filename, content_type=content_type, credentials=credentials,
+                    bucket=credentials["bucketName"], region=credentials["region"],
                 )
                 # Drop keys passed explicitly below to avoid "multiple values" TypeError.
                 fwd_kwargs = {k: v for k, v in kwargs.items() if k not in {"file_uuid", "filename", "content_type"}}
                 msg_body = self.build_msg_body(
-                    upload_result, file_uuid=md5_hex(file_bytes), filename=filename,
-                    content_type=content_type, **fwd_kwargs,
+                    upload_result, file_uuid=md5_hex(file_bytes), filename=filename, content_type=content_type, **fwd_kwargs,
                 )
             else:
                 msg_body = self.build_msg_body({}, **kwargs)
             if caption:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": caption}})
-            gc = kwargs.get("group_code", "")
-            return await sender.dispatch_msg_body(chat_id, msg_body, reply_to, group_code=gc)
+                msg_body.append(_text_elem(caption))
+            return await adapter._outbound.sender.dispatch_msg_body(chat_id, msg_body, reply_to, group_code=kwargs.get("group_code", ""))
         except ValueError as ve:
             return SendResult(success=False, error=str(ve))
         except Exception as exc:
@@ -2487,72 +2401,43 @@ class _ImageHandler(MediaSendHandler):
 
     def build_msg_body(self, upload_result, **kwargs):
         return build_image_msg_body(
-            url=upload_result["url"],
-            uuid=kwargs["file_uuid"],
-            filename=kwargs["filename"],
-            size=upload_result["size"],
-            width=upload_result.get("width", 0),
-            height=upload_result.get("height", 0),
-            mime_type=kwargs["content_type"],
+            url=upload_result["url"], uuid=kwargs["file_uuid"], filename=kwargs["filename"], size=upload_result["size"],
+            width=upload_result.get("width", 0), height=upload_result.get("height", 0), mime_type=kwargs["content_type"],
         )
 
 
 class ImageUrlHandler(_ImageHandler):
-    """Strategy: send image from a URL (download → COS → TIMImageElem)."""
+    """Image from a URL (download → COS → TIMImageElem)."""
 
     async def acquire_file(self, adapter, **kwargs):
         image_url: str = kwargs["image_url"]
         logger.info("[%s] ImageUrlHandler: downloading %s", adapter.name, image_url)
-        file_bytes, content_type = await media_download_url(
-            image_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
-        )
+        file_bytes, content_type = await media_download_url(image_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB)
+        path_part = image_url.split("?")[0]
         if not content_type or content_type == "application/octet-stream":
-            path_part = image_url.split("?")[0]
             content_type = guess_mime_type(path_part) or "image/jpeg"
-        filename = os.path.basename(image_url.split("?")[0]) or "image.jpg"
-        return file_bytes, filename, content_type
+        return file_bytes, os.path.basename(path_part) or "image.jpg", content_type
 
 
 class ImageFileHandler(_ImageHandler):
-    """Strategy: send image from a local file path (read → COS → TIMImageElem)."""
+    """Image from a local path (read → COS → TIMImageElem)."""
 
     async def acquire_file(self, adapter, **kwargs):
-        image_path: str = kwargs["image_path"]
-        if not os.path.isfile(image_path):
-            raise ValueError(f"File not found: {image_path}")
-        logger.info("[%s] ImageFileHandler: reading %s", adapter.name, image_path)
-        with open(image_path, "rb") as f:
-            file_bytes = f.read()
-        filename = os.path.basename(image_path) or "image.jpg"
-        content_type = guess_mime_type(filename) or "image/jpeg"
-        return file_bytes, filename, content_type
+        return _read_local_file(adapter, "ImageFileHandler", kwargs["image_path"], "image.jpg", "image/jpeg")
 
 
 class DocumentHandler(MediaSendHandler):
-    """Strategy: send local file/document (read → COS → TIMFileElem)."""
+    """Local file/document (read → COS → TIMFileElem)."""
 
     async def acquire_file(self, adapter, **kwargs):
-        file_path: str = kwargs["file_path"]
-        if not os.path.isfile(file_path):
-            raise ValueError(f"File not found: {file_path}")
-        logger.info("[%s] DocumentHandler: reading %s", adapter.name, file_path)
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-        filename = kwargs.get("filename") or os.path.basename(file_path) or "document"
-        content_type = guess_mime_type(filename) or "application/octet-stream"
-        return file_bytes, filename, content_type
+        return _read_local_file(adapter, "DocumentHandler", kwargs["file_path"], "document", "application/octet-stream", kwargs.get("filename"))
 
     def build_msg_body(self, upload_result, **kwargs):
-        return build_file_msg_body(
-            url=upload_result["url"],
-            filename=kwargs["filename"],
-            uuid=kwargs["file_uuid"],
-            size=upload_result["size"],
-        )
+        return build_file_msg_body(url=upload_result["url"], filename=kwargs["filename"], uuid=kwargs["file_uuid"], size=upload_result["size"])
 
 
 class StickerHandler(MediaSendHandler):
-    """Strategy: send sticker/emoji (TIMFaceElem, no COS upload needed)."""
+    """Sticker/emoji (TIMFaceElem, no COS upload)."""
 
     def needs_cos_upload(self) -> bool:
         return False
@@ -2562,10 +2447,7 @@ class StickerHandler(MediaSendHandler):
 
     def build_msg_body(self, upload_result, **kwargs):
         from gateway.platforms.yuanbao_sticker import (
-            get_sticker_by_name,
-            get_random_sticker,
-            build_face_msg_body,
-            build_sticker_msg_body,
+            get_sticker_by_name, get_random_sticker, build_face_msg_body, build_sticker_msg_body,
         )
         sticker_name = kwargs.get("sticker_name")
         face_index = kwargs.get("face_index")
@@ -2574,11 +2456,9 @@ class StickerHandler(MediaSendHandler):
             if sticker is None:
                 raise ValueError(f"Sticker not found: {sticker_name!r}")
             return build_sticker_msg_body(sticker)
-        elif face_index is not None:
+        if face_index is not None:
             return build_face_msg_body(face_index=face_index)
-        else:
-            sticker = get_random_sticker()
-            return build_sticker_msg_body(sticker)
+        return build_sticker_msg_body(get_random_sticker())
 
 
 class GroupQueryService:
@@ -2600,30 +2480,24 @@ class GroupQueryService:
                 logger.warning("[%s] %s failed: status=%d", adapter.name, label, status)
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
-            if biz_data and isinstance(biz_data, bytes):
-                return decode_rsp(biz_data)
-            return empty
+            return decode_rsp(biz_data) if biz_data and isinstance(biz_data, bytes) else empty
         except asyncio.TimeoutError:
             logger.warning("[%s] %s timeout: group=%s", adapter.name, label, group_code)
-            return None
         except Exception as exc:
             logger.warning("[%s] %s failed: %s", adapter.name, label, exc)
-            return None
+        return None
 
     async def query_group_info_raw(self, group_code: str) -> Optional[dict]:
-        """Query group info via WS (name, owner, member count…); None on failure."""
+        """Group info (name, owner, member count…); None on failure."""
         return await self._ws_query(
             "query_group_info", group_code, encode_query_group_info(group_code),
             decode_query_group_info_rsp, {"group_code": group_code},
         )
 
-    async def get_group_member_list_raw(
-        self, group_code: str, offset: int = 0, limit: int = 200
-    ) -> Optional[dict]:
-        """Query group member list via WS; None on failure. Populates adapter._member_cache."""
+    async def get_group_member_list_raw(self, group_code: str, offset: int = 0, limit: int = 200) -> Optional[dict]:
+        """Group member list; None on failure. Populates adapter._member_cache."""
         result = await self._ws_query(
-            "get_group_member_list", group_code,
-            encode_get_group_member_list(group_code, offset=offset, limit=limit),
+            "get_group_member_list", group_code, encode_get_group_member_list(group_code, offset=offset, limit=limit),
             decode_get_group_member_list_rsp, {"members": [], "next_offset": 0, "is_complete": True},
         )
         if result and result.get("members"):
@@ -2647,55 +2521,43 @@ class HeartbeatManager:
             return
         try:
             if chat_id.startswith("group:"):
-                encoded = encode_send_group_heartbeat(
-                    from_account=adapter._bot_id, group_code=chat_id[len("group:"):], heartbeat=heartbeat_val,
-                )
+                encoded = encode_send_group_heartbeat(from_account=adapter._bot_id, group_code=chat_id[len("group:"):], heartbeat=heartbeat_val)
             else:
-                encoded = encode_send_private_heartbeat(
-                    from_account=adapter._bot_id, to_account=chat_id.removeprefix("direct:"), heartbeat=heartbeat_val,
-                )
+                encoded = encode_send_private_heartbeat(from_account=adapter._bot_id, to_account=chat_id.removeprefix("direct:"), heartbeat=heartbeat_val)
             await conn.ws.send(encoded)
-            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
-            logger.debug(
-                "[%s] Reply heartbeat %s sent: chat=%s",
-                adapter.name, status_name, chat_id,
-            )
+            logger.debug("[%s] Reply heartbeat %s sent: chat=%s", adapter.name,
+                         "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH", chat_id)
         except Exception as exc:
             logger.debug("[%s] send_heartbeat_once failed: %s", adapter.name, exc)
 
     async def start(self, chat_id: str) -> None:
-        """Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s)."""
+        """Start or renew the periodic RUNNING sender."""
         adapter = self._adapter
-        conn = adapter._connection
-        if conn.ws is None or not adapter._bot_id:
+        if adapter._connection.ws is None or not adapter._bot_id:
             return
         self._reply_hb_last_active[chat_id] = time.time()
         existing = self._reply_heartbeat_tasks.get(chat_id)
         if existing and not existing.done():
             return
-        self._reply_heartbeat_tasks[chat_id] = asyncio.create_task(
-            self._worker(chat_id), name=f"yuanbao-reply-hb-{chat_id}",
-        )
+        self._reply_heartbeat_tasks[chat_id] = asyncio.create_task(self._worker(chat_id), name=f"yuanbao-reply-hb-{chat_id}")
 
     async def _worker(self, chat_id: str) -> None:
-        """Send RUNNING every 2s; after 30s without renewal (or WS loss) send FINISH and exit."""
+        """Send RUNNING every 2s; after 30s without renewal (or WS loss) send FINISH and exit.
+        A cancelled worker sends no FINISH — stop() decides that."""
+        cancelled = False
         try:
             await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
             while True:
                 await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
-                last_active = self._reply_hb_last_active.get(chat_id, 0)
-                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
+                if time.time() - self._reply_hb_last_active.get(chat_id, 0) > REPLY_HEARTBEAT_TIMEOUT_S:
                     break
-                conn = self._adapter._connection
-                if conn.ws is None:
+                if self._adapter._connection.ws is None:
                     break
                 await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
         except asyncio.CancelledError:
             cancelled = True
         except Exception:
-            cancelled = False
-        else:
-            cancelled = False
+            pass
         finally:
             if not cancelled:
                 await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
@@ -2703,7 +2565,7 @@ class HeartbeatManager:
             self._reply_hb_last_active.pop(chat_id, None)
 
     async def stop(self, chat_id: str, send_finish: bool = True) -> None:
-        """Stop Reply Heartbeat and optionally send FINISH."""
+        """Stop the RUNNING sender and optionally send FINISH."""
         task = self._reply_heartbeat_tasks.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
@@ -2715,7 +2577,6 @@ class HeartbeatManager:
             await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
 
     async def close(self) -> None:
-        """Cancel all reply heartbeat tasks."""
         _cancel_all(self._reply_heartbeat_tasks)
         self._reply_hb_last_active.clear()
 
@@ -2729,18 +2590,13 @@ class SlowResponseNotifier:
         self._tasks: Dict[str, asyncio.Task] = {}
 
     async def start(self, chat_id: str) -> None:
-        """Start a delayed task that notifies the user when the agent is slow."""
         self.cancel(chat_id)
         self._tasks[chat_id] = asyncio.create_task(self._notifier(chat_id), name=f"yuanbao-slow-resp-{chat_id}")
 
     async def _notifier(self, chat_id: str) -> None:
-        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
         try:
             await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
-            logger.info(
-                "[%s] Agent response exceeded %ds for %s, sending wait notice",
-                self._adapter.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
-            )
+            logger.info("[%s] Agent response exceeded %ds for %s, sending wait notice", self._adapter.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id)
             await self._sender.send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
         except asyncio.CancelledError:
             pass
@@ -2748,13 +2604,11 @@ class SlowResponseNotifier:
             logger.debug("[%s] Slow-response notifier failed: %s", self._adapter.name, exc)
 
     def cancel(self, chat_id: str) -> None:
-        """Cancel the pending slow-response notifier for *chat_id*, if any."""
         task = self._tasks.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
 
     async def close(self) -> None:
-        """Cancel all slow-response tasks."""
         _cancel_all(self._tasks)
 
 
@@ -2764,6 +2618,8 @@ class MessageSender:
 
     IMAGE_EXTS: ClassVar[frozenset] = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
     CHAT_DICT_MAX_SIZE: ClassVar[int] = 1000  # Max distinct chat IDs in _chat_locks
+    # @nickname bounded by whitespace / line edges
+    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
 
     def __init__(self, adapter: "YuanbaoAdapter") -> None:
         self._adapter = adapter
@@ -2779,43 +2635,30 @@ class MessageSender:
         }
 
     def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Return (or create) a per-chat-id lock with safe LRU eviction."""
+        """Per-chat-id lock with LRU eviction (prefers evicting an unlocked entry)."""
         if chat_id in self._chat_locks:
             self._chat_locks.move_to_end(chat_id)
             return self._chat_locks[chat_id]
         if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
-            evicted = False
-            for key in list(self._chat_locks):
-                if not self._chat_locks[key].locked():
-                    self._chat_locks.pop(key)
-                    evicted = True
-                    break
-            if not evicted:
-                self._chat_locks.pop(next(iter(self._chat_locks)))
+            victim = next((k for k in self._chat_locks if not self._chat_locks[k].locked()), next(iter(self._chat_locks)))
+            self._chat_locks.pop(victim)
         self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
 
-    async def send_text(
-        self, chat_id: str, content: str, reply_to: Optional[str] = None, group_code: str = "",
-    ) -> "SendResult":
-        """Send text message with auto-chunking and per-chat-id ordering guarantee."""
+    async def send_text(self, chat_id: str, content: str, reply_to: Optional[str] = None, group_code: str = "") -> "SendResult":
+        """Send text with auto-chunking and per-chat-id ordering guarantee."""
         adapter = self._adapter
-        conn = adapter._connection
-        if conn.ws is None:
+        if adapter._connection.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
         if self._on_send_start:
             self._on_send_start(chat_id)
         async with self.get_chat_lock(chat_id):
             content_to_send = self.strip_cron_wrapper(content)
             chunks = self.truncate_message(content_to_send, adapter.MAX_TEXT_CHUNK)
-            logger.info(
-                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
-                adapter.name, len(content_to_send), adapter.MAX_TEXT_CHUNK,
-                len(chunks), [len(c) for c in chunks],
-            )
+            logger.info("[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
+                        adapter.name, len(content_to_send), adapter.MAX_TEXT_CHUNK, len(chunks), [len(c) for c in chunks])
             for i, chunk in enumerate(chunks):
-                r_to = reply_to if i == 0 else None
-                result = await self.send_text_chunk(chat_id, chunk, r_to, group_code=group_code)
+                result = await self.send_text_chunk(chat_id, chunk, reply_to if i == 0 else None, group_code=group_code)
                 if not result.success:
                     return result
         if self._on_send_finish:  # e.g. FINISH heartbeat
@@ -2825,19 +2668,14 @@ class MessageSender:
                 pass
         return SendResult(success=True)
 
-    async def send_media(
-        self, chat_id: str, handler_name: str, reply_to: Optional[str] = None,
-        caption: Optional[str] = None, **kwargs: Any,
-    ) -> "SendResult":
-        """Dispatch media send to the named handler strategy."""
+    async def send_media(self, chat_id: str, handler_name: str, reply_to: Optional[str] = None,
+                         caption: Optional[str] = None, **kwargs: Any) -> "SendResult":
         handler = self._media_handlers.get(handler_name)
         if handler is None:
             return SendResult(success=False, error=f"Unknown media handler: {handler_name!r}")
         return await handler.handle(self._adapter, chat_id, reply_to=reply_to, caption=caption, **kwargs)
 
-    async def send_direct(
-        self, chat_id: str, message: str, media_files: Optional[List[Tuple[str, bool]]] = None,
-    ) -> Dict[str, Any]:
+    async def send_direct(self, chat_id: str, message: str, media_files: Optional[List[Tuple[str, bool]]] = None) -> Dict[str, Any]:
         """send_message tool entry: text first, then each media file by extension, on the running adapter."""
         adapter = self._adapter
         last_result: Optional["SendResult"] = None
@@ -2846,8 +2684,7 @@ class MessageSender:
             if not last_result.success:
                 return {"error": f"Yuanbao send failed: {last_result.error}"}
         for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in self.IMAGE_EXTS:
+            if Path(media_path).suffix.lower() in self.IMAGE_EXTS:
                 last_result = await adapter.send_image_file(chat_id, media_path)
             else:
                 last_result = await adapter.send_document(chat_id, media_path)
@@ -2855,16 +2692,9 @@ class MessageSender:
                 return {"error": f"Yuanbao media send failed: {last_result.error}"}
         if last_result is None:
             return {"error": "No deliverable text or media remained after processing"}
-        return {
-            "success": True,
-            "platform": "yuanbao",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id if last_result else None,
-        }
+        return {"success": True, "platform": "yuanbao", "chat_id": chat_id, "message_id": last_result.message_id}
 
-    async def dispatch_msg_body(
-        self, chat_id: str, msg_body: list, reply_to: Optional[str] = None, group_code: str = "",
-    ) -> "SendResult":
+    async def dispatch_msg_body(self, chat_id: str, msg_body: list, reply_to: Optional[str] = None, group_code: str = "") -> "SendResult":
         """Lock + dispatch an arbitrary MsgBody to C2C or group."""
         async with self.get_chat_lock(chat_id):
             result = await self._send_msg_body(chat_id, msg_body, reply_to, group_code)
@@ -2872,9 +2702,7 @@ class MessageSender:
             return SendResult(success=True, message_id=result.get("msg_key"))
         return SendResult(success=False, error=result.get("error", "Unknown error"))
 
-    async def send_text_chunk(
-        self, chat_id: str, text: str, reply_to: Optional[str] = None, retry: int = 3, group_code: str = "",
-    ) -> "SendResult":
+    async def send_text_chunk(self, chat_id: str, text: str, reply_to: Optional[str] = None, retry: int = 3, group_code: str = "") -> "SendResult":
         """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
         adapter = self._adapter
         last_error: str = "Unknown error"
@@ -2883,27 +2711,18 @@ class MessageSender:
                 if chat_id.startswith("group:"):
                     msg_body = self._build_msg_body_with_mentions(text, chat_id[len("group:"):])
                 else:
-                    msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+                    msg_body = [_text_elem(text)]
                 raw = await self._send_msg_body(chat_id, msg_body, reply_to, group_code)
                 if raw.get("success"):
                     return SendResult(success=True, message_id=raw.get("msg_key"))
                 last_error = raw.get("error", "Unknown error")
-                logger.warning(
-                    "[%s] send_text_chunk attempt %d/%d failed: %s",
-                    adapter.name, attempt + 1, retry, last_error,
-                )
+                logger.warning("[%s] send_text_chunk attempt %d/%d failed: %s", adapter.name, attempt + 1, retry, last_error)
             except Exception as exc:
                 last_error = str(exc)
-                logger.warning(
-                    "[%s] send_text_chunk attempt %d/%d exception: %s",
-                    adapter.name, attempt + 1, retry, last_error,
-                )
+                logger.warning("[%s] send_text_chunk attempt %d/%d exception: %s", adapter.name, attempt + 1, retry, last_error)
             if attempt < retry - 1:
                 await asyncio.sleep(2 ** attempt)
-        logger.error(
-            "[%s] send_text_chunk max retries (%d) exceeded. Last error: %s",
-            adapter.name, retry, last_error,
-        )
+        logger.error("[%s] send_text_chunk max retries (%d) exceeded. Last error: %s", adapter.name, retry, last_error)
         return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
 
     async def _send_msg_body(self, chat_id: str, msg_body: list, reply_to: Optional[str], group_code: str) -> dict:
@@ -2912,11 +2731,9 @@ class MessageSender:
             return await self.send_group_msg_body(chat_id[len("group:"):], msg_body, reply_to)
         return await self.send_c2c_msg_body(chat_id.removeprefix("direct:"), msg_body, group_code=group_code)
 
-    # @nickname bounded by whitespace / line edges
-    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
-
     def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
-        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
+        """Parse @nickname patterns against the (unexpired) member cache into mixed TIMTextElem +
+        TIMCustomElem(elem_type 1002) msg_body; plain text when no members are cached."""
         members: list = []
         cached = self._adapter._member_cache.get(group_code)
         if cached:
@@ -2926,7 +2743,7 @@ class MessageSender:
             else:
                 del self._adapter._member_cache[group_code]
         if not members:
-            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+            return [_text_elem(text)]
         nickname_to_uid = {}
         for m in members:
             nick = m.get("nickname") or m.get("nick_name") or ""
@@ -2936,53 +2753,42 @@ class MessageSender:
         msg_body: list = []
         last_idx = 0
         for match in self._AT_USER_RE.finditer(text):
-            start = match.start()
-            if start > last_idx:
-                seg = text[last_idx:start].strip()
-                if seg:
-                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
+            seg = text[last_idx:match.start()].strip()
+            if seg:
+                msg_body.append(_text_elem(seg))
             nickname = match.group(1)
             entry = nickname_to_uid.get(nickname.lower())
             if entry:
                 real_nick, uid = entry
                 msg_body.append({
                     "msg_type": "TIMCustomElem",
-                    "msg_content": {
-                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
-                    },
+                    "msg_content": {"data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid})},
                 })
             else:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
+                msg_body.append(_text_elem(f"@{nickname}"))
             last_idx = match.end()
-        if last_idx < len(text):
-            tail = text[last_idx:].strip()
-            if tail:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
-        if not msg_body:
-            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
-        return msg_body
+        tail = text[last_idx:].strip()
+        if tail:
+            msg_body.append(_text_elem(tail))
+        return msg_body or [_text_elem(text)]
 
     async def send_c2c_msg_body(self, to_account: str, msg_body: list, group_code: str = "") -> dict:
-        """Send C2C message with arbitrary MsgBody."""
         req_id = f"c2c_{next_seq_no()}"
         encoded = encode_send_c2c_message(
-            to_account=to_account, msg_body=msg_body, from_account=self._adapter._bot_id or "",
-            msg_id=req_id, group_code=group_code,
+            to_account=to_account, msg_body=msg_body, from_account=self._adapter._bot_id or "", msg_id=req_id, group_code=group_code,
         )
         return await self._dispatch_encoded(self._adapter, encoded, req_id)
 
     async def send_group_msg_body(self, group_code: str, msg_body: list, reply_to: Optional[str] = None) -> dict:
-        """Send group message with arbitrary MsgBody."""
         req_id = f"grp_{next_seq_no()}"
         encoded = encode_send_group_message(
-            group_code=group_code, msg_body=msg_body, from_account=self._adapter._bot_id or "",
-            msg_id=req_id, ref_msg_id=reply_to or "",
+            group_code=group_code, msg_body=msg_body, from_account=self._adapter._bot_id or "", msg_id=req_id, ref_msg_id=reply_to or "",
         )
         return await self._dispatch_encoded(self._adapter, encoded, req_id)
 
     @staticmethod
     async def _dispatch_encoded(adapter: "YuanbaoAdapter", encoded: bytes, req_id: str) -> dict:
-        """Send pre-encoded bytes via WS and return a normalised result dict."""
+        """Send pre-encoded bytes via WS → ``{"success", "msg_key" | "error"}``."""
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
@@ -2993,44 +2799,33 @@ class MessageSender:
 
     @staticmethod
     def validate_media(file_bytes: Optional[bytes], filename: str, max_size_mb: int = 20) -> Optional[str]:
-        """Pre-upload check; returns an error description or None."""
+        """Pre-upload check; error description or None."""
         if file_bytes is None or len(file_bytes) == 0:
             return f"Empty file: {filename}"
-        max_bytes = max_size_mb * 1024 * 1024
-        if len(file_bytes) > max_bytes:
-            size_mb = len(file_bytes) / 1024 / 1024
-            return f"File too large: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
+        if len(file_bytes) > max_size_mb * 1024 * 1024:
+            return f"File too large: {filename} ({len(file_bytes) / 1024 / 1024:.1f}MB > {max_size_mb}MB)"
         return None
 
     @staticmethod
-    def truncate_message(
-        content: str, max_length: int = 4000, len_fn: Optional[Callable[[str], int]] = None,
-    ) -> List[str]:
+    def truncate_message(content: str, max_length: int = 4000, len_fn: Optional[Callable[[str], int]] = None) -> List[str]:
         """Table/fence-aware chunking via MarkdownProcessor, stripping ``(1/3)`` page indicators."""
-        _len = len_fn or len
-        if _len(content) <= max_length:
+        if (len_fn or len)(content) <= max_length:
             return [content]
-        chunks = MarkdownProcessor.chunk_markdown_text(content, max_length, len_fn=len_fn)
-        chunks = [_INDICATOR_RE.sub('', c) for c in chunks]
-        return chunks if chunks else [content]
+        chunks = [_INDICATOR_RE.sub('', c) for c in MarkdownProcessor.chunk_markdown_text(content, max_length, len_fn=len_fn)]
+        return chunks or [content]
 
     @staticmethod
     def strip_cron_wrapper(content: str) -> str:
-        """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
+        """Strip the scheduler's cron header/footer wrapper; unchanged when the shape doesn't match."""
         if not content.startswith("Cronjob Response: "):
             return content
         divider = "\n-------------\n\n"
         footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
         divider_pos = content.find(divider)
         footer_pos = content.rfind(footer_prefix)
-        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos or "\n(job_id: " not in content[:divider_pos]:
             return content
-        header = content[:divider_pos]
-        if "\n(job_id: " not in header:
-            return content
-        body_start = divider_pos + len(divider)
-        body = content[body_start:footer_pos].strip()
-        return body or content
+        return content[divider_pos + len(divider):footer_pos].strip() or content
 
     async def close(self) -> None:
         self._chat_locks.clear()
@@ -3046,12 +2841,8 @@ class OutboundManager:
         self.sender: MessageSender = MessageSender(adapter)
         self.heartbeat: HeartbeatManager = HeartbeatManager(adapter)
         self.slow_notifier: SlowResponseNotifier = SlowResponseNotifier(adapter, self.sender)
-        self.sender._on_send_start = self._handle_send_start
+        self.sender._on_send_start = self.slow_notifier.cancel  # before a send: drop the slow-response notice
         self.sender._on_send_finish = self._handle_send_finish
-
-    def _handle_send_start(self, chat_id: str) -> None:
-        """Before a send: cancel the slow-response notifier."""
-        self.slow_notifier.cancel(chat_id)
 
     async def _handle_send_finish(self, chat_id: str) -> None:
         """After a send: FINISH heartbeat."""
@@ -3071,7 +2862,6 @@ class OutboundManager:
         return self.sender._chat_locks
 
     async def close(self) -> None:
-        """Shut down all sub-managers."""
         await self.sender.close()
         await self.heartbeat.close()
         await self.slow_notifier.close()
@@ -3083,18 +2873,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
-    MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
+    MEDIA_MAX_SIZE_MB: int = 50
+    DM_MAX_CHARS = 10000
 
     _active_instance: ClassVar[Optional["YuanbaoAdapter"]] = None
 
     @classmethod
     def get_active(cls) -> Optional["YuanbaoAdapter"]:
-        """Return the currently connected YuanbaoAdapter, or None."""
         return cls._active_instance
 
     @classmethod
     def set_active(cls, adapter: Optional["YuanbaoAdapter"]) -> None:
-        """Register (or clear) the active adapter instance."""
         cls._active_instance = adapter
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
@@ -3133,16 +2922,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return policy, [x.strip() for x in raw.split(",") if x.strip()]
         dm_policy, dm_allow_from = _policy("dm")
         group_policy, group_allow_from = _policy("group")
-        self._access_policy = AccessPolicy(
-            dm_policy=dm_policy, dm_allow_from=dm_allow_from,
-            group_policy=group_policy, group_allow_from=group_allow_from,
-        )
+        self._access_policy = AccessPolicy(dm_policy=dm_policy, dm_allow_from=dm_allow_from,
+                                           group_policy=group_policy, group_allow_from=group_allow_from)
         self._group_query = GroupQueryService(self)
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
         # Auto-sethome stays open when no home is set or the home is a group (upgradable by first DM).
-        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (
-            config.home_channel.chat_id if config.home_channel else ""
-        )
+        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (config.home_channel.chat_id if config.home_channel else "")
         self._auto_sethome_done: bool = bool(_existing_home) and not _existing_home.startswith("group:")
 
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
@@ -3178,7 +2963,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return policy.is_group_allowed(group_code)
             if policy.group_policy == "open":
                 return policy._open_dm_opted_in()
-            return False
         return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -3203,17 +2987,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._group_queues.clear()
         logger.info("[%s] Disconnected", self.name)
 
-    async def send(
-        self, chat_id: str, content: str, reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None, group_code: str = "",
-    ) -> SendResult:
+    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
+                   metadata: Optional[Dict[str, Any]] = None, group_code: str = "") -> SendResult:
         return await self._outbound.sender.send_text(chat_id, content, reply_to, group_code=group_code)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Chat metadata from the chat_id prefix (``group:`` → group, else dm)."""
-        if chat_id.startswith("group:"):
-            return {"name": chat_id, "type": "group"}
-        return {"name": chat_id, "type": "dm"}
+        return {"name": chat_id, "type": "group" if chat_id.startswith("group:") else "dm"}
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """Start the RUNNING heartbeat."""
@@ -3252,57 +3031,36 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def get_group_member_list(self, group_code: str, offset: int = 0, limit: int = 200) -> Optional[dict]:
         return await self._group_query.get_group_member_list_raw(group_code, offset=offset, limit=limit)
 
-    DM_MAX_CHARS = 10000
-
     async def send_dm(self, user_id: str, text: str, group_code: str = "") -> SendResult:
         """Proactive C2C DM (text capped at DM_MAX_CHARS); group_code marks a group-originated DM."""
         if not self._access_policy.is_dm_allowed(user_id):
             return SendResult(success=False, error="DM access denied for this user")
         if len(text) > self.DM_MAX_CHARS:
             text = text[:self.DM_MAX_CHARS] + "\n...(truncated)"
-        chat_id = f"direct:{user_id}"
-        return await self.send(chat_id, text, group_code=group_code)
+        return await self.send(f"direct:{user_id}", text, group_code=group_code)
 
     # Media sends delegate to MessageSender.send_media via the named handler strategy.
-    async def send_image(
-        self, chat_id: str, image_url: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any,
-    ) -> SendResult:
-        return await self._outbound.sender.send_media(
-            chat_id, "image_url", reply_to=reply_to, caption=caption, image_url=image_url, **kwargs,
-        )
+    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any) -> SendResult:
+        return await self._outbound.sender.send_media(chat_id, "image_url", reply_to=reply_to, caption=caption, image_url=image_url, **kwargs)
 
-    async def send_image_file(
-        self, chat_id: str, image_path: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any,
-    ) -> SendResult:
-        return await self._outbound.sender.send_media(
-            chat_id, "image_file", reply_to=reply_to, caption=caption, image_path=image_path, **kwargs,
-        )
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any) -> SendResult:
+        return await self._outbound.sender.send_media(chat_id, "image_file", reply_to=reply_to, caption=caption, image_path=image_path, **kwargs)
 
-    async def send_sticker(
-        self, chat_id: str, sticker_name: Optional[str] = None, face_index: Optional[int] = None,
-        reply_to: Optional[str] = None, **kwargs: Any,
-    ) -> SendResult:
-        return await self._outbound.sender.send_media(
-            chat_id, "sticker", reply_to=reply_to, sticker_name=sticker_name, face_index=face_index, **kwargs,
-        )
+    async def send_sticker(self, chat_id: str, sticker_name: Optional[str] = None, face_index: Optional[int] = None,
+                           reply_to: Optional[str] = None, **kwargs: Any) -> SendResult:
+        return await self._outbound.sender.send_media(chat_id, "sticker", reply_to=reply_to, sticker_name=sticker_name, face_index=face_index, **kwargs)
 
-    async def send_document(
-        self, chat_id: str, file_path: str, filename: Optional[str] = None, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any,
-    ) -> SendResult:
+    async def send_document(self, chat_id: str, file_path: str, filename: Optional[str] = None, caption: Optional[str] = None,
+                            reply_to: Optional[str] = None, metadata: Optional[dict] = None, **kwargs: Any) -> SendResult:
         return await self._outbound.sender.send_media(
             chat_id, "document", reply_to=reply_to, caption=caption, file_path=file_path, filename=filename, **kwargs,
         )
 
     async def _get_cached_token(self) -> dict:
-        """Get the current valid sign token (using module-level cache)."""
-        return await SignManager.get_token(
-            self._app_key, self._app_secret, self._api_domain,
-            route_env=self._route_env,
-        )
-
+        """Current valid sign token (module-level cache)."""
+        return await SignManager.get_token(self._app_key, self._app_secret, self._api_domain, route_env=self._route_env)
 
 
 # Module-level delegates kept for external importers (tools/send_message_tool, tools/yuanbao_tools).
@@ -3310,10 +3068,6 @@ def get_active_adapter() -> Optional["YuanbaoAdapter"]:
     return YuanbaoAdapter.get_active()
 
 
-async def send_yuanbao_direct(
-    adapter: "YuanbaoAdapter",
-    chat_id: str,
-    message: str,
-    media_files: Optional[List[Tuple[str, bool]]] = None,
-) -> Dict[str, Any]:
+async def send_yuanbao_direct(adapter: "YuanbaoAdapter", chat_id: str, message: str,
+                              media_files: Optional[List[Tuple[str, bool]]] = None) -> Dict[str, Any]:
     return await adapter._outbound.sender.send_direct(chat_id, message, media_files)
