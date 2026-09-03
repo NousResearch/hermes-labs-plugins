@@ -82,13 +82,26 @@ def _csv_set(raw: Any) -> Set[str]:
 
 
 def dingtalk_deps_present() -> bool:
-    """PASSIVE registry ``check_fn`` — must never install; credentials are gated separately."""
+    """PASSIVE registry ``check_fn`` — must never install; credentials are gated separately.
+
+    Registry ``check_fn`` — called from status displays and config loading, so it must never install
+    anything. The ACTIVE lazy-installer (``check_dingtalk_requirements``) is registered as
+    ``ensure_deps_fn`` and runs from ``create_adapter()`` when this returns False (#79812).
+    """
     return DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE
 
 
 def ensure_dingtalk_deps() -> bool:
     """ACTIVE deps-only installer (registry ``ensure_deps_fn``); rebinds module globals. Deliberately does NOT
-    check credentials: an ``extra``-configured platform would otherwise be vetoed before ever installing (deadlock)."""
+    check credentials: an ``extra``-configured platform would otherwise be vetoed before ever installing (deadlock).
+
+    Lazy-installs dingtalk-stream/httpx and rebinds module globals. Deliberately does NOT check credentials
+    — ``ensure_deps_fn``'s contract is deps-only ("Returns True once deps are importable"); credentials are
+    gated by ``is_connected``/``validate_config``. Otherwise a platform configured via
+    ``PlatformConfig.extra`` (which ``_is_connected`` accepts) would pass enablement, reach
+    ``create_adapter()``, and have the installer veto on env-var grounds before ever installing —
+    re-creating the #79812 deadlock for extra-configured setups.
+    """
     global DINGTALK_STREAM_AVAILABLE, dingtalk_stream, ChatbotMessage, CallbackMessage, AckMessage, HTTPX_AVAILABLE, httpx
     if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
         return True
@@ -694,7 +707,12 @@ def _nested_allowed_users(yaml_cfg: dict, dingtalk_cfg: dict):
 
 def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
     """Translate config.yaml dingtalk: keys into DINGTALK_* env vars (apply_yaml_config_fn); env wins, returns None. The docs put the allowlist at
-    ``gateway.platforms.dingtalk.extra.allowed_users`` but gateway authz only consults DINGTALK_ALLOWED_USERS, so nested-only allowlists are bridged too."""
+    ``gateway.platforms.dingtalk.extra.allowed_users`` but gateway authz only consults DINGTALK_ALLOWED_USERS, so nested-only allowlists are bridged too.
+
+    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy dingtalk_cfg block from
+    gateway/config.py::load_gateway_config(). Env vars take precedence over YAML (each assignment guarded by
+    not os.getenv(...)). Returns None — everything flows through env.
+    """
     for key, env, encode in (("require_mention", "DINGTALK_REQUIRE_MENTION", lambda v: str(v).lower()), ("mention_patterns", "DINGTALK_MENTION_PATTERNS", json.dumps)):
         if key in dingtalk_cfg and not os.getenv(env):
             os.environ[env] = encode(dingtalk_cfg[key])
