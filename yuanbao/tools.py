@@ -41,8 +41,7 @@ def _err(msg: str) -> dict:
 
 
 def _yb_tool(label: str):
-    """Handler decorator: ``fn(args)`` result → tool_result; ``_YbError`` → its envelope;
-    any other exception → logged + ``_err(str(exc))``."""
+    """Handler decorator: ``fn(args)`` → tool_result; ``_YbError`` → its envelope; else logged ``_err``."""
     def deco(fn):
         @functools.wraps(fn)
         async def handler(args, **kw):
@@ -242,12 +241,10 @@ async def send_sticker(args) -> dict:
 async def send_dm(args) -> dict:
     """Send a DM to a group member, with optional media.
 
-    group_code: explicit arg, else the session's "group:<code>" chat_id. Without ``user_id``
-    the member list is searched by ``name`` (partial, case-insensitive; >1 match returns
-    candidates). media_files items are {"path", "is_voice"} dicts or (path, is_voice) pairs;
-    ``MEDIA:<path>`` tags embedded in the text are extracted too. Text goes via adapter.send_dm;
-    media via send_image_file (images) or send_document. Partial media failures are reported
-    in ``note``, not as failure.
+    group_code defaults to the session's "group:<code>" chat_id. Without ``user_id`` the member
+    list is searched by ``name`` (partial, case-insensitive; >1 match returns candidates).
+    media_files items are {"path", "is_voice"} dicts or (path, is_voice) pairs; ``MEDIA:<path>``
+    tags in the text count too. Partial media failures are reported in ``note``, not as failure.
     """
     group_code = args.get("group_code", "")
     if not group_code:
@@ -530,11 +527,6 @@ _TOOLS = (
 
 for _schema, _handler, _emoji in _TOOLS:
     registry.register(
-        name=_schema["name"],
-        toolset="hermes-yuanbao",
-        schema=_schema,
-        handler=_handler,
-        check_fn=_check_yuanbao,
-        is_async=True,
-        emoji=_emoji,
+        name=_schema["name"], toolset="hermes-yuanbao", schema=_schema, handler=_handler,
+        check_fn=_check_yuanbao, is_async=True, emoji=_emoji,
     )
