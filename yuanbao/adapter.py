@@ -113,9 +113,8 @@ def _iter_ybres_refs(matches) -> Iterator[Tuple[str, str, str]]:
     """Turn ``_YB_RES_REF_RE`` matches into ``(rid, kind, filename)`` for resolvable kinds only."""
     for m in matches:
         kind, _, filename = m.group(1).partition(":")
-        kind = kind.strip()
-        if kind in _RESOLVABLE_MEDIA_KINDS:
-            yield m.group(2), kind, filename.strip()
+        if kind.strip() in _RESOLVABLE_MEDIA_KINDS:
+            yield m.group(2), kind.strip(), filename.strip()
 
 
 def _text_elem(text: str) -> dict:
@@ -519,10 +518,10 @@ class RecallGuardMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         cmd = (ctx.push or {}).get("callback_command", "")
-        if cmd not in self._RECALL_COMMANDS:
+        if cmd in self._RECALL_COMMANDS:
+            self._handle_recall(ctx, cmd)  # terminal: recalls never dispatch
+        else:
             await next_fn()
-            return
-        self._handle_recall(ctx, cmd)
 
     @staticmethod
     def _build_source(adapter, group_code: str, from_account: str):
@@ -574,10 +573,8 @@ class RecallGuardMiddleware(InboundMiddleware):
 
     @staticmethod
     def _find_processing_session(adapter, recalled_id: str) -> Optional[str]:
-        for sk, mid in adapter._processing_msg_ids.items():
-            if mid == recalled_id and sk in adapter._active_sessions:
-                return sk
-        return None
+        return next((sk for sk, mid in adapter._processing_msg_ids.items()
+                     if mid == recalled_id and sk in adapter._active_sessions), None)
 
     @classmethod
     def _interrupt_for_recall(cls, adapter, session_key: str, recalled_id: str, group_code: str, from_account: str) -> None:
@@ -593,9 +590,7 @@ class RecallGuardMiddleware(InboundMiddleware):
         # Set pending + signal directly (bypass handle_message to avoid busy-ack).
         # May overwrite a user message pending in the same ~200ms window — acceptable.
         adapter._pending_messages[session_key] = MessageEvent(
-            text=recall_text, message_type=MessageType.TEXT,
-            source=cls._build_source(adapter, group_code, from_account), internal=True,
-        )
+            text=recall_text, message_type=MessageType.TEXT, source=cls._build_source(adapter, group_code, from_account), internal=True)
         active_event = adapter._active_sessions.get(session_key)
         if active_event is not None:
             active_event.set()
@@ -673,7 +668,7 @@ class SkipSelfMiddleware(InboundMiddleware):
 
     @staticmethod
     def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
-        return bool(from_account and bot_id) and from_account == bot_id
+        return bool(from_account) and from_account == bot_id
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if self._is_self_reference(ctx.from_account, ctx.adapter._bot_id):
@@ -742,13 +737,12 @@ class AccessGuardMiddleware(InboundMiddleware):
     name = "access-guard"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        adapter = ctx.adapter
-        policy: AccessPolicy = adapter._access_policy
+        policy: AccessPolicy = ctx.adapter._access_policy
         if ctx.chat_type == "dm" and not policy.is_dm_intake_allowed(ctx.from_account):
-            logger.debug("[%s] DM from %s blocked by dm_policy=%s", adapter.name, ctx.from_account, policy.dm_policy)
+            logger.debug("[%s] DM from %s blocked by dm_policy=%s", ctx.adapter.name, ctx.from_account, policy.dm_policy)
             return  # Stop pipeline
         if ctx.chat_type == "group" and not policy.is_group_allowed(ctx.group_code):
-            logger.debug("[%s] Group %s blocked by group_policy=%s", adapter.name, ctx.group_code, policy.group_policy)
+            logger.debug("[%s] Group %s blocked by group_policy=%s", ctx.adapter.name, ctx.group_code, policy.group_policy)
             return  # Stop pipeline
         await next_fn()
 
@@ -1577,9 +1571,7 @@ class MediaResolveMiddleware(InboundMiddleware):
         mimes: List[str] = []
         cache = getattr(ctx.adapter, "_msg_content_cache", None)
         text = cache.get(ctx.reply_to_message_id) if ctx.reply_to_message_id and cache else None
-        if not isinstance(text, str) or not text:
-            return paths, mimes
-        for m in _YB_LOCAL_MEDIA_RE.finditer(text):
+        for m in _YB_LOCAL_MEDIA_RE.finditer(text if isinstance(text, str) else ""):
             kind = (m.group(1) or "").strip().lower()
             path = (m.group(2) or "").strip()
             if not path or path in paths or not os.path.exists(path):
@@ -1634,8 +1626,6 @@ class PatchAnchorsMiddleware(InboundMiddleware):
 
     @staticmethod
     def _patch(text: str, urls: List[str], types: List[str]) -> str:
-        if not text or not urls:
-            return text
         patched = text
         for u, m in zip(urls, types):
             if not u.startswith("/"):
@@ -1764,8 +1754,7 @@ class ConnectionManager:
         self._recv_task: Optional[asyncio.Task] = None
         self._pending_acks: Dict[str, asyncio.Future] = {}
         self._pending_pong: Optional[asyncio.Future] = None
-        self._consecutive_hb_timeouts: int = 0
-        self._reconnect_attempts: int = 0
+        self._consecutive_hb_timeouts = self._reconnect_attempts = 0
         self._reconnecting: bool = False
         # Debounce buffer aggregating multi-part inbound messages: sender key -> frames / timer
         self._inbound_buffer: Dict[str, list] = {}
