@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -232,43 +232,35 @@ class ByteRoverMemoryProvider(MemoryProvider):
         return [QUERY_SCHEMA, CURATE_SCHEMA, STATUS_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        handler = self._TOOLS.get(tool_name)
-        return handler(self, args) if handler else tool_error(f"Unknown tool: {tool_name}")
+        if tool_name not in _TOOLS:
+            return tool_error(f"Unknown tool: {tool_name}")
+        arg, fail_msg, run, on_ok = _TOOLS[tool_name]
+        value = args.get(arg, "") if arg else None
+        if arg and not value:
+            return tool_error(f"{arg} is required")
+        result = run(self, value)
+        if not result["success"]:
+            return tool_error(result.get("error", fail_msg))
+        return json.dumps(on_ok(result.get("output", "")))
 
     def shutdown(self) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=10.0)
 
-    # Tool implementations
 
-    @staticmethod
-    def _tool_result(result: dict, fail_msg: str, on_ok: Callable[[str], dict]) -> str:
-        if not result["success"]:
-            return tool_error(result.get("error", fail_msg))
-        return json.dumps(on_ok(result.get("output", "")))
+def _format_query_output(output: str) -> dict:
+    output = output.strip()
+    if len(output) < _MIN_OUTPUT_LEN:
+        return {"result": "No relevant memories found."}
+    return {"result": output[:8000] + "\n\n[... truncated]" if len(output) > 8000 else output}
 
-    def _tool_query(self, args: dict) -> str:
-        query = args.get("query", "")
-        if not query:
-            return tool_error("query is required")
 
-        def fmt(output: str) -> dict:
-            output = output.strip()
-            if len(output) < _MIN_OUTPUT_LEN:
-                return {"result": "No relevant memories found."}
-            return {"result": output[:8000] + "\n\n[... truncated]" if len(output) > 8000 else output}
-        return self._tool_result(self._query(query), "Query failed", fmt)
-
-    def _tool_curate(self, args: dict) -> str:
-        content = args.get("content", "")
-        if not content:
-            return tool_error("content is required")
-        return self._tool_result(self._curate(content), "Curate failed", lambda _: {"result": "Memory curated successfully."})
-
-    def _tool_status(self, args: dict) -> str:
-        return self._tool_result(_run_brv(["status"], timeout=15, cwd=self._cwd), "Status check failed", lambda out: {"status": out})
-
-    _TOOLS = {"brv_query": _tool_query, "brv_curate": _tool_curate, "brv_status": _tool_status}
+# tool name -> (required arg or None, failure message, run(provider, arg_value) -> brv result, on_ok(output) -> JSON payload)
+_TOOLS = {
+    "brv_query": ("query", "Query failed", lambda p, q: p._query(q), _format_query_output),
+    "brv_curate": ("content", "Curate failed", lambda p, c: p._curate(c), lambda _: {"result": "Memory curated successfully."}),
+    "brv_status": (None, "Status check failed", lambda p, _: _run_brv(["status"], timeout=15, cwd=p._cwd), lambda out: {"status": out}),
+}
 
 
 def register(ctx) -> None:
