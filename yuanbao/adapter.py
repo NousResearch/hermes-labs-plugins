@@ -449,16 +449,12 @@ class DecodeMiddleware(InboundMiddleware):
             conn_json = None
         if isinstance(conn_json, dict):
             push = self.parse_json_push(conn_json)
-            if push:
-                return push, "json"
-        else:
-            try:
-                push = decode_inbound_push(data)
-            except Exception:
-                push = None
-            if push:
-                return push, "protobuf"
-        return None, ""
+            return (push, "json") if push else (None, "")
+        try:
+            push = decode_inbound_push(data)
+        except Exception:
+            push = None
+        return (push, "protobuf") if push else (None, "")
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if not ctx.raw_frames:
@@ -798,13 +794,9 @@ def _iter_custom_elems(msg_body: list) -> Iterator[Tuple[Any, dict]]:
             continue
         content = elem.get("msg_content", {}) or {}
         data_str = content.get("data", "") if isinstance(content, dict) else ""
-        if not data_str:
-            continue
-        try:
-            custom = json.loads(data_str)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        yield custom, content
+        if data_str:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                yield json.loads(data_str), content
 
 
 def _file_name(content: dict) -> str:
@@ -971,13 +963,10 @@ class ExtractContentMiddleware(InboundMiddleware):
             for key, value in ext_map.items():
                 if not key.startswith("wexin_forward_msg_") or not isinstance(value, str) or not value:
                     continue
-                try:
-                    pb = base64.b64decode(value)
-                except (binascii.Error, ValueError):
-                    continue
-                data = decode_forward_msg_data(pb)
-                if isinstance(data, dict) and data.get("sub_type") == 1:
-                    return data
+                with contextlib.suppress(binascii.Error, ValueError):
+                    data = decode_forward_msg_data(base64.b64decode(value))
+                    if isinstance(data, dict) and data.get("sub_type") == 1:
+                        return data
         return None
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -1147,8 +1136,7 @@ class GroupAttributionMiddleware(InboundMiddleware):
 
 
 class YuanbaoMessageType(Enum):
-    """Yuanbao-local subtypes; coerced back to MessageType in DispatchMiddleware."""
-    CHAT_RECORD = "chat_record"
+    CHAT_RECORD = "chat_record"  # yuanbao-local subtype; coerced back to MessageType in DispatchMiddleware
 
 
 _ELEM_MESSAGE_TYPES = {"TIMImageElem": MessageType.PHOTO, "TIMSoundElem": MessageType.VOICE,
@@ -2086,8 +2074,8 @@ class ConnectionManager:
             return
         adapter = self._adapter
         logger.info("[%s] Debounce flush: key=%s, aggregated %d frames", adapter.name, key, len(data_list))
-        ctx = InboundContext(adapter=adapter, raw_frames=data_list)
-        adapter._track_task(asyncio.create_task(adapter._inbound_pipeline.execute(ctx), name=f"yuanbao-pipeline-{key}"))
+        adapter._track_task(asyncio.create_task(
+            adapter._inbound_pipeline.execute(InboundContext(adapter=adapter, raw_frames=data_list)), name=f"yuanbao-pipeline-{key}"))
 
     async def send_biz_request(self, encoded_conn_msg: bytes, req_id: str, timeout: float = DEFAULT_SEND_TIMEOUT) -> dict:
         """Send a business request and await its response future (pending_acks[req_id]), cleaning up on exit."""
@@ -2313,9 +2301,8 @@ class HeartbeatManager:
             return
         self._reply_hb_last_active[chat_id] = time.time()
         existing = self._reply_heartbeat_tasks.get(chat_id)
-        if existing and not existing.done():
-            return
-        self._reply_heartbeat_tasks[chat_id] = asyncio.create_task(self._worker(chat_id), name=f"yuanbao-reply-hb-{chat_id}")
+        if not existing or existing.done():
+            self._reply_heartbeat_tasks[chat_id] = asyncio.create_task(self._worker(chat_id), name=f"yuanbao-reply-hb-{chat_id}")
 
     async def _worker(self, chat_id: str) -> None:
         """Send RUNNING every 2s; after 30s without renewal (or WS loss) send FINISH and exit.
@@ -2455,9 +2442,13 @@ class MessageSender:
         """Lock + dispatch an arbitrary MsgBody to C2C or group."""
         async with self.get_chat_lock(chat_id):
             result = await self._send_msg_body(chat_id, msg_body, reply_to, group_code)
-        if result.get("success"):
-            return SendResult(success=True, message_id=result.get("msg_key"))
-        return SendResult(success=False, error=result.get("error", "Unknown error"))
+        return self._to_send_result(result)
+
+    @staticmethod
+    def _to_send_result(raw: dict) -> "SendResult":
+        if raw.get("success"):
+            return SendResult(success=True, message_id=raw.get("msg_key"))
+        return SendResult(success=False, error=raw.get("error", "Unknown error"))
 
     async def send_text_chunk(self, chat_id: str, text: str, reply_to: Optional[str] = None, retry: int = 3, group_code: str = "") -> "SendResult":
         """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
@@ -2471,7 +2462,7 @@ class MessageSender:
                     msg_body = [_text_elem(text)]
                 raw = await self._send_msg_body(chat_id, msg_body, reply_to, group_code)
                 if raw.get("success"):
-                    return SendResult(success=True, message_id=raw.get("msg_key"))
+                    return self._to_send_result(raw)
                 last_error = raw.get("error", "Unknown error")
                 logger.warning("[%s] send_text_chunk attempt %d/%d failed: %s", adapter.name, attempt + 1, retry, last_error)
             except Exception as exc:
