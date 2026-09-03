@@ -1,18 +1,8 @@
-"""
-Yuanbao platform adapter.
+"""Yuanbao platform adapter: WebSocket gateway client (AUTH_BIND, ping/pong heartbeat, reconnect),
+inbound middleware pipeline (T05 push → MessageEvent) and outbound sender (T06 text/media).
 
-Connects to the Yuanbao WebSocket gateway, handles authentication (AUTH_BIND),
-heartbeat, reconnection, message receive (T05) and send (T06).
-
-Configuration in config.yaml (or via env vars):
-    platforms:
-      yuanbao:
-        extra:
-          app_id: "..."              # or YUANBAO_APP_ID
-          app_secret: "..."          # or YUANBAO_APP_SECRET
-          bot_id: "..."              # or YUANBAO_BOT_ID  (optional, returned by sign-token)
-          ws_url: "wss://..."        # or YUANBAO_WS_URL
-          api_domain: "https://..."  # or YUANBAO_API_DOMAIN
+Config under ``platforms.yuanbao.extra`` (or env): app_id/YUANBAO_APP_ID, app_secret/YUANBAO_APP_SECRET,
+bot_id/YUANBAO_BOT_ID (optional, returned by sign-token), ws_url/YUANBAO_WS_URL, api_domain/YUANBAO_API_DOMAIN.
 """
 
 from __future__ import annotations
@@ -29,16 +19,16 @@ import logging
 import os
 import re
 import secrets
+import sys
 import time
 import urllib.parse
 import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
-from abc import ABC, abstractmethod
 from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Tuple
-
-import sys
 
 import httpx
 
@@ -61,6 +51,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
 )
 from gateway.platforms import helpers as _mdchunk
+from gateway.platforms._shared import get_scoped_secret as _yb_secret
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
     download_url as media_download_url,
@@ -100,53 +91,47 @@ from gateway.session import build_session_key
 
 logger = logging.getLogger(__name__)
 
-# Version / platform constants (AUTH_BIND and sign-token headers)
+# AUTH_BIND / sign-token header values
 try:
     from hermes_cli import __version__ as _HERMES_VERSION
 except ImportError:
     _HERMES_VERSION = "0.0.0"
-
-_APP_VERSION = _HERMES_VERSION
-_BOT_VERSION = _HERMES_VERSION
+_APP_VERSION = _BOT_VERSION = _HERMES_VERSION
 _YUANBAO_INSTANCE_ID = str(HERMES_INSTANCE_ID)
 _OPERATION_SYSTEM = sys.platform
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
 DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com"
-
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
 AUTH_TIMEOUT_SECONDS = 10.0
 MAX_RECONNECT_ATTEMPTS = 100
 DEFAULT_SEND_TIMEOUT = 30.0  # WS biz request timeout
-
-# Bound on the WS close handshake at teardown/reconnect: websockets' own close_timeout (5s) waits
-# for the server's close echo, which an idle server never sends, stalling shutdown. A responsive
-# server finishes well under 1s, so this only caps the pathological hang.
+# Caps the WS close handshake: websockets' own 5s close_timeout waits for a close echo an idle
+# server never sends, stalling shutdown; a responsive server finishes well under 1s.
 WS_CLOSE_TIMEOUT_S = 1.0
-
-# Close codes that indicate permanent errors — do NOT reconnect.
-NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}
-
-# Heartbeat timeout threshold — N consecutive missed pongs trigger reconnect.
-HEARTBEAT_TIMEOUT_THRESHOLD = 2
-
-# Reply Heartbeat configuration
-REPLY_HEARTBEAT_INTERVAL_S = 2.0   # Send RUNNING every 2 seconds
-REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # Auto-stop after 30 seconds of inactivity
-
-# Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
-SLOW_RESPONSE_TIMEOUT_S = 120.0
+NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}  # permanent errors — never reconnect
+HEARTBEAT_TIMEOUT_THRESHOLD = 2  # consecutive missed pongs before reconnect
+REPLY_HEARTBEAT_INTERVAL_S = 2.0   # RUNNING cadence
+REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # auto-FINISH after this much inactivity
+SLOW_RESPONSE_TIMEOUT_S = 120.0  # push SLOW_RESPONSE_MESSAGE when the agent is silent this long
 SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
 
-# Resource anchors in transcript text: [image|ybres:abc]  [file:report.pdf|ybres:xyz]  [voice|ybres:…]
+# Transcript anchors: [image|ybres:abc]  [file:report.pdf|ybres:xyz]  [voice|ybres:…]
 _YB_RES_REF_RE = re.compile(r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]")
-
 # Anchors after local download: [image: /path]  [file: report.pdf → /path]  [video: /path]
 _YB_LOCAL_MEDIA_RE = re.compile(r"\[(\w+):[^\]]*?(/[^\]]+?)\s*\]")
+_RESOLVABLE_MEDIA_KINDS = frozenset({"image", "file", "video"})  # kinds injected into model context
+_INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')  # "(1/3)" page indicators from BasePlatformAdapter
+_TEXT_ELEM_TYPE = "TIMTextElem"
 
-# Media kinds that can be resolved and injected into the model context
-_RESOLVABLE_MEDIA_KINDS = frozenset({"image", "file", "video"})
+OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50  # recent transcript messages scanned for observed media
+OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
+# platforms.yuanbao.extra.media_resolve_concurrency: 1 = sequential rollback knob;
+# 6 = browser per-origin HTTP/1.1 ceiling; 12 = backfill cap.
+_DEFAULT_RESOLVE_CONCURRENCY = 6
+_MIN_RESOLVE_CONCURRENCY = 1
+_MAX_RESOLVE_CONCURRENCY = 12
 
 
 def _iter_ybres_refs(matches) -> Iterator[Tuple[str, str, str]]:
@@ -157,58 +142,41 @@ def _iter_ybres_refs(matches) -> Iterator[Tuple[str, str, str]]:
         if kind in _RESOLVABLE_MEDIA_KINDS:
             yield m.group(2), kind, filename.strip()
 
-# Strip page indicators like (1/3) appended by BasePlatformAdapter
-_INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
 
-# Observed-media backfill: how many recent transcript messages to scan
-OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
-# Max number of resource references to resolve per inbound turn
-OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
+def _text_elem(text: str) -> dict:
+    """A TIMTextElem msg_body entry."""
+    return {"msg_type": _TEXT_ELEM_TYPE, "msg_content": {"text": text}}
 
-# Inbound media resolve concurrency (config: platforms.yuanbao.extra.media_resolve_concurrency).
-# 1 = sequential rollback knob; 6 = browser per-origin HTTP/1.1 ceiling; 12 = backfill cap.
-_DEFAULT_RESOLVE_CONCURRENCY = 6
-_MIN_RESOLVE_CONCURRENCY = 1
-_MAX_RESOLVE_CONCURRENCY = 12
+
+def _cancel_all(tasks: Dict[str, asyncio.Task]) -> None:
+    """Cancel every unfinished task in *tasks* and clear the dict."""
+    for task in list(tasks.values()):
+        if not task.done():
+            task.cancel()
+    tasks.clear()
+
 
 class MarkdownProcessor:
-    """Markdown chunking utilities — thin delegates to the shared fence-aware chunker in
-    gateway.platforms.helpers; method names kept for existing call sites and tests."""
+    """Thin delegates to the shared fence-aware chunker in gateway.platforms.helpers; method names
+    kept for existing call sites and tests."""
 
     @staticmethod
     def has_unclosed_fence(text: str) -> bool:
-        """Detect whether the text has unclosed code block fences."""
         return _mdchunk.text_has_unclosed_fence(text)
-
-    # -- Table detection ---------------------------------------------------
 
     @staticmethod
     def ends_with_table_row(text: str) -> bool:
-        """Detect whether the text ends with a table row."""
         return _mdchunk.text_ends_with_table_row(text)
 
-    # -- Paragraph boundary splitting --------------------------------------
-
     @staticmethod
-    def split_at_paragraph_boundary(
-        text: str,
-        max_chars: int,
-        len_fn: Optional[Callable[[str], int]] = None,
-    ) -> tuple[str, str]:
-        """Find the nearest paragraph boundary within max_chars; return (head, tail)."""
+    def split_at_paragraph_boundary(text: str, max_chars: int, len_fn: Optional[Callable[[str], int]] = None) -> tuple[str, str]:
+        """Nearest paragraph boundary within max_chars → (head, tail)."""
         return _mdchunk.split_at_paragraph_boundary(text, max_chars, len_fn=len_fn)
 
-    # -- Core: chunk splitting ---------------------------------------------
-
     @classmethod
-    def chunk_markdown_text(
-        cls,
-        text: str,
-        max_chars: int = 4000,
-        len_fn: Optional[Callable[[str], int]] = None,
-    ) -> list[str]:
-        """Split Markdown into <= max_chars chunks at paragraph boundaries, never inside a
-        code fence or table (an oversized single block may exceed the limit)."""
+    def chunk_markdown_text(cls, text: str, max_chars: int = 4000, len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
+        """<= max_chars chunks at paragraph boundaries, never inside a fence or table (an oversized
+        single block may exceed the limit)."""
         return _mdchunk.split_text_fence_aware(text, max_chars, len_fn, prefer_paragraphs=True, balance_fences=False)
 
 
@@ -244,22 +212,19 @@ class SignManager:
     @staticmethod
     def build_timestamp() -> str:
         """Beijing-time ISO-8601 timestamp without milliseconds (2006-01-02T15:04:05+08:00)."""
-        bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
-        return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        return datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
     @classmethod
     def is_cache_valid(cls, entry: dict[str, Any]) -> bool:
-        """Determine whether the cache entry is valid (not expired with margin)."""
         return entry["expire_ts"] - time.time() > cls.CACHE_REFRESH_MARGIN_S
 
     @classmethod
     def clear_locks(cls) -> None:
-        """Clear all per-app_key refresh locks (called on disconnect)."""
         cls._locks.clear()
 
     @classmethod
     def purge_expired(cls) -> int:
-        """Drop expired token-cache entries (called lazily from get_token); returns count purged."""
+        """Drop expired token-cache entries; returns count purged."""
         now = time.time()
         expired_keys = [k for k, v in cls._cache.items() if now - v.get("expire_ts", 0) > 0]
         for k in expired_keys:
@@ -267,24 +232,17 @@ class SignManager:
         return len(expired_keys)
 
     @classmethod
-    async def fetch(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Send sign-ticket HTTP request with auto-retry (up to MAX_RETRIES times)."""
+    async def fetch(cls, app_key: str, app_secret: str, api_domain: str, route_env: str = "") -> dict[str, Any]:
+        """POST sign-token, retrying RETRYABLE_CODE up to MAX_RETRIES times."""
         url = f"{api_domain.rstrip('/')}{cls.TOKEN_PATH}"
         async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
             for attempt in range(cls.MAX_RETRIES + 1):
                 nonce = secrets.token_hex(16)
                 timestamp = cls.build_timestamp()
-                signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
                 payload = {
                     "app_key": app_key,
                     "nonce": nonce,
-                    "signature": signature,
+                    "signature": cls.compute_signature(nonce, timestamp, app_key, app_secret),
                     "timestamp": timestamp,
                 }
                 headers = {
@@ -296,15 +254,10 @@ class SignManager:
                 }
                 if route_env:
                     headers["X-Route-Env"] = route_env
-                logger.info(
-                    "Sign token request: url=%s%s",
-                    url,
-                    f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
-                )
+                logger.info("Sign token request: url=%s%s", url, f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "")
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
-                    body = response.text
-                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+                    raise RuntimeError(f"Sign token API returned {response.status_code}: {response.text[:200]}")
                 try:
                     result_data: dict[str, Any] = response.json()
                 except Exception as exc:
@@ -317,47 +270,33 @@ class SignManager:
                     logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
                     return data
                 if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
-                    logger.warning(
-                        "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
-                        code,
-                        cls.RETRY_DELAY_S,
-                        attempt + 1,
-                        cls.MAX_RETRIES,
-                    )
+                    logger.warning("Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
+                                   code, cls.RETRY_DELAY_S, attempt + 1, cls.MAX_RETRIES)
                     await asyncio.sleep(cls.RETRY_DELAY_S)
                     continue
-                msg = result_data.get("msg", "")
-                raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
+                raise RuntimeError(f"Sign token error: code={code}, msg={result_data.get('msg', '')}")
         raise RuntimeError("Sign token failed: max retries exceeded")
 
     @classmethod
     async def _fetch_into_cache(cls, app_key: str, app_secret: str, api_domain: str, route_env: str) -> None:
         data = await cls.fetch(app_key, app_secret, api_domain, route_env)
         duration: int = data.get("duration", 0)
-        expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
         cls._cache[app_key] = {
             "token": data.get("token", ""),
             "bot_id": data.get("bot_id", ""),
             "duration": duration,
             "product": data.get("product", ""),
             "source": data.get("source", ""),
-            "expire_ts": expire_ts,
+            "expire_ts": time.time() + (duration if duration > 0 else 3600),
         }
 
     @classmethod
-    async def get_token(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Get WS auth token, served from cache while valid (with CACHE_REFRESH_MARGIN_S)."""
+    async def get_token(cls, app_key: str, app_secret: str, api_domain: str, route_env: str = "") -> dict[str, Any]:
+        """WS auth token, served from cache while valid (with CACHE_REFRESH_MARGIN_S)."""
         cls.purge_expired()
         cached = cls._cache.get(app_key)
         if cached and cls.is_cache_valid(cached):
-            remain = int(cached["expire_ts"] - time.time())
-            logger.info("Using cached token (%ds remaining)", remain)
+            logger.info("Using cached token (%ds remaining)", int(cached["expire_ts"] - time.time()))
             return dict(cached)
         async with cls.get_refresh_lock(app_key):
             cached = cls._cache.get(app_key)
@@ -367,14 +306,8 @@ class SignManager:
         return dict(cls._cache[app_key])
 
     @classmethod
-    async def force_refresh(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Force refresh token (clear cache and re-sign)."""
+    async def force_refresh(cls, app_key: str, app_secret: str, api_domain: str, route_env: str = "") -> dict[str, Any]:
+        """Clear the cached token and re-sign."""
         logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
         async with cls.get_refresh_lock(app_key):
             cls._cache.pop(app_key, None)
@@ -382,21 +315,16 @@ class SignManager:
         return dict(cls._cache[app_key])
 
 
-from dataclasses import dataclass, field as dc_field
-from gateway.platforms._shared import get_scoped_secret as _yb_secret
-
 @dataclass
 class InboundContext:
     """Mutable context passed through every inbound middleware in registration order."""
 
     adapter: Any  # YuanbaoAdapter (forward-ref avoids circular import)
-    raw_frames: list = dc_field(default_factory=list)  # Raw bytes frames (debounce-aggregated)
-
-    # Populated by DecodeMiddleware
+    raw_frames: list = dc_field(default_factory=list)  # debounce-aggregated raw frames
+    # DecodeMiddleware
     push: Optional[dict] = None
     decoded_via: str = ""  # "json" | "protobuf"
-
-    # Extracted from push by FieldExtractMiddleware
+    # ExtractFieldsMiddleware
     from_account: str = ""
     group_code: str = ""
     group_name: str = ""
@@ -404,58 +332,39 @@ class InboundContext:
     msg_body: list = dc_field(default_factory=list)
     msg_id: str = ""
     cloud_custom_data: str = ""
-
-    # Derived by ChatRoutingMiddleware
+    # ChatRoutingMiddleware
     chat_id: str = ""
     chat_type: str = ""  # "dm" | "group"
     chat_name: str = ""
-
-    # Populated by ContentExtractMiddleware
+    # ExtractContentMiddleware (forwarded_records = parsed ForwardMsgData for elem_type 1009)
     raw_text: str = ""
     media_refs: list = dc_field(default_factory=list)
-
-    # Populated by ExtractContentMiddleware for elem_type 1009 (WeChat forward).
-    # Contains the parsed ForwardMsgData dict (sub_type / nick_name / msg list).
     forwarded_records: Optional[dict] = None
-
-    # Owner command detection
-    owner_command: Optional[str] = None
-
-    # Source built by BuildSourceMiddleware
-    source: Optional[Any] = None  # SessionSource
-
-    # Populated by ClassifyMessageTypeMiddleware
-    msg_type: Optional[Any] = None  # MessageType | YuanbaoMessageType
-
-    # Populated by QuoteContextMiddleware
+    owner_command: Optional[str] = None  # OwnerCommandMiddleware
+    source: Optional[Any] = None  # SessionSource, BuildSourceMiddleware
+    msg_type: Optional[Any] = None  # MessageType | YuanbaoMessageType, ClassifyMessageTypeMiddleware
+    # QuoteContextMiddleware
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None
-    quote_media_refs: list = dc_field(default_factory=list)  # List of (rid, kind, filename)
-
-    # Populated by MediaResolveMiddleware. Combined list of resolved local
-    # paths from up to three sources (deduped, in this order):
-    #   1) media carried by the current message (always),
-    #   2) media from the quoted message (when reply_to_message_id is set),
-    #   3) recent group-observed media (only when chat_type == "group" and no quote is present).
+    quote_media_refs: list = dc_field(default_factory=list)  # (rid, kind, filename)
+    # MediaResolveMiddleware: resolved local paths, deduped, in this order: 1) media carried by
+    # the current message, 2) quoted-message media (when reply_to_message_id is set), 3) recent
+    # group-observed media (group chats without a quote only).
     media_urls: list = dc_field(default_factory=list)
     media_types: list = dc_field(default_factory=list)
-
-    # Populated by GroupAttributionMiddleware
-    channel_prompt: Optional[str] = None
+    channel_prompt: Optional[str] = None  # GroupAttributionMiddleware
 
 
 class InboundMiddleware(ABC):
-    """Inbound middleware: set class-level ``name`` and implement ``handle(ctx, next_fn)``;
-    ``await next_fn()`` continues the pipeline, returning without it stops."""
+    """Set class-level ``name`` and implement ``handle(ctx, next_fn)``; ``await next_fn()``
+    continues the pipeline, returning without it stops."""
 
-    name: str = ""  # Override in each subclass
+    name: str = ""
 
     @abstractmethod
-    async def handle(self, ctx: InboundContext, next_fn: Callable) -> None:
-        """Process *ctx* and optionally call *next_fn* to continue the pipeline."""
+    async def handle(self, ctx: InboundContext, next_fn: Callable) -> None: ...
 
     async def __call__(self, ctx: InboundContext, next_fn: Callable) -> None:
-        """Allow middleware instances to be called directly (duck-typing compat)."""
         return await self.handle(ctx, next_fn)
 
     def __repr__(self) -> str:
@@ -467,11 +376,10 @@ class InboundPipeline:
     remove. Accepts ``InboundMiddleware`` instances or plain ``async def(ctx, next_fn)`` callables."""
 
     def __init__(self) -> None:
-        self._middlewares: list = []  # list of (name, handler, when_fn | None)
+        self._middlewares: list = []  # (name, handler, when_fn | None)
 
     @staticmethod
     def _normalize(name_or_mw, handler=None):
-        """(InboundMiddleware,) or (name, handler) → (name, callable)."""
         if isinstance(name_or_mw, InboundMiddleware):
             return name_or_mw.name, name_or_mw
         return name_or_mw, handler
@@ -483,6 +391,7 @@ class InboundPipeline:
         return self
 
     def _insert_relative(self, target: str, offset: int, name_or_mw, handler, when) -> "InboundPipeline":
+        """Insert at index(target)+offset; appends when *target* is not registered."""
         name, h = self._normalize(name_or_mw, handler)
         idx = next((i for i, (n, _, _) in enumerate(self._middlewares) if n == target), None)
         entry = (name, h, when)
@@ -493,25 +402,21 @@ class InboundPipeline:
         return self
 
     def use_before(self, target: str, name_or_mw, handler=None, when=None) -> "InboundPipeline":
-        """Insert a middleware before *target* (by name).  Appends if not found."""
         return self._insert_relative(target, 0, name_or_mw, handler, when)
 
     def use_after(self, target: str, name_or_mw, handler=None, when=None) -> "InboundPipeline":
-        """Insert a middleware after *target* (by name).  Appends if not found."""
         return self._insert_relative(target, 1, name_or_mw, handler, when)
 
     def remove(self, name: str) -> "InboundPipeline":
-        """Remove a middleware by name."""
         self._middlewares = [(n, h, w) for n, h, w in self._middlewares if n != name]
         return self
 
     @property
     def middleware_names(self) -> list:
-        """Return ordered list of registered middleware names (for testing)."""
         return [n for n, _, _ in self._middlewares]
 
     async def execute(self, ctx: InboundContext) -> None:
-        """Run all middlewares in order.  Each middleware receives ``(ctx, next_fn)``."""
+        """Run the chain; each middleware receives ``(ctx, next_fn)``."""
         chain = self._middlewares
         index = 0
 
@@ -567,8 +472,7 @@ class DecodeMiddleware(InboundMiddleware):
         if not raw_json:
             return None
         from_account, group_code = DecodeMiddleware.json_sender_fields(raw_json)
-        msg_body_raw = (raw_json.get("msg_body", []) or raw_json.get("MsgBody", []))
-        msg_body = DecodeMiddleware.convert_json_msg_body(msg_body_raw)
+        msg_body = DecodeMiddleware.convert_json_msg_body(raw_json.get("msg_body", []) or raw_json.get("MsgBody", []))
         # Recall callbacks may have neither from_account nor msg_body.
         if not from_account and not msg_body and not raw_json.get("callback_command"):
             return None
@@ -589,7 +493,7 @@ class DecodeMiddleware(InboundMiddleware):
         }
 
     def _decode_single(self, adapter, data: bytes) -> tuple:
-        """Decode a single raw frame into (push_dict, decoded_via) or (None, '')."""
+        """One raw frame → (push_dict, decoded_via) or (None, '')."""
         try:
             conn_json = json.loads(data.decode("utf-8"))
         except Exception:
@@ -608,18 +512,15 @@ class DecodeMiddleware(InboundMiddleware):
         return None, ""
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        data_list = ctx.raw_frames
-        if not data_list:
+        if not ctx.raw_frames:
             return  # Stop pipeline — nothing to decode
         merged_push = None
         decoded_via = ""
-        for data in data_list:
+        for data in ctx.raw_frames:
             push, via = self._decode_single(ctx.adapter, data)
             if not push:
-                logger.info(
-                "[%s] Push decoded but no valid message. raw hex(first64)=%s",
-                    ctx.adapter.name, data.hex()[:128] if data else "(empty)",
-                )
+                logger.info("[%s] Push decoded but no valid message. raw hex(first64)=%s",
+                            ctx.adapter.name, data.hex()[:128] if data else "(empty)")
                 continue
             if merged_push is None:
                 merged_push = push
@@ -629,23 +530,16 @@ class DecodeMiddleware(InboundMiddleware):
                 # Subsequent pushes: append msg_body to the base, newline-separated.
                 extra_body = push.get("msg_body", [])
                 if extra_body:
-                    _sep = {"msg_type": "TIMTextElem", "msg_content": {"text": "\n"}}
-                    merged_push["msg_body"] = merged_push.get("msg_body", []) + [_sep] + extra_body
-                    logger.info(
-                        "[%s] Merged %d extra msg_body elements from aggregated push",
-                        ctx.adapter.name, len(extra_body),
-                    )
+                    merged_push["msg_body"] = merged_push.get("msg_body", []) + [_text_elem("\n")] + extra_body
+                    logger.info("[%s] Merged %d extra msg_body elements from aggregated push", ctx.adapter.name, len(extra_body))
         if not merged_push:
             return  # Stop pipeline
         ctx.push = merged_push
         ctx.decoded_via = decoded_via
         logger.info(
             "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
-            ctx.adapter.name, ctx.decoded_via,
-            ctx.push.get("from_account", ""),
-            ctx.push.get("group_code", ""),
-            ctx.push.get("msg_id", ""),
-            [e.get("msg_type", "") for e in ctx.push.get("msg_body", [])],
+            ctx.adapter.name, ctx.decoded_via, ctx.push.get("from_account", ""), ctx.push.get("group_code", ""),
+            ctx.push.get("msg_id", ""), [e.get("msg_type", "") for e in ctx.push.get("msg_body", [])],
         )
         logger.debug("[%s] Push payload: %s", ctx.adapter.name, ctx.push)
         await next_fn()
@@ -3039,14 +2933,6 @@ class GroupQueryService:
         if result and result.get("members"):
             self._adapter._member_cache[group_code] = (time.time(), result["members"])
         return result
-
-
-def _cancel_all(tasks: Dict[str, asyncio.Task]) -> None:
-    """Cancel every unfinished task in *tasks* and clear the dict."""
-    for task in list(tasks.values()):
-        if not task.done():
-            task.cancel()
-    tasks.clear()
 
 
 class HeartbeatManager:
