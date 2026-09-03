@@ -1261,13 +1261,12 @@ _ELEM_MESSAGE_TYPES = {
 
 
 class ClassifyMessageTypeMiddleware(InboundMiddleware):
-    """Determine MessageType from text content and msg_body elements."""
+    """MessageType (or yuanbao-local YuanbaoMessageType) from text and msg_body elements."""
 
     name = "classify-msg-type"
 
     @staticmethod
     def _classify(text: str, msg_body: list):
-        """MessageType (or yuanbao-local YuanbaoMessageType) from text and msg_body."""
         if text.startswith("/"):
             return MessageType.COMMAND
         for elem in msg_body:
@@ -1276,9 +1275,8 @@ class ClassifyMessageTypeMiddleware(InboundMiddleware):
             if mapped is not None:
                 return mapped
             if etype == "TIMCustomElem":
-                data_str = (elem.get("msg_content") or {}).get("data", "")
                 try:
-                    custom = json.loads(data_str)
+                    custom = json.loads((elem.get("msg_content") or {}).get("data", ""))
                 except (json.JSONDecodeError, TypeError):
                     custom = None
                 if isinstance(custom, dict) and custom.get("elem_type") == 1009:
@@ -1309,12 +1307,9 @@ class QuoteContextMiddleware(InboundMiddleware):
         quote_id = str(quote.get("id") or "").strip() or None
         desc = str(quote.get("desc") or "").strip()
         sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
-        quote_text = (f"{sender}: {desc}" if sender else desc) if desc else None
-        return quote_id, quote_text
+        return quote_id, (f"{sender}: {desc}" if sender else desc) if desc else None
 
-    async def _extract_media_refs_from_transcript(
-        self, ctx: InboundContext
-    ) -> List[Tuple[str, str, str]]:
+    async def _extract_media_refs_from_transcript(self, ctx: InboundContext) -> List[Tuple[str, str, str]]:
         """``(rid, kind, filename)`` for ybres anchors in the quoted transcript message; [] when
         there is no reply_to id, no store/source, or no resolvable anchors."""
         if ctx.reply_to_message_id is None:
@@ -1322,11 +1317,10 @@ class QuoteContextMiddleware(InboundMiddleware):
         adapter = ctx.adapter
         media_refs: List[Tuple[str, str, str]] = []
         try:
-            store = getattr(adapter, "_session_store", None)
+            store = _session_store(adapter)
             if not store or ctx.source is None:
                 return []
-            session_entry = store.get_or_create_session(ctx.source)
-            history = store.load_transcript(session_entry.session_id)
+            history = store.load_transcript(store.get_or_create_session(ctx.source).session_id)
             for msg in reversed(history or []):
                 mid = msg.get("message_id", "")
                 if not mid or mid != ctx.reply_to_message_id:
@@ -1336,10 +1330,7 @@ class QuoteContextMiddleware(InboundMiddleware):
                     media_refs.extend(_iter_ybres_refs(_YB_RES_REF_RE.finditer(_content)))
                 break
         except Exception as exc:
-            logger.warning(
-                "[%s] quote transcript lookup failed: %s",
-                getattr(adapter, "name", "yuanbao"), exc,
-            )
+            logger.warning("[%s] quote transcript lookup failed: %s", getattr(adapter, "name", "yuanbao"), exc)
         return media_refs
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -1355,6 +1346,7 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
     time. On any failure raw_text is left untouched."""
 
     name = "forwarded-records-parse"
+    FORWARD_MSG_TEXT_MAX_CHARS = 1000  # per-record text cap; record count is NOT capped
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         try:
@@ -1362,34 +1354,26 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
                 await self._send_loading_heartbeat(ctx)
                 ctx.raw_text = self.build_forward_text(ctx.forwarded_records, ctx=ctx, is_dispatch=True)
         except Exception as exc:
-            logger.warning(
-                "[%s] forwarded-records deep parse failed: %s",
-                getattr(ctx.adapter, "name", "yuanbao"), exc,
-            )
+            logger.warning("[%s] forwarded-records deep parse failed: %s", getattr(ctx.adapter, "name", "yuanbao"), exc)
         await next_fn()
 
     @staticmethod
     async def _send_loading_heartbeat(ctx: InboundContext) -> None:
         """Best-effort RUNNING heartbeat so the user sees a loading bubble."""
         try:
-            await ctx.adapter._outbound.heartbeat.send_heartbeat_once(
-                ctx.chat_id, WS_HEARTBEAT_RUNNING,
-            )
+            await ctx.adapter._outbound.heartbeat.send_heartbeat_once(ctx.chat_id, WS_HEARTBEAT_RUNNING)
         except Exception:
             pass
 
     @classmethod
-    def _media_marker(
-        cls, media: dict, plain_text: str = "",
-    ) -> Tuple[str, Optional[Dict[str, str]]]:
+    def _media_marker(cls, media: dict, plain_text: str = "") -> Tuple[str, Optional[Dict[str, str]]]:
         """One ``multimedia`` entry → ``(marker, ref)``: ``[kind|ybres:RID]`` + media_refs dict when a
         RID/URL is usable, else a plain ``[kind] name`` marker and ``ref=None``."""
         media_type = (media.get("type", "") or media.get("doc_type", "")).strip().lower()
         url = str(media.get("url") or "").strip()
-        media_id = str(media.get("media_id") or "").strip()
         file_name = str(media.get("file_name") or "").strip()
         # media_id is directly usable as a ybres RID; else parse resourceId from the URL.
-        rid = media_id or ExtractContentMiddleware._parse_resource_id(url)
+        rid = str(media.get("media_id") or "").strip() or ExtractContentMiddleware._parse_resource_id(url)
         if media_type == "image":
             if url and rid:
                 return f"[image|ybres:{rid}] {file_name}".rstrip(), {"kind": "image", "url": url}
@@ -1402,27 +1386,20 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
                 return f"[file|ybres:{rid}] {file_name}".rstrip(), ref
             return f"[file] {file_name}".rstrip(), None
         if media_type == "url":  # link share (e.g. WeChat article) — keep URL for the agent
-            link_title = file_name or str(media.get("title") or "")
-            return f"[link] {link_title} {url}".rstrip(), None
+            return f"[link] {file_name or str(media.get('title') or '')} {url}".rstrip(), None
         if media_type == "video":
             if url and rid:
                 return f"[video|ybres:{rid}] {file_name}".rstrip(), {"kind": "video", "url": url}
             return f"[video] {file_name or url}".rstrip(), None
         return f"[{media_type or 'media'}] {url or file_name}".rstrip(), None
 
-    FORWARD_MSG_TEXT_MAX_CHARS = 1000  # per-record text cap; record count is NOT capped
-
     @classmethod
-    def _walk_forward_msgs(
-        cls,
-        forward_data: dict,
-    ) -> Iterator[Tuple[str, str, List[Dict[str, str]]]]:
+    def _walk_forward_msgs(cls, forward_data: dict) -> Iterator[Tuple[str, str, List[Dict[str, str]]]]:
         """Yield ``(sender, body, refs)`` per ``ForwardMsgData['msg']`` record; body capped at
         FORWARD_MSG_TEXT_MAX_CHARS. ``refs`` keeps textual order — PatchAnchorsMiddleware relies on it."""
         for msg in (forward_data.get("msg") if isinstance(forward_data, dict) else None) or []:
             if not isinstance(msg, dict):
                 continue
-            sender = msg.get("sender", "")
             plain_text = msg.get("plainText", "")
             msg_contents = msg.get("msgContent", []) or []
             refs: List[Dict[str, str]] = []
@@ -1445,22 +1422,18 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
                                     refs.append(ref)
                     elif mc_type == 3:
                         parts.append("[嵌套聊天记录]")
-                    else:
-                        if plain_text:
-                            parts.append(plain_text)
+                    elif plain_text:
+                        parts.append(plain_text)
                 rendered = "  ".join(p for p in parts if p) or plain_text
             if len(rendered) > cls.FORWARD_MSG_TEXT_MAX_CHARS:
                 rendered = rendered[: cls.FORWARD_MSG_TEXT_MAX_CHARS] + "…(已截断)"
-            yield sender, rendered, refs
+            yield msg.get("sender", ""), rendered, refs
 
     @classmethod
-    def build_forward_text(
-        cls, forward_data: dict, *, ctx: InboundContext, is_dispatch: bool,
-    ) -> str:
+    def build_forward_text(cls, forward_data: dict, *, ctx: InboundContext, is_dispatch: bool) -> str:
         """Render ``ForwardMsgData`` as ``发送人：正文`` lines with media markers. When ``is_dispatch``,
         refs go to ``ctx.media_refs`` and a ``用户附言：`` footer is added (observe-time callers skip both)."""
-        nickname = ctx.sender_nickname or "用户"
-        lines = [f"当前用户的昵称为{nickname}", "以下为用户的聊天记录"]
+        lines = [f"当前用户的昵称为{ctx.sender_nickname or '用户'}", "以下为用户的聊天记录"]
         for sender, body, refs in cls._walk_forward_msgs(forward_data):
             lines.append(f"{sender}：{body}")
             if is_dispatch:
@@ -1472,83 +1445,60 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
 
 
 class MediaResolveMiddleware(InboundMiddleware):
-    """Resolve inbound media references to downloadable URLs."""
+    """Resolve inbound media references to local cached files. Yuanbao COS hostnames resolve to
+    private IPs (tripping vision_tools' SSRF guard), so we download ourselves and hand the model
+    local paths."""
 
     name = "media-resolve"
 
-    # --- Resource download cache (keyed by resourceId) ---
-    # Avoids redundant downloads of the same resource within the TTL window.
-    _resource_cache: ClassVar[Dict[str, Tuple[str, str, float]]] = {}  # rid -> (local_path, mime, ts)
-    _RESOURCE_CACHE_TTL_S: ClassVar[int] = 24 * 60 * 60  # 24 hours
+    # Resource download cache keyed by resourceId: rid -> (local_path, mime, ts)
+    _resource_cache: ClassVar[Dict[str, Tuple[str, str, float]]] = {}
+    _RESOURCE_CACHE_TTL_S: ClassVar[int] = 24 * 60 * 60
     _RESOURCE_CACHE_MAX_SIZE: ClassVar[int] = 256
 
     @classmethod
     def _get_cached_resource(cls, resource_id: str) -> Optional[Tuple[str, str]]:
-        """Return cached ``(local_path, mime)`` if still valid and file exists, else None."""
-        if not resource_id:
-            return None
-        entry = cls._resource_cache.get(resource_id)
+        """Cached ``(local_path, mime)`` if unexpired and the file still exists (cache dir may be swept)."""
+        entry = cls._resource_cache.get(resource_id) if resource_id else None
         if entry is None:
             return None
         local_path, mime, ts = entry
-        if time.time() - ts > cls._RESOURCE_CACHE_TTL_S:
-            cls._resource_cache.pop(resource_id, None)
-            return None
-        # Verify the cached file still exists on disk (cache dir may be swept).
-        if not os.path.isfile(local_path):
+        if time.time() - ts > cls._RESOURCE_CACHE_TTL_S or not os.path.isfile(local_path):
             cls._resource_cache.pop(resource_id, None)
             return None
         return local_path, mime
 
     @classmethod
     def _put_cached_resource(cls, resource_id: str, local_path: str, mime: str) -> None:
-        """Store download result in cache. Evicts oldest entries when over capacity."""
+        """Cache a download result; evicts the oldest 25% when at capacity."""
         if not resource_id:
             return
         if len(cls._resource_cache) >= cls._RESOURCE_CACHE_MAX_SIZE:
-            # Drop the oldest 25% of entries by timestamp.
             sorted_keys = sorted(cls._resource_cache, key=lambda k: cls._resource_cache[k][2])
             for k in sorted_keys[: cls._RESOURCE_CACHE_MAX_SIZE // 4]:
                 cls._resource_cache.pop(k, None)
         cls._resource_cache[resource_id] = (local_path, mime, time.time())
 
     @classmethod
-    def _append_cached_resource(
-        cls,
-        adapter,
-        resource_id: str,
-        media_paths: List[str],
-        mimes: List[str],
-    ) -> bool:
-        """Append a cached resource to output lists when available."""
+    def _append_cached_resource(cls, adapter, resource_id: str, media_paths: List[str], mimes: List[str]) -> bool:
+        """Append a cached resource to the output lists; False on miss."""
         hit = cls._get_cached_resource(resource_id)
         if hit is None:
             return False
-        local_path, mime = hit
-        logger.debug(
-            "[%s] resource cache hit: rid=%s path=%s",
-            adapter.name, resource_id, local_path,
-        )
-        media_paths.append(local_path)
-        mimes.append(mime)
+        logger.debug("[%s] resource cache hit: rid=%s path=%s", adapter.name, resource_id, hit[0])
+        media_paths.append(hit[0])
+        mimes.append(hit[1])
         return True
 
     @staticmethod
     def _guess_image_ext_from_url(url: str) -> str:
-        """Guess image extension from URL path."""
-        path = urllib.parse.urlparse(url).path
-        ext = os.path.splitext(path)[1].lower()
-        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
-            return ext
-        return ".jpg"
+        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+        return ext if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"} else ".jpg"
 
     @staticmethod
     async def _fetch_resource_url(adapter, resource_id: str) -> str:
-        """Low-level helper: exchange a ``resourceId`` for a direct download URL.
-
-        Handles token retrieval, the ``/api/resource/v1/download`` API call,
-        and a single 401-retry with token force-refresh.  Raises on failure.
-        """
+        """Exchange a ``resourceId`` for a direct download URL via ``/api/resource/v1/download``,
+        with a single 401-retry after token force-refresh. Raises on failure."""
         resource_id = resource_id.strip()
         if not resource_id:
             raise RuntimeError("missing resource_id")
@@ -1559,36 +1509,24 @@ class MediaResolveMiddleware(InboundMiddleware):
         if not token or not bot_id:
             raise RuntimeError("missing token or bot_id for resource download")
         api_url = f"{adapter._api_domain}/api/resource/v1/download"
-        headers = {
-            "Content-Type": "application/json",
-            "X-ID": bot_id,
-            "X-Token": token,
-            "X-Source": source,
-        }
+        headers = {"Content-Type": "application/json", "X-ID": bot_id, "X-Token": token, "X-Source": source}
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             for attempt in range(2):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
-                    # Force refresh token once on expiry and retry
-                    token_data = await SignManager.force_refresh(
-                        adapter._app_key, adapter._app_secret, adapter._api_domain,
-                    )
+                    token_data = await SignManager.force_refresh(adapter._app_key, adapter._app_secret, adapter._api_domain)
                     token = str(token_data.get("token") or "").strip()
                     source = str(token_data.get("source") or source or "web").strip() or "web"
                     bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
                     if not token or not bot_id:
                         break
-                    headers["X-ID"] = bot_id
-                    headers["X-Token"] = token
-                    headers["X-Source"] = source
+                    headers.update({"X-ID": bot_id, "X-Token": token, "X-Source": source})
                     continue
                 resp.raise_for_status()
                 payload = resp.json()
                 code = payload.get("code")
                 if code not in {None, 0}:
-                    raise RuntimeError(
-                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
-                    )
+                    raise RuntimeError(f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}")
                 data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
                 real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
                 if real_url:
@@ -1598,13 +1536,8 @@ class MediaResolveMiddleware(InboundMiddleware):
 
     @staticmethod
     async def _resolve_download_url(adapter, url: str) -> str:
-        """Resolve Yuanbao resource placeholder to a directly fetchable real URL.
-
-        Common URL patterns:
-          https://hunyuan.tencent.com/api/resource/download?resourceId=...
-        Direct GET returns 401; need business API:
-          GET /api/resource/v1/download?resourceId=...
-        """
+        """Resolve a Yuanbao resource placeholder URL (``…/api/resource/download?resourceId=…``,
+        which 401s on direct GET) to a fetchable URL via the business API; passthrough otherwise."""
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
@@ -1622,96 +1555,61 @@ class MediaResolveMiddleware(InboundMiddleware):
     @classmethod
     async def _download_and_cache(
         cls, adapter, *, fetch_url: str, kind: str,
-        file_name: Optional[str] = None, log_tag: str = "",
-        resource_id: str = "",
+        file_name: Optional[str] = None, log_tag: str = "", resource_id: str = "",
     ) -> Optional[Tuple[str, str]]:
-        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``.
-
-        When *resource_id* is provided, an in-memory cache keyed by resourceId
-        is consulted first to skip redundant downloads of the same resource
-        within the TTL window.
-        """
+        """Download a Yuanbao resource into the local media cache → ``(local_path, mime)`` or None.
+        A *resource_id* is checked against the in-memory cache first."""
         if resource_id:
             hit = cls._get_cached_resource(resource_id)
             if hit is not None:
-                logger.debug(
-                    "[%s] resource cache hit: rid=%s path=%s",
-                    adapter.name, resource_id, hit[0],
-                )
+                logger.debug("[%s] resource cache hit: rid=%s path=%s", adapter.name, resource_id, hit[0])
                 return hit
         try:
-            file_bytes, content_type = await media_download_url(
-                fetch_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
-            )
+            file_bytes, content_type = await media_download_url(fetch_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB)
         except Exception as exc:
-            logger.warning(
-                "[%s] inbound media download failed: kind=%s %s err=%s",
-                adapter.name, kind, log_tag, exc,
-            )
+            logger.warning("[%s] inbound media download failed: kind=%s %s err=%s", adapter.name, kind, log_tag, exc)
             return None
         if kind == "image":
             ext = cls._guess_image_ext_from_url(fetch_url)
             try:
                 local_path = cache_image_from_bytes(file_bytes, ext=ext)
             except ValueError as exc:
-                logger.warning(
-                    "[%s] inbound image cache rejected: %s err=%s",
-                    adapter.name, log_tag, exc,
-                )
+                logger.warning("[%s] inbound image cache rejected: %s err=%s", adapter.name, log_tag, exc)
                 return None
             mime = guess_mime_type(f"image{ext}")
             if not mime.startswith("image/"):
                 mime = content_type if content_type.startswith("image/") else "image/jpeg"
-            cls._put_cached_resource(resource_id, local_path, mime)
-            return local_path, mime
-        if kind == "video":
+        elif kind == "video":
             # Yuanbao video resources carry no reliable extension; default to mp4.
             local_path = cache_video_from_bytes(file_bytes)
-            mime = guess_mime_type(local_path) or (
-                content_type if content_type.startswith("video/") else "video/mp4"
-            )
-            cls._put_cached_resource(resource_id, local_path, mime)
-            return local_path, mime
-        # kind == "file"
-        if not file_name:
-            parsed = urllib.parse.urlparse(fetch_url)
-            file_name = os.path.basename(parsed.path) or "file"
-        try:
-            local_path = cache_document_from_bytes(file_bytes, file_name)
-        except Exception as exc:
-            logger.warning("[%s] inbound file cache failed: %s err=%s", adapter.name, log_tag, exc)
-            return None
-        mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
+            mime = guess_mime_type(local_path) or (content_type if content_type.startswith("video/") else "video/mp4")
+        else:  # file
+            file_name = file_name or os.path.basename(urllib.parse.urlparse(fetch_url).path) or "file"
+            try:
+                local_path = cache_document_from_bytes(file_bytes, file_name)
+            except Exception as exc:
+                logger.warning("[%s] inbound file cache failed: %s err=%s", adapter.name, log_tag, exc)
+                return None
+            mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
         cls._put_cached_resource(resource_id, local_path, mime)
         return local_path, mime
 
     @classmethod
-    async def _resolve_media_urls(
-        cls, adapter, media_refs: List[Dict[str, str]]
-    ) -> Tuple[List[str], List[str]]:
-        """Resolve inbound media refs: download to local cache, return (local_paths, mime_types).
-
-        Yuanbao COS hostnames resolve to private IPs, tripping the SSRF guard
-        in vision_tools. We download ourselves and return local cache paths.
-
-        Resolution runs with bounded concurrency
-        (``adapter.media_resolve_concurrency``); see :meth:`_resolve_ybres_refs`
-        for the same order-preserving / exception-isolated contract.
-        """
-        # Pre-filter resolvable refs, preserving input order.
+    async def _resolve_media_urls(cls, adapter, media_refs: List[Dict[str, str]]) -> Tuple[List[str], List[str]]:
+        """Resolve inbound media refs → (local_paths, mime_types); same bounded-concurrency,
+        order-preserving, exception-isolated contract as :meth:`_resolve_ybres_refs`."""
         media_urls: List[str] = []
         media_types: List[str] = []
         active: List[Tuple[str, str, str, str]] = []
         for ref in media_refs:
             kind = str(ref.get("kind") or "").strip().lower()
             url = str(ref.get("url") or "").strip()
-            filename = str(ref.get("name") or "").strip()
             if kind not in _RESOLVABLE_MEDIA_KINDS or not url:
                 continue
             rid = ExtractContentMiddleware._parse_resource_id(url)
             if rid and cls._append_cached_resource(adapter, rid, media_urls, media_types):
                 continue
-            active.append((kind, url, filename, rid or ""))
+            active.append((kind, url, str(ref.get("name") or "").strip(), rid or ""))
         if not active:
             return media_urls, media_types
 
@@ -1719,10 +1617,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             try:
                 fetch_url = await cls._resolve_download_url(adapter, url)
             except Exception as exc:
-                logger.warning(
-                    "[%s] inbound media resolve failed: kind=%s url=%s err=%s",
-                    adapter.name, kind, url, exc,
-                )
+                logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", adapter.name, kind, url, exc)
                 return None
             return await cls._download_and_cache(
                 adapter, fetch_url=fetch_url, kind=kind, file_name=filename or None,
@@ -1737,11 +1632,9 @@ class MediaResolveMiddleware(InboundMiddleware):
 
     @staticmethod
     async def _gather_resolve(adapter, active, resolve_one, crash_msg, scope, out_paths, out_mimes) -> None:
-        """Run *resolve_one(*item)* over *active* under bounded concurrency; append successes in input order.
-
-        ``return_exceptions=True`` isolates per-item failures; a batch summary log line with
-        stable fields (concurrency vs elapsed_ms) is emitted for offline aggregation.
-        """
+        """Run *resolve_one(*item)* over *active* under bounded concurrency; append successes in
+        input order. ``return_exceptions=True`` isolates per-item failures; the batch summary line
+        keeps stable fields (concurrency vs elapsed_ms) for offline aggregation."""
         semaphore = asyncio.Semaphore(adapter.media_resolve_concurrency)
 
         async def _guarded(item):
@@ -1755,38 +1648,24 @@ class MediaResolveMiddleware(InboundMiddleware):
             if isinstance(result, BaseException):
                 fmt, args = crash_msg(item, result)
                 logger.warning(fmt, *args)
+            if isinstance(result, BaseException) or result is None:
                 _failed += 1
                 continue
-            if result is None:
-                _failed += 1
-                continue
-            path, mime = result
-            out_paths.append(path)
-            out_mimes.append(mime)
+            out_paths.append(result[0])
+            out_mimes.append(result[1])
         logger.info(
             "[%s] media resolve batch: scope=%s concurrency=%d total=%d ok=%d failed=%d elapsed_ms=%d",
             adapter.name, scope, adapter.media_resolve_concurrency, len(active), len(out_paths), _failed, _elapsed_ms,
         )
 
     @classmethod
-    async def _resolve_ybres_refs(
-        cls,
-        adapter,
-        refs: List[Tuple[str, str, str]],
-        *,
-        log_prefix: str,
-    ) -> Tuple[List[str], List[str]]:
+    async def _resolve_ybres_refs(cls, adapter, refs: List[Tuple[str, str, str]], *, log_prefix: str) -> Tuple[List[str], List[str]]:
         """Resolve ``(rid, kind, filename)`` ybres tuples to local paths (bounded concurrency,
         input order preserved, per-rid failures isolated). Cache hits are served without a fetch."""
         media_paths: List[str] = []
         mimes: List[str] = []
-        active: List[Tuple[str, str, str]] = []
-        for rid, kind, filename in refs:
-            if kind not in _RESOLVABLE_MEDIA_KINDS:
-                continue
-            if cls._append_cached_resource(adapter, rid, media_paths, mimes):
-                continue
-            active.append((rid, kind, filename))
+        active = [(rid, kind, filename) for rid, kind, filename in refs
+                  if kind in _RESOLVABLE_MEDIA_KINDS and not cls._append_cached_resource(adapter, rid, media_paths, mimes)]
         if not active:
             return media_paths, mimes
 
@@ -1794,10 +1673,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             try:
                 fresh_url = await cls._fetch_resource_url(adapter, rid)
             except Exception as exc:
-                logger.warning(
-                    "[%s] %s resolve failed: rid=%s kind=%s err=%s",
-                    adapter.name, log_prefix, rid, kind, exc,
-                )
+                logger.warning("[%s] %s resolve failed: rid=%s kind=%s err=%s", adapter.name, log_prefix, rid, kind, exc)
                 return None
             return await cls._download_and_cache(
                 adapter, fetch_url=fresh_url, kind=kind, file_name=filename or None,
@@ -1812,13 +1688,12 @@ class MediaResolveMiddleware(InboundMiddleware):
 
     @classmethod
     async def _collect_observed_media(cls, adapter, source) -> Tuple[List[str], List[str]]:
-        """Resolve recent observed image/file anchors from transcript into ``(local_paths, mimes)``."""
-        store = getattr(adapter, "_session_store", None)
+        """Resolve recent observed image/file anchors from the transcript into ``(local_paths, mimes)``."""
+        store = _session_store(adapter)
         if not store:
             return [], []
         try:
-            session_entry = store.get_or_create_session(source)
-            history = store.load_transcript(session_entry.session_id)
+            history = store.load_transcript(store.get_or_create_session(source).session_id)
         except Exception as exc:
             logger.warning("[%s] Observed-media hydration setup failed: %s", adapter.name, exc)
             return [], []
@@ -1826,10 +1701,9 @@ class MediaResolveMiddleware(InboundMiddleware):
             return [], []
         # Walk newest→oldest (matches within a message too) so the per-turn cap keeps the
         # *latest* refs; ``order`` is reversed back to chronological before resolving.
-        window = history[-OBSERVED_MEDIA_BACKFILL_LOOKBACK:]
         order: List[Tuple[str, str, str]] = []  # (rid, kind, filename)
         seen: set = set()
-        for msg in reversed(window):
+        for msg in reversed(history[-OBSERVED_MEDIA_BACKFILL_LOOKBACK:]):
             content = msg.get("content")
             if not isinstance(content, str) or "|ybres:" not in content:
                 continue
@@ -1848,10 +1722,8 @@ class MediaResolveMiddleware(InboundMiddleware):
         return await cls._resolve_ybres_refs(adapter, order, log_prefix="observed-media")
 
     @classmethod
-    async def _resolve_quote_media(
-        cls, adapter, quote_media_refs: List[Tuple[str, str, str]],
-    ) -> Tuple[List[str], List[str]]:
-        """Resolve ``(rid, kind, filename)`` anchors of the quoted message (from QuoteContextMiddleware)."""
+    async def _resolve_quote_media(cls, adapter, quote_media_refs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str]]:
+        """Resolve ybres anchors of the quoted message (from QuoteContextMiddleware)."""
         return await cls._resolve_ybres_refs(adapter, quote_media_refs, log_prefix="quote")
 
     @staticmethod
@@ -1861,29 +1733,17 @@ class MediaResolveMiddleware(InboundMiddleware):
         anchors were that turn's failure — no re-download here."""
         paths: List[str] = []
         mimes: List[str] = []
-        rid_key = ctx.reply_to_message_id
-        if not rid_key:
-            return paths, mimes
         cache = getattr(ctx.adapter, "_msg_content_cache", None)
-        if not cache:
-            return paths, mimes
-        text = cache.get(rid_key)
+        text = cache.get(ctx.reply_to_message_id) if ctx.reply_to_message_id and cache else None
         if not isinstance(text, str) or not text:
             return paths, mimes
-        seen: set = set()
         for m in _YB_LOCAL_MEDIA_RE.finditer(text):
             kind = (m.group(1) or "").strip().lower()
             path = (m.group(2) or "").strip()
-            if not path or path in seen:
+            if not path or path in paths or not os.path.exists(path):
                 continue
-            if not os.path.exists(path):
-                continue
-            seen.add(path)
-            mime = guess_mime_type(os.path.basename(path)) or (
-                "image/jpeg" if kind == "image" else "application/octet-stream"
-            )
             paths.append(path)
-            mimes.append(mime)
+            mimes.append(guess_mime_type(os.path.basename(path)) or ("image/jpeg" if kind == "image" else "application/octet-stream"))
         return paths, mimes
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -1892,16 +1752,12 @@ class MediaResolveMiddleware(InboundMiddleware):
         adapter = ctx.adapter
         urls: List[str] = []
         types: List[str] = []
-        seen: set = set()
 
         def _add_unique_pairs(pair_lists: Tuple[List[str], List[str]]) -> None:
-            u_list, m_list = pair_lists
-            for u, m in zip(u_list, m_list):
-                if not u or u in seen:
-                    continue
-                seen.add(u)
-                urls.append(u)
-                types.append(m)
+            for u, m in zip(*pair_lists):
+                if u and u not in urls:
+                    urls.append(u)
+                    types.append(m)
         # 1) Media carried by the current message itself.
         own_pairs = await self._resolve_media_urls(adapter, ctx.media_refs)
         own_count = sum(1 for u in own_pairs[0] if u)
@@ -1911,17 +1767,13 @@ class MediaResolveMiddleware(InboundMiddleware):
         if ctx.reply_to_message_id is not None:
             if ctx.quote_media_refs:
                 _add_unique_pairs(await self._resolve_quote_media(adapter, ctx.quote_media_refs))
-            else:
-                # DM rows carry no platform message_id → recover already-local media from the msg cache.
+            else:  # DM rows carry no platform message_id → recover already-local media from the msg cache.
                 _add_unique_pairs(self._collect_quote_local_media(ctx))
         elif ctx.chat_type == "group":
             try:
                 _add_unique_pairs(await self._collect_observed_media(adapter, ctx.source))
             except Exception as exc:
-                logger.warning(
-                    "[%s] observed-image hydration raised, continuing anyway: %s",
-                    adapter.name, exc,
-                )
+                logger.warning("[%s] observed-image hydration raised, continuing anyway: %s", adapter.name, exc)
         ctx.media_urls = urls
         ctx.media_types = types
         # Re-check placeholder using ``own_count``: placeholder text with only quote/observed
@@ -1950,14 +1802,12 @@ class PatchAnchorsMiddleware(InboundMiddleware):
             anchor_match = _YB_RES_REF_RE.search(patched)
             if not anchor_match:
                 break
-            head = anchor_match.group(1)
-            kind, _, filename = head.partition(":")
+            kind, _, filename = anchor_match.group(1).partition(":")
             kind = kind.strip()
             if kind == "image" and m.startswith("image/"):
                 replacement = f"[image: {u}]"
             elif kind == "file":
-                label = filename.strip() or os.path.basename(u)
-                replacement = f"[file: {label} → {u}]"
+                replacement = f"[file: {filename.strip() or os.path.basename(u)} → {u}]"
             elif kind == "video":
                 replacement = f"[video: {u}]"
             else:
@@ -1971,7 +1821,7 @@ class PatchAnchorsMiddleware(InboundMiddleware):
 
 
 class DispatchMiddleware(InboundMiddleware):
-    """Build MessageEvent and dispatch to AI handler."""
+    """Build the MessageEvent and dispatch it (groups: serialised per session via a queue)."""
 
     name = "dispatch"
 
@@ -1984,22 +1834,14 @@ class DispatchMiddleware(InboundMiddleware):
         )
 
         async def _dispatch_inbound_event() -> None:
+            if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types):
+                msg_type = MessageType.DOCUMENT
+            else:  # yuanbao-local subtypes (CHAT_RECORD) are deep-parsed into text → TEXT downstream
+                msg_type = ctx.msg_type if isinstance(ctx.msg_type, MessageType) else MessageType.TEXT
             event = MessageEvent(
-                text=ctx.raw_text,
-                message_type=(
-                    MessageType.DOCUMENT
-                    if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types)
-                    # yuanbao-local subtypes (CHAT_RECORD) are deep-parsed into text → TEXT downstream
-                    else ctx.msg_type if isinstance(ctx.msg_type, MessageType)
-                    else MessageType.TEXT
-                ),
-                source=ctx.source,
-                message_id=ctx.msg_id or None,
-                raw_message=ctx.push,
-                media_urls=list(ctx.media_urls),
-                media_types=list(ctx.media_types),
-                reply_to_message_id=ctx.reply_to_message_id,
-                reply_to_text=ctx.reply_to_text,
+                text=ctx.raw_text, message_type=msg_type, source=ctx.source, message_id=ctx.msg_id or None,
+                raw_message=ctx.push, media_urls=list(ctx.media_urls), media_types=list(ctx.media_types),
+                reply_to_message_id=ctx.reply_to_message_id, reply_to_text=ctx.reply_to_text,
                 channel_prompt=ctx.channel_prompt,
             )
             if _sk and ctx.msg_id:
@@ -2008,21 +1850,16 @@ class DispatchMiddleware(InboundMiddleware):
             if ctx.msg_id and ctx.raw_text:
                 cache = adapter._msg_content_cache
                 cache[ctx.msg_id] = ctx.raw_text
-                if len(cache) > 200:
-                    for k in list(cache)[:len(cache) - 200]:
-                        del cache[k]
+                for k in list(cache)[:max(0, len(cache) - 200)]:
+                    del cache[k]
             await adapter.handle_message(event)
         if ctx.chat_type == "group":
             is_new = _sk not in adapter._group_queues
             queue = adapter._group_queues.setdefault(_sk, asyncio.Queue())
             queue.put_nowait(_dispatch_inbound_event)
-            logger.info(
-                "[%s] Group message enqueued (qsize=%d) for %s",
-                adapter.name, queue.qsize(), (_sk or "")[:50],
-            )
+            logger.info("[%s] Group message enqueued (qsize=%d) for %s", adapter.name, queue.qsize(), (_sk or "")[:50])
             if is_new:
-                self._track_inbound(adapter, self._consume_group_queue(adapter, _sk),
-                                    f"yuanbao-group-consumer-{(_sk or '')[:30]}")
+                self._track_inbound(adapter, self._consume_group_queue(adapter, _sk), f"yuanbao-group-consumer-{(_sk or '')[:30]}")
         else:
             self._track_inbound(adapter, _dispatch_inbound_event(), f"yuanbao-inbound-{ctx.msg_id or 'unknown'}")
         await next_fn()
@@ -2035,21 +1872,17 @@ class DispatchMiddleware(InboundMiddleware):
 
     @staticmethod
     async def _consume_group_queue(adapter: "YuanbaoAdapter", session_key: str) -> None:
-        """Drain the group queue one dispatch at a time, waiting for each to finish."""
-        _IDLE_TIMEOUT = 2.0
+        """Drain the group queue one dispatch at a time, waiting for each to finish; exits after 2s idle."""
         queue = adapter._group_queues.get(session_key)
         if not queue:
             return
         try:
             while True:
                 try:
-                    dispatch_fn = await asyncio.wait_for(queue.get(), timeout=_IDLE_TIMEOUT)
+                    dispatch_fn = await asyncio.wait_for(queue.get(), timeout=2.0)
                 except asyncio.TimeoutError:
                     break
-                logger.debug(
-                    "[%s] Group queue: dispatching for %s (remaining=%d)",
-                    adapter.name, (session_key or "")[:50], queue.qsize(),
-                )
+                logger.debug("[%s] Group queue: dispatching for %s (remaining=%d)", adapter.name, (session_key or "")[:50], queue.qsize())
                 try:
                     await dispatch_fn()
                     while session_key in adapter._active_sessions:
@@ -2064,31 +1897,15 @@ class InboundPipelineBuilder:
     """Assembles the default Yuanbao inbound pipeline (order matters)."""
 
     _DEFAULT_MIDDLEWARES: list[type] = [
-        DecodeMiddleware,
-        ExtractFieldsMiddleware,
-        RecallGuardMiddleware,
-        DedupMiddleware,
-        SkipSelfMiddleware,
-        ChatRoutingMiddleware,
-        AccessGuardMiddleware,
-        ExtractContentMiddleware,
-        PlaceholderFilterMiddleware,
-        OwnerCommandMiddleware,
-        BuildSourceMiddleware,
-        GroupAtGuardMiddleware,
-        AutoSetHomeMiddleware,
-        GroupAttributionMiddleware,
-        ClassifyMessageTypeMiddleware,
-        QuoteContextMiddleware,
-        ForwardedRecordsParseMiddleware,
-        MediaResolveMiddleware,
-        PatchAnchorsMiddleware,
-        DispatchMiddleware,
+        DecodeMiddleware, ExtractFieldsMiddleware, RecallGuardMiddleware, DedupMiddleware, SkipSelfMiddleware,
+        ChatRoutingMiddleware, AccessGuardMiddleware, ExtractContentMiddleware, PlaceholderFilterMiddleware,
+        OwnerCommandMiddleware, BuildSourceMiddleware, GroupAtGuardMiddleware, AutoSetHomeMiddleware,
+        GroupAttributionMiddleware, ClassifyMessageTypeMiddleware, QuoteContextMiddleware,
+        ForwardedRecordsParseMiddleware, MediaResolveMiddleware, PatchAnchorsMiddleware, DispatchMiddleware,
     ]
 
     @classmethod
     def build(cls) -> InboundPipeline:
-        """Build the default inbound message processing pipeline."""
         pipeline = InboundPipeline()
         for mw_cls in cls._DEFAULT_MIDDLEWARES:
             pipeline.use(mw_cls())
