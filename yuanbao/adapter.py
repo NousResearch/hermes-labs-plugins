@@ -546,25 +546,19 @@ class DecodeMiddleware(InboundMiddleware):
 
 
 class ExtractFieldsMiddleware(InboundMiddleware):
-    """Extract common fields from ctx.push into ctx attributes."""
+    """Copy common push fields onto ctx."""
 
     name = "extract-fields"
+    _FIELDS = ("from_account", "group_code", "group_name", "sender_nickname", "msg_id", "cloud_custom_data")
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        push = ctx.push
-        ctx.from_account = push.get("from_account", "")
-        ctx.group_code = push.get("group_code", "")
-        ctx.group_name = push.get("group_name", "")
-        ctx.sender_nickname = push.get("sender_nickname", "")
-        ctx.msg_body = push.get("msg_body", [])
-        ctx.msg_id = push.get("msg_id", "")
-        ctx.cloud_custom_data = push.get("cloud_custom_data", "")
+        for f in self._FIELDS:
+            setattr(ctx, f, ctx.push.get(f, ""))
+        ctx.msg_body = ctx.push.get("msg_body", [])
         await next_fn()
 
 
 class DedupMiddleware(InboundMiddleware):
-    """Inbound message deduplication."""
-
     name = "dedup"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -572,6 +566,11 @@ class DedupMiddleware(InboundMiddleware):
             logger.debug("[%s] Duplicate message ignored: msg_id=%s", ctx.adapter.name, ctx.msg_id)
             return  # Stop pipeline
         await next_fn()
+
+
+def _session_store(adapter):
+    """Adapter's SessionStore, or None before ``set_session_store`` ran."""
+    return getattr(adapter, "_session_store", None)
 
 
 class RecallGuardMiddleware(InboundMiddleware):
@@ -599,6 +598,10 @@ class RecallGuardMiddleware(InboundMiddleware):
             thread_id="main" if group_code else None,
         )
 
+    @classmethod
+    def _resolve_sid(cls, store, adapter, group_code: str, from_account: str) -> str:
+        return store.get_or_create_session(cls._build_source(adapter, group_code, from_account)).session_id
+
     def _handle_recall(self, ctx: InboundContext, cmd: str) -> None:
         adapter = ctx.adapter
         push = ctx.push or {}
@@ -621,8 +624,7 @@ class RecallGuardMiddleware(InboundMiddleware):
             if matched_sk is not None:
                 self._interrupt_for_recall(adapter, matched_sk, recalled_id, group_code, from_account)
             else:
-                recalled_content = adapter._msg_content_cache.get(recalled_id)
-                self._patch_transcript(adapter, recalled_id, group_code, from_account, recalled_content)
+                self._patch_transcript(adapter, recalled_id, group_code, from_account, adapter._msg_content_cache.get(recalled_id))
 
     # -- Branch C: interrupt currently-processing message ---------------
 
@@ -634,8 +636,7 @@ class RecallGuardMiddleware(InboundMiddleware):
         return None
 
     @classmethod
-    def _interrupt_for_recall(cls, adapter, session_key: str, recalled_id: str,
-                              group_code: str, from_account: str) -> None:
+    def _interrupt_for_recall(cls, adapter, session_key: str, recalled_id: str, group_code: str, from_account: str) -> None:
         where = f"group {group_code}" if group_code else f"direct chat with {from_account}"
         recall_text = (
             f"[CRITICAL — MESSAGE RECALLED] The user message that triggered "
@@ -649,40 +650,32 @@ class RecallGuardMiddleware(InboundMiddleware):
             f"\"The message has been recalled.\" in the "
             f"language the user was using."
         )
-        synth_event = MessageEvent(
-            text=recall_text,
-            message_type=MessageType.TEXT,
-            source=cls._build_source(adapter, group_code, from_account),
-            internal=True,
-        )
         # Set pending + signal directly (bypass handle_message to avoid busy-ack).
         # May overwrite a user message pending in the same ~200ms window — acceptable.
-        adapter._pending_messages[session_key] = synth_event
+        adapter._pending_messages[session_key] = MessageEvent(
+            text=recall_text, message_type=MessageType.TEXT,
+            source=cls._build_source(adapter, group_code, from_account), internal=True,
+        )
         active_event = adapter._active_sessions.get(session_key)
         if active_event is not None:
             active_event.set()
         logger.info("[%s] Recall interrupt: msg_id=%s session=%s", adapter.name, recalled_id, session_key[:30])
-        # The interrupted turn will persist the recalled content *after* our
-        # interrupt — schedule a delayed redaction to clean it up.
+        # The interrupted turn persists the recalled content *after* our interrupt — redact later.
         recalled_text = adapter._processing_msg_texts.get(session_key, "")
         if recalled_text:
             cls._schedule_content_redact(adapter, session_key, recalled_text, group_code, from_account)
 
     @classmethod
-    def _schedule_content_redact(cls, adapter, session_key: str, recalled_text: str,
-                                 group_code: str, from_account: str) -> None:
+    def _schedule_content_redact(cls, adapter, session_key: str, recalled_text: str, group_code: str, from_account: str) -> None:
         async def _redact() -> None:
-            store = getattr(adapter, "_session_store", None)
+            store = _session_store(adapter)
             if not store:
                 return
             try:
-                sid = store.get_or_create_session(
-                    cls._build_source(adapter, group_code, from_account),
-                ).session_id
+                sid = cls._resolve_sid(store, adapter, group_code, from_account)
             except Exception:
                 return
-            # Poll until the recalled content appears in transcript — the
-            # interrupted turn hasn't finished writing yet when scheduled.
+            # Poll until the recalled content appears — the interrupted turn hasn't finished writing yet.
             for _ in range(30):
                 await asyncio.sleep(0.5)
                 try:
@@ -699,20 +692,18 @@ class RecallGuardMiddleware(InboundMiddleware):
                             logger.warning("[%s] Recall redact failed: %s", adapter.name, exc)
                         return
             logger.debug("[%s] Recall redact: content not found after polling, session %s", adapter.name, session_key[:30])
-        task = asyncio.create_task(_redact())
-        adapter._background_tasks.add(task)
-        task.add_done_callback(adapter._background_tasks.discard)
+        adapter._track_task(asyncio.create_task(_redact()))
 
     # -- Branch A/B: patch transcript (session idle) --------------------
 
     @classmethod
     def _patch_transcript(cls, adapter, recalled_id: str, group_code: str,
                           from_account: str, recalled_content: Optional[str] = None) -> None:
-        store = getattr(adapter, "_session_store", None)
+        store = _session_store(adapter)
         if not store:
             return
         try:
-            sid = store.get_or_create_session(cls._build_source(adapter, group_code, from_account)).session_id
+            sid = cls._resolve_sid(store, adapter, group_code, from_account)
         except Exception as exc:
             logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
             return
@@ -721,22 +712,13 @@ class RecallGuardMiddleware(InboundMiddleware):
         except Exception as exc:
             logger.warning("[%s] Recall: failed to load transcript: %s", adapter.name, exc)
             return
-        # A1: exact platform message_id match (rows persisted with a platform_message_id).
-        target = None
-        branch_label = ""
-        for entry in transcript:
-            if entry.get("message_id") == recalled_id:
-                target = entry
-                branch_label = "branch A1: id match"
-                break
-        # A2: content-match fallback for rows without a platform id (agent-processed @bot
-        # messages — run.py doesn't carry msg_id through — or pre-column rows).
+        # A1: exact platform message_id match; A2: content-match fallback for rows without a
+        # platform id (agent-processed @bot messages — run.py doesn't carry msg_id — or pre-column rows).
+        target = next((e for e in transcript if e.get("message_id") == recalled_id), None)
+        branch_label = "branch A1: id match"
         if target is None and recalled_content:
-            for entry in transcript:
-                if entry.get("role") == "user" and entry.get("content") == recalled_content:
-                    target = entry
-                    branch_label = "branch A2: content match"
-                    break
+            target = next((e for e in transcript if e.get("role") == "user" and e.get("content") == recalled_content), None)
+            branch_label = "branch A2: content match"
         if target is not None:
             target["content"] = cls._REDACTED
             try:
@@ -755,16 +737,13 @@ class RecallGuardMiddleware(InboundMiddleware):
 
 
 class SkipSelfMiddleware(InboundMiddleware):
-    """Filter out bot's own messages."""
+    """Drop the bot's own messages."""
 
     name = "skip-self"
 
     @staticmethod
     def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
-        """Detect whether the message is from the bot itself."""
-        if not from_account or not bot_id:
-            return False
-        return from_account == bot_id
+        return bool(from_account and bot_id) and from_account == bot_id
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if self._is_self_reference(ctx.from_account, ctx.adapter._bot_id):
@@ -774,41 +753,30 @@ class SkipSelfMiddleware(InboundMiddleware):
 
 
 class ChatRoutingMiddleware(InboundMiddleware):
-    """Determine chat_id, chat_type, chat_name from push fields."""
+    """Derive chat_id / chat_type / chat_name from push fields."""
 
     name = "chat-routing"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.group_code:
-            ctx.chat_id = f"group:{ctx.group_code}"
-            ctx.chat_type = "group"
-            ctx.chat_name = ctx.group_name or ctx.group_code
+            ctx.chat_id, ctx.chat_type, ctx.chat_name = f"group:{ctx.group_code}", "group", ctx.group_name or ctx.group_code
         else:
-            ctx.chat_id = f"direct:{ctx.from_account}"
-            ctx.chat_type = "dm"
-            ctx.chat_name = ctx.sender_nickname or ctx.from_account
+            ctx.chat_id, ctx.chat_type, ctx.chat_name = f"direct:{ctx.from_account}", "dm", ctx.sender_nickname or ctx.from_account
         await next_fn()
 
 
 class AccessPolicy:
     """DM / group access rules shared by inbound middleware and outbound ``send_dm``."""
 
-    def __init__(
-        self,
-        dm_policy: str,
-        dm_allow_from: list[str],
-        group_policy: str,
-        group_allow_from: list[str],
-    ) -> None:
+    def __init__(self, dm_policy: str, dm_allow_from: list[str], group_policy: str, group_allow_from: list[str]) -> None:
         self._dm_policy = dm_policy
         self._dm_allow_from = dm_allow_from
         self._group_policy = group_policy
         self._group_allow_from = group_allow_from
 
     def _open_dm_opted_in(self) -> bool:
-        if (_yb_secret("GATEWAY_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}:
-            return True
-        return (_yb_secret("YUANBAO_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}
+        return any((_yb_secret(k, "") or "").lower() in {"true", "1", "yes"}
+                   for k in ("GATEWAY_ALLOW_ALL_USERS", "YUANBAO_ALLOW_ALL_USERS"))
 
     def _evaluate(self, policy: str, allow_from: list[str], principal: str, *, pairing: bool) -> bool:
         """Shared allow/deny rule; *pairing* is the verdict for the "pairing" policy."""
@@ -827,12 +795,9 @@ class AccessPolicy:
     def is_dm_intake_allowed(self, sender_id: str) -> bool:
         """Whether a DM may reach gateway intake (pairing handshake path)."""
         principal = str(sender_id or "").strip()
-        if not principal:
-            return False
-        return self._evaluate(self._dm_policy, self._dm_allow_from, principal, pairing=True)
+        return bool(principal) and self._evaluate(self._dm_policy, self._dm_allow_from, principal, pairing=True)
 
     def is_group_allowed(self, group_code: str) -> bool:
-        """Platform-level group chat inbound filter (open / allowlist / disabled)."""
         return self._evaluate(self._group_policy, self._group_allow_from, group_code.strip(), pairing=False)
 
     @property
@@ -845,25 +810,18 @@ class AccessPolicy:
 
 
 class AccessGuardMiddleware(InboundMiddleware):
-    """Platform-level DM/Group access control filter."""
+    """Platform-level DM/group access filter."""
 
     name = "access-guard"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
         policy: AccessPolicy = adapter._access_policy
-        if ctx.chat_type == "dm":
-            if not policy.is_dm_intake_allowed(ctx.from_account):
-                logger.debug(
-                    "[%s] DM from %s blocked by dm_policy=%s",
-                    adapter.name, ctx.from_account, policy.dm_policy,
-                )
-                return  # Stop pipeline
-        elif ctx.chat_type == "group" and not policy.is_group_allowed(ctx.group_code):
-            logger.debug(
-                "[%s] Group %s blocked by group_policy=%s",
-                adapter.name, ctx.group_code, policy.group_policy,
-            )
+        if ctx.chat_type == "dm" and not policy.is_dm_intake_allowed(ctx.from_account):
+            logger.debug("[%s] DM from %s blocked by dm_policy=%s", adapter.name, ctx.from_account, policy.dm_policy)
+            return  # Stop pipeline
+        if ctx.chat_type == "group" and not policy.is_group_allowed(ctx.group_code):
+            logger.debug("[%s] Group %s blocked by group_policy=%s", adapter.name, ctx.group_code, policy.group_policy)
             return  # Stop pipeline
         await next_fn()
 
@@ -872,8 +830,7 @@ class AutoSetHomeMiddleware(InboundMiddleware):
     """Silently designate the first inbound conversation as home channel (config.yaml + env);
     a group home is upgraded by the first DM. Runs after GroupAtGuard so unaddressed group traffic
     never claims it; only strictly-authorized senders (allowlist / open opt-in / pairing-approved)
-    may — intake-only pairing forwards must not.
-    """
+    may — intake-only pairing forwards must not."""
 
     name = "auto-sethome"
 
@@ -881,27 +838,20 @@ class AutoSetHomeMiddleware(InboundMiddleware):
         adapter = ctx.adapter
         if not adapter._auto_sethome_done and adapter._sender_may_designate_home(ctx):
             _cur_home = os.getenv("YUANBAO_HOME_CHANNEL", "")
-            _should_set = (
-                not _cur_home
-                or (_cur_home.startswith("group:") and ctx.chat_type == "dm")
-            )
+            _should_set = not _cur_home or (_cur_home.startswith("group:") and ctx.chat_type == "dm")
             if ctx.chat_type == "dm":
                 adapter._auto_sethome_done = True  # DM seen — no further upgrades needed
             if _should_set:
                 try:
                     from hermes_constants import get_hermes_home
                     from hermes_cli.config import atomic_config_write, read_user_config_raw
-                    _home = get_hermes_home()
-                    config_path = _home / "config.yaml"
+                    config_path = get_hermes_home() / "config.yaml"
                     # Raw read: merged defaults must not be persisted to the user's file.
                     user_config: dict = read_user_config_raw(config_path)
                     user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
                     atomic_config_write(config_path, user_config)
                     os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
-                    logger.info(
-                        "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",
-                        adapter.name, ctx.chat_id, ctx.chat_name,
-                    )
+                    logger.info("[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel", adapter.name, ctx.chat_id, ctx.chat_name)
                 except Exception as e:
                     logger.warning("[%s] Auto-sethome failed: %s", adapter.name, e)
         await next_fn()
@@ -913,9 +863,7 @@ def _iter_custom_elems(msg_body: list) -> Iterator[Tuple[Any, dict]]:
         if not isinstance(elem, dict) or elem.get("msg_type") != "TIMCustomElem":
             continue
         content = elem.get("msg_content", {}) or {}
-        if not isinstance(content, dict):
-            continue
-        data_str = content.get("data", "")
+        data_str = content.get("data", "") if isinstance(content, dict) else ""
         if not data_str:
             continue
         try:
@@ -925,26 +873,31 @@ def _iter_custom_elems(msg_body: list) -> Iterator[Tuple[Any, dict]]:
         yield custom, content
 
 
+def _file_name(content: dict) -> str:
+    """First non-empty of file_name / fileName / filename, stripped."""
+    return (str(content.get("file_name") or "").strip() or str(content.get("fileName") or "").strip()
+            or str(content.get("filename") or "").strip())
+
+
 class ExtractContentMiddleware(InboundMiddleware):
-    """Extract raw text and media refs from msg_body."""
+    """Extract raw text, media refs and forwarded records from msg_body."""
 
     name = "extract-content"
 
     _CARD_CONTENT_MAX_LENGTH = 1000
+    _UNSUPPORTED = "[unsupported message type]"
 
     @staticmethod
     def _format_shared_link(custom: dict) -> str:
-        """Format elem_type 1010 (share card) into bracket-placeholder text."""
+        """elem_type 1010 (share card) → bracket-placeholder text."""
         title = custom.get("title", "")
         link = custom.get("link", "")
-        header = f"[share_card: {title} | {link}]" if link else f"[share_card: {title}]"
-        lines = [header]
+        lines = [f"[share_card: {title} | {link}]" if link else f"[share_card: {title}]"]
         max_len = ExtractContentMiddleware._CARD_CONTENT_MAX_LENGTH
         for field in ("card_content", "wechat_des"):
             val = custom.get(field)
             if val and isinstance(val, str):
-                preview = val[:max_len] + "...(truncated)" if len(val) > max_len else val
-                lines.append(f"Preview: {preview}")
+                lines.append(f"Preview: {val[:max_len] + '...(truncated)' if len(val) > max_len else val}")
                 break
         if link:
             lines.append("[visit link for full content]")
@@ -952,7 +905,7 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     @staticmethod
     def _format_link_understanding(custom: dict) -> Optional[str]:
-        """Format elem_type 1007 (link understanding card) into bracket-placeholder text."""
+        """elem_type 1007 (link understanding card) → bracket-placeholder text."""
         content = custom.get("content")
         if not content:
             return None
@@ -999,17 +952,15 @@ class ExtractContentMiddleware(InboundMiddleware):
         for elem in msg_body:
             elem_type: str = elem.get("msg_type", "")
             content: dict = elem.get("msg_content", {})
-            if elem_type == "TIMTextElem":
-                text = content.get("text", "")
-                if text:
-                    parts.append(text)
+            if elem_type == _TEXT_ELEM_TYPE:
+                if content.get("text", ""):
+                    parts.append(content["text"])
             elif elem_type == "TIMImageElem":
                 rid = cls._parse_resource_id(cls._pick_image_url(content))
                 parts.append(f"[image|ybres:{rid}]" if rid else "[image]")
             elif elem_type == "TIMFileElem":
                 filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
-                file_url = str(content.get("url") or "").strip()
-                rid = cls._parse_resource_id(file_url)
+                rid = cls._parse_resource_id(str(content.get("url") or "").strip())
                 if rid:
                     parts.append(f"[file:{filename}|ybres:{rid}]" if filename else f"[file|ybres:{rid}]")
                 else:
@@ -1021,21 +972,16 @@ class ExtractContentMiddleware(InboundMiddleware):
             elif elem_type == "TIMCustomElem":
                 parts.append(cls._custom_elem_text(content.get("data", "")))
             elif elem_type == "TIMFaceElem":
-                raw_data = content.get("data", "")
                 face_name = ""
-                if raw_data:
+                if content.get("data", ""):
                     try:
-                        face_data = json.loads(raw_data)
-                        face_name = (face_data.get("name") or "").strip()
+                        face_name = (json.loads(content["data"]).get("name") or "").strip()
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         pass
                 parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
             elif elem_type:
-                # Unknown element type — include type as placeholder
-                parts.append(f"[{elem_type}]")
-        return " ".join(parts) if parts else ""
-
-    _UNSUPPORTED = "[unsupported message type]"
+                parts.append(f"[{elem_type}]")  # unknown element type — keep as placeholder
+        return " ".join(parts)
 
     @classmethod
     def _custom_elem_text(cls, data_val: str) -> str:
@@ -1062,11 +1008,9 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
-        """Strip and convert a leading full-width slash (Chinese IME) to ASCII so commands match."""
+        """Strip; convert a leading full-width slash (Chinese IME) to ASCII so commands match."""
         text = text.strip()
-        if text.startswith('\uff0f'):  # Full-width slash
-            text = '/' + text[1:]
-        return text
+        return '/' + text[1:] if text.startswith('\uff0f') else text
 
     @staticmethod
     def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
@@ -1083,53 +1027,36 @@ class ExtractContentMiddleware(InboundMiddleware):
                 image_url = ExtractContentMiddleware._pick_image_url(content)
                 if image_url:
                     refs.append({"kind": "image", "url": image_url})
-                continue
-            if msg_type == "TIMFileElem":
+            elif msg_type == "TIMFileElem":
                 file_url = str(content.get("url") or "").strip()
-                file_name = (
-                    str(content.get("file_name") or "").strip()
-                    or str(content.get("fileName") or "").strip()
-                    or str(content.get("filename") or "").strip()
-                )
                 if file_url:
                     ref: Dict[str, str] = {"kind": "file", "url": file_url}
-                    if file_name:
-                        ref["name"] = file_name
+                    if _file_name(content):
+                        ref["name"] = _file_name(content)
                     refs.append(ref)
         return refs
 
     @staticmethod
     def _extract_forwarded_records(msg_body: list, user_id: str = "") -> Optional[dict]:
-        """ForwardMsgData for elem_type 1009 (WeChat forward), or None.
-
-        Payload lives in ``msg_content.ext_map`` (pb field 999) under keys
-        ``wexin_forward_msg_[id]_[userid]``; values are base64 protobuf (NOT JSON).
-        First entry decoding to ``sub_type == 1`` wins.
-        """
+        """ForwardMsgData for elem_type 1009 (WeChat forward), or None. Payload lives in
+        ``msg_content.ext_map`` (pb field 999) under ``wexin_forward_msg_[id]_[userid]`` keys as
+        base64 protobuf (NOT JSON); the first entry decoding to ``sub_type == 1`` wins."""
         for custom, content in _iter_custom_elems(msg_body):
             if not (isinstance(custom, dict) and custom.get("elem_type") == 1009):
                 continue
             ext_map = content.get("ext_map") or {}
             if not isinstance(ext_map, dict) or not ext_map:
                 return None
-
-            def _parse_value(value):
-                if not isinstance(value, str) or not value:
-                    return None
+            for key, value in ext_map.items():
+                if not key.startswith("wexin_forward_msg_") or not isinstance(value, str) or not value:
+                    continue
                 try:
                     pb = base64.b64decode(value)
                 except (binascii.Error, ValueError):
-                    return None
+                    continue
                 data = decode_forward_msg_data(pb)
                 if isinstance(data, dict) and data.get("sub_type") == 1:
                     return data
-                return None
-            for key, value in ext_map.items():
-                if not key.startswith("wexin_forward_msg_"):
-                    continue
-                parsed = _parse_value(value)
-                if parsed is not None:
-                    return parsed
         return None
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -1137,6 +1064,7 @@ class ExtractContentMiddleware(InboundMiddleware):
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.forwarded_records = self._extract_forwarded_records(ctx.msg_body, ctx.from_account)
         await next_fn()
+
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
     """Skip pure placeholder messages (e.g. '[image]' with no media)."""
@@ -1150,11 +1078,7 @@ class PlaceholderFilterMiddleware(InboundMiddleware):
 
     @classmethod
     def is_skippable_placeholder(cls, text: str, media_count: int = 0) -> bool:
-        """Detect whether the message is a pure placeholder (should be skipped)."""
-        if media_count > 0:
-            return False
-        stripped = text.strip()
-        return stripped in cls.SKIPPABLE_PLACEHOLDERS
+        return media_count <= 0 and text.strip() in cls.SKIPPABLE_PLACEHOLDERS
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if self.is_skippable_placeholder(ctx.raw_text, len(ctx.media_refs)):
@@ -1177,75 +1101,51 @@ class OwnerCommandMiddleware(InboundMiddleware):
     _rewrite_slash_command = staticmethod(ExtractContentMiddleware._rewrite_slash_command)
 
     @classmethod
-    def _detect_owner_command(
-        cls,
-        *,
-        push: dict,
-        msg_body: list,
-        chat_type: str,
-        from_account: str,
-    ) -> Tuple[Optional[str], Optional[str], bool]:
+    def _detect_owner_command(cls, *, push: dict, msg_body: list, chat_type: str, from_account: str) -> Tuple[Optional[str], Optional[str], bool]:
         """→ (cmd, cmd_line, is_owner); (None, None, False) when not an allowlisted command."""
         if chat_type != "group" or not cls.ALLOWLIST:
             return None, None, False
-        # Extract TIMTextElem: only do command recognition with exactly one text segment
-        text_elems = [e for e in (msg_body or []) if e.get("msg_type") == "TIMTextElem"]
+        # Only recognise commands when there is exactly one text segment.
+        text_elems = [e for e in (msg_body or []) if e.get("msg_type") == _TEXT_ELEM_TYPE]
         if len(text_elems) != 1:
             return None, None, False
-        text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = cls._rewrite_slash_command(text)
+        cmd_line = cls._rewrite_slash_command((text_elems[0].get("msg_content") or {}).get("text", ""))
         if not cmd_line.startswith("/"):
             return None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
         if cmd not in cls.ALLOWLIST:
             return None, None, False
-        # Owner ⇔ push.from_account == push.bot_owner_id. These commands are privileged
-        # (/approve, /stop, /reset…) — a non-owner must never be able to run them.
+        # Owner ⇔ push.from_account == push.bot_owner_id; these commands are privileged
+        # (/approve, /stop, /reset…) so a non-owner must never run them.
         owner_id = str((push or {}).get("bot_owner_id") or "").strip()
-        is_owner = bool(owner_id) and owner_id == from_account
-        return cmd, cmd_line, is_owner
+        return cmd, cmd_line, bool(owner_id) and owner_id == from_account
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
         matched_cmd, cmd_line, is_owner = self._detect_owner_command(
-            push=ctx.push,
-            msg_body=ctx.msg_body,
-            chat_type=ctx.chat_type,
-            from_account=ctx.from_account,
+            push=ctx.push, msg_body=ctx.msg_body, chat_type=ctx.chat_type, from_account=ctx.from_account,
         )
         if matched_cmd and not is_owner:
-            logger.info(
-                "[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s",
-                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
-            )
+            logger.info("[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s", adapter.name, ctx.chat_id, ctx.from_account, matched_cmd)
             adapter._track_task(asyncio.create_task(
                 adapter.send(ctx.chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
                 name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
             ))
             return  # Stop pipeline
         if matched_cmd and is_owner and cmd_line:
-            logger.info(
-                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
-                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
-            )
+            logger.info("[%s] Bot owner slash command: chat=%s from=%s cmd=%s", adapter.name, ctx.chat_id, ctx.from_account, matched_cmd)
             ctx.owner_command = matched_cmd
-            ctx.raw_text = cmd_line  # Override with clean command text
+            ctx.raw_text = cmd_line  # clean command text
         await next_fn()
 
 
 class BuildSourceMiddleware(InboundMiddleware):
-    """Build SessionSource from context fields."""
-
     name = "build-source"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        adapter = ctx.adapter
-        ctx.source = adapter.build_source(
-            chat_id=ctx.chat_id,
-            chat_type=ctx.chat_type,
-            chat_name=ctx.chat_name,
-            user_id=ctx.from_account or None,
-            user_name=ctx.sender_nickname or ctx.from_account,
+        ctx.source = ctx.adapter.build_source(
+            chat_id=ctx.chat_id, chat_type=ctx.chat_type, chat_name=ctx.chat_name,
+            user_id=ctx.from_account or None, user_name=ctx.sender_nickname or ctx.from_account,
             thread_id="main" if ctx.chat_type == "group" else None,
         )
         await next_fn()
@@ -1280,12 +1180,11 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
     @staticmethod
     def _build_group_channel_prompt(msg_body: list, bot_id: Optional[str]) -> str:
-        """Build a per-turn group-chat prompt that highlights which message to respond to."""
-        bid = str(bot_id or "unknown")
+        """Per-turn group-chat prompt that highlights which message to respond to."""
         bot_mention = GroupAtGuardMiddleware._extract_bot_mention_text(msg_body, bot_id) or "unknown"
         return (
             "You are handling a Yuanbao group chat message.\n"
-            f"- Your identity: user_id={bid}, @-mention name in this group={bot_mention}\n"
+            f"- Your identity: user_id={bot_id or 'unknown'}, @-mention name in this group={bot_mention}\n"
             "- Lines in history prefixed with `[nickname|user_id]` are observed group context "
             "and are not necessarily addressed to you.\n"
             "- Treat only the current new message as a request explicitly directed at you, "
@@ -1293,33 +1192,23 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         )
 
     @classmethod
-    def _observe_group_message(
-        cls,
-        adapter, source, sender_display: str, text: str,
-        *,
-        ctx: InboundContext,
-        msg_id: Optional[str] = None,
-        forwarded_records: Optional[dict] = None,
-    ) -> None:
+    def _observe_group_message(cls, adapter, source, sender_display: str, text: str, *, ctx: InboundContext,
+                               msg_id: Optional[str] = None, forwarded_records: Optional[dict] = None) -> None:
         """Record a group message as ``role: user`` ``[nickname|user_id]\\n<content>`` without
         invoking the agent, so later @bot turns see the full conversation."""
-        store = getattr(adapter, "_session_store", None)
+        store = _session_store(adapter)
         if not store:
             return
         try:
             session_entry = store.get_or_create_session(source)
-            user_id = source.user_id or "unknown"
             body_text = text
             if forwarded_records:
-                summary = ForwardedRecordsParseMiddleware.build_forward_text(
-                    forwarded_records, ctx=ctx, is_dispatch=False,
-                )
+                summary = ForwardedRecordsParseMiddleware.build_forward_text(forwarded_records, ctx=ctx, is_dispatch=False)
                 if summary:
                     body_text = f"{text}\n{summary}" if text else summary
-            attributed = f"[{sender_display}|{user_id}]\n{body_text}"
             entry: dict = {
                 "role": "user",
-                "content": attributed,
+                "content": f"[{sender_display}|{source.user_id or 'unknown'}]\n{body_text}",
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                 "observed": True,
             }
@@ -1334,14 +1223,9 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
-                msg_id=ctx.msg_id or None,
-                forwarded_records=ctx.forwarded_records,
-                ctx=ctx,
+                msg_id=ctx.msg_id or None, forwarded_records=ctx.forwarded_records, ctx=ctx,
             )
-            logger.info(
-                "[%s] Group message observed (no @bot): chat=%s from=%s",
-                adapter.name, ctx.chat_id, ctx.from_account,
-            )
+            logger.info("[%s] Group message observed (no @bot): chat=%s from=%s", adapter.name, ctx.chat_id, ctx.from_account)
             return  # Stop pipeline — message observed but not dispatched
         await next_fn()
 
@@ -1355,13 +1239,8 @@ class GroupAttributionMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.chat_type == "group" and not ctx.owner_command:
-            adapter = ctx.adapter
-            ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(
-                ctx.msg_body, adapter._bot_id,
-            )
-            user_id_label = ctx.from_account or "unknown"
-            nickname_label = ctx.sender_nickname or ctx.from_account or "unknown"
-            ctx.raw_text = f"[{nickname_label}|{user_id_label}]\n{ctx.raw_text}"
+            ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(ctx.msg_body, ctx.adapter._bot_id)
+            ctx.raw_text = f"[{ctx.sender_nickname or ctx.from_account or 'unknown'}|{ctx.from_account or 'unknown'}]\n{ctx.raw_text}"
             if ctx.source is not None:
                 ctx.source = dataclasses.replace(ctx.source, user_name=None)
         await next_fn()
