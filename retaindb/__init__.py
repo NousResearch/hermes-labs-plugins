@@ -99,12 +99,9 @@ class _Client:
 
     def _headers(self, path: str, json_body: bool = True) -> dict:
         token = self.api_key.replace("Bearer ", "").strip()
-        return {
-            "Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin",
-            **({"Content-Type": "application/json"} if json_body else {}),
-            # memory/context routes also accept the key as X-API-Key
-            **({"X-API-Key": token} if path.startswith(("/v1/memory", "/v1/context")) else {}),
-        }
+        return {"Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin",
+                **({"Content-Type": "application/json"} if json_body else {}),
+                **({"X-API-Key": token} if path.startswith(("/v1/memory", "/v1/context")) else {})}  # memory/context also accept X-API-Key
 
     def _http(self, method: str, path: str, *, json_body: bool = True, timeout: float = 30, **kwargs):
         import requests
@@ -311,11 +308,9 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._client: _Client | None = None
         self._queue: _WriteQueue | None = None
         self._user_id, self._session_id, self._agent_id = "default", "", "hermes"
-        self._lock = threading.Lock()
-        # Prefetch caches + thread tracking (prevents accumulation on rapid calls)
-        self._context_result = self._dialectic_result = ""
-        self._agent_model: dict = {}
-        self._prefetch_threads: list[threading.Thread] = []
+        self._lock = threading.Lock()  # guards the prefetch caches below
+        self._context_result, self._dialectic_result, self._agent_model = "", "", {}
+        self._prefetch_threads: list[threading.Thread] = []  # tracked so rapid turns don't pile up threads
 
     @property
     def name(self) -> str:
@@ -341,8 +336,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             profile_name = os.path.basename(str(kwargs.get("hermes_home", "")))
             project = f"hermes-{profile_name}" if profile_name not in {"", ".hermes"} else "default"
         self._client = _Client(get_secret("RETAINDB_API_KEY", "") or "", base_url, project)
-        self._session_id = session_id
-        self._user_id = kwargs.get("user_id", "default") or "default"
+        self._session_id, self._user_id = session_id, kwargs.get("user_id", "default") or "default"
         self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
         from hermes_constants import get_hermes_home
         home = get_hermes_home()
@@ -357,14 +351,11 @@ class RetainDBMemoryProvider(MemoryProvider):
         return (f"# RetainDB Memory\nActive. Project: {project}.\nUse retaindb_search to find memories, retaindb_remember to store facts, "
                 "retaindb_profile for a user overview, retaindb_context for current-task context.")
 
-    # Background prefetch (fires at turn-end, consumed next turn-start)
-
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Fire context + dialectic + agent model prefetches in background."""
+        """Fire context + dialectic + agent model prefetches in background (turn-end); prefetch() consumes them next turn."""
         if not self._client:
             return
-        # Wait for the previous batch so threads don't accumulate on rapid turns.
-        for t in self._prefetch_threads:
+        for t in self._prefetch_threads:  # wait for the previous batch so threads don't accumulate on rapid turns
             t.join(timeout=2.0)
         if any(t.is_alive() for t in self._prefetch_threads):
             logger.debug("RetainDB prefetch still running; skipping new batch")
@@ -397,15 +388,13 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _reasoning_level(query: str) -> str:
-        n = len(query)
-        return "low" if n < 120 else "medium" if n < 400 else "high"
+        return "low" if len(query) < 120 else "medium" if len(query) < 400 else "high"
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Consume prefetched results and return them as a context block."""
         with self._lock:
             context, dialectic, agent_model = self._context_result, self._dialectic_result, self._agent_model
-            self._context_result = self._dialectic_result = ""
-            self._agent_model = {}
+            self._context_result, self._dialectic_result, self._agent_model = "", "", {}
         model_lines = [fmt(agent_model[k]) for k, fmt in _AGENT_MODEL_FIELDS if agent_model.get(k)] if agent_model.get("memory_count", 0) > 0 else []
         parts = [context, dialectic and f"[RetainDB User Synthesis]\n{dialectic}",
                  model_lines and "[RetainDB Agent Self-Model]\n" + "\n".join(model_lines)]
@@ -416,10 +405,9 @@ class RetainDBMemoryProvider(MemoryProvider):
         if not self._queue or not user_content:
             return
         now = datetime.now(timezone.utc).isoformat()
-        self._queue.enqueue(self._user_id, session_id or self._session_id, [
-            {"role": "user", "content": user_content, "timestamp": now},
-            {"role": "assistant", "content": assistant_content, "timestamp": now},
-        ])
+        self._queue.enqueue(self._user_id, session_id or self._session_id,
+                            [{"role": "user", "content": user_content, "timestamp": now},
+                             {"role": "assistant", "content": assistant_content, "timestamp": now}])
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(_SCHEMAS)
@@ -448,19 +436,17 @@ class RetainDBMemoryProvider(MemoryProvider):
         except ValueError as exc:
             return {"error": str(exc)}
         import mimetypes
-        mime = mimetypes.guess_type(path_obj.name)[0] or "application/octet-stream"
         result = self._client.upload_file(path_obj.read_bytes(), path_obj.name, args.get("remote_path") or f"/{path_obj.name}",
-                                          mime, args.get("scope", "PROJECT"), None)
+                                          mimetypes.guess_type(path_obj.name)[0] or "application/octet-stream", args.get("scope", "PROJECT"), None)
         if args.get("ingest") and result.get("file", {}).get("id"):
             result["ingest"] = self._ingest(result["file"]["id"])
         return result
 
     def _tool_read_file(self, args: dict, file_id: str) -> Any:
         file_info = self._client.get_file(file_id).get("file") or {}
-        mime = (file_info.get("mime_type") or "").lower()
         raw = self._client.read_file_content(file_id)
         out = {"file_id": file_id, "rdb_uri": file_info.get("rdb_uri"), "name": file_info.get("name")}
-        if not (mime.startswith("text/") or file_info.get("name", "").endswith(_TEXT_EXTS)):
+        if not ((file_info.get("mime_type") or "").lower().startswith("text/") or file_info.get("name", "").endswith(_TEXT_EXTS)):
             return {**out, "content": None, "note": "Binary file — use retaindb_ingest_file to extract text into memory."}
         text = raw.decode("utf-8", errors="replace")
         return {**out, "content": text[:32000], "truncated": len(text) > 32000}
