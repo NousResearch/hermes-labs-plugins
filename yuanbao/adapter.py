@@ -2562,15 +2562,10 @@ class OutboundManager:
         self.sender: MessageSender = MessageSender(adapter)
         self.heartbeat: HeartbeatManager = HeartbeatManager(adapter)
         self.slow_notifier: SlowResponseNotifier = SlowResponseNotifier(adapter, self.sender)
-
-    async def start_slow_notifier(self, chat_id: str) -> None:
-        await self.slow_notifier.start(chat_id)
-
-    def cancel_slow_notifier(self, chat_id: str) -> None:
-        self.slow_notifier.cancel(chat_id)
-
-    def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        return self.sender.get_chat_lock(chat_id)
+        # Delegates kept for callers/tests that address the outbound facade.
+        self.start_slow_notifier = self.slow_notifier.start
+        self.cancel_slow_notifier = self.slow_notifier.cancel
+        self.get_chat_lock = self.sender.get_chat_lock
 
     @property
     def _chat_locks(self) -> collections.OrderedDict:
