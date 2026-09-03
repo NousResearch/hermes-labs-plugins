@@ -12,6 +12,7 @@ import json
 import random
 import re
 import unicodedata
+from collections import Counter
 from typing import Optional
 
 # Sticker catalogue – ported from builtin-stickers.json. Every builtin sticker is in
@@ -131,27 +132,14 @@ def _compact_text(raw: str) -> str:
 
 
 def _multiset_char_hit_ratio(needle: str, haystack: str) -> float:
-    if not needle:
-        return 0.0
-    bag: dict[str, int] = {}
-    for ch in haystack:
-        bag[ch] = bag.get(ch, 0) + 1
-    hits = 0
-    for ch in needle:
-        if bag.get(ch, 0) > 0:
-            hits += 1
-            bag[ch] -= 1
-    return hits / len(needle)
+    return sum((Counter(needle) & Counter(haystack)).values()) / len(needle) if needle else 0.0
 
 
 def _bigram_jaccard(a: str, b: str) -> float:
     if len(a) < 2 or len(b) < 2:
         return 0.0
-    A = {a[i:i + 2] for i in range(len(a) - 1)}
-    B = {b[i:i + 2] for i in range(len(b) - 1)}
-    inter = len(A & B)
-    union = len(A) + len(B) - inter
-    return inter / union if union else 0.0
+    A, B = ({x[i:i + 2] for i in range(len(x) - 1)} for x in (a, b))
+    return len(A & B) / len(A | B)
 
 
 def _longest_subsequence_ratio(needle: str, haystack: str) -> float:
@@ -161,8 +149,7 @@ def _longest_subsequence_ratio(needle: str, haystack: str) -> float:
     for ch in haystack:
         if j >= len(needle):
             break
-        if ch == needle[j]:
-            j += 1
+        j += ch == needle[j]
     return j / len(needle)
 
 

@@ -189,14 +189,8 @@ def _sorted_kv(d: dict[str, str]) -> list[tuple[str, str]]:
 
 
 def _cos_sign(
-    method: str,
-    path: str,
-    params: dict[str, str],
-    headers: dict[str, str],
-    secret_id: str,
-    secret_key: str,
-    start_time: Optional[int] = None,
-    expire_seconds: int = 3600,
+    method: str, path: str, params: dict[str, str], headers: dict[str, str], secret_id: str, secret_key: str,
+    start_time: Optional[int] = None, expire_seconds: int = 3600,
 ) -> str:
     """COS Authorization 头（q-sign-algorithm=sha1；https://cloud.tencent.com/document/product/436/7778）。
 
@@ -208,12 +202,8 @@ def _cos_sign(
     sign_key = _hmac_sha1_hex(secret_key, q_sign_time)  # SignKey = HMAC-SHA1(SecretKey, q-sign-time)
     sorted_params = _sorted_kv(params)
     sorted_headers = _sorted_kv(headers)
-    http_string = "\n".join([
-        method.lower(), path,
-        "&".join(f"{k}={v}" for k, v in sorted_params),
-        "&".join(f"{k}={v}" for k, v in sorted_headers),
-        "",
-    ])
+    kv = lambda pairs: "&".join(f"{k}={v}" for k, v in pairs)  # noqa: E731
+    http_string = "\n".join([method.lower(), path, kv(sorted_params), kv(sorted_headers), ""])
     string_to_sign = "\n".join(["sha1", q_sign_time, hashlib.sha1(http_string.encode("utf-8")).hexdigest(), ""])
     return (
         f"q-sign-algorithm=sha1&q-ak={secret_id}&q-sign-time={q_sign_time}&q-key-time={q_sign_time}"
@@ -226,13 +216,8 @@ def _cos_sign(
 # ============ 主要公开 API ============
 
 async def get_cos_credentials(
-    app_key: str,
-    api_domain: str,
-    token: str,
-    filename: str = "file",
-    file_id: Optional[str] = None,
-    bot_id: str = "",
-    route_env: str = "",
+    app_key: str, api_domain: str, token: str, filename: str = "file", file_id: Optional[str] = None,
+    bot_id: str = "", route_env: str = "",
 ) -> dict:
     """调用 genUploadInfo 获取 COS 临时密钥及上传配置。
 
@@ -260,22 +245,16 @@ async def get_cos_credentials(
 
 
 async def upload_to_cos(
-    file_bytes: bytes,
-    filename: str,
-    content_type: str,
-    credentials: dict,
-    bucket: str,
-    region: str,
+    file_bytes: bytes, filename: str, content_type: str, credentials: dict, bucket: str, region: str,
 ) -> dict:
     """用临时凭证（get_cos_credentials() 返回的 dict）HMAC-SHA1 签名，httpx PUT 上传到 COS（走全球加速域名）。
 
     Returns {url, uuid (内容 MD5), size, width?, height? (仅图片)}
     Raises httpx.HTTPStatusError（COS 非 2xx）/ RuntimeError（credentials 字段缺失）
     """
-    secret_id: str = credentials.get("encryptTmpSecretId", "")
-    secret_key: str = credentials.get("encryptTmpSecretKey", "")
-    session_token: str = credentials.get("encryptToken", "")
-    cos_key: str = credentials.get("location", "")
+    secret_id, secret_key, session_token, cos_key = (
+        credentials.get(k, "") for k in ("encryptTmpSecretId", "encryptTmpSecretKey", "encryptToken", "location")
+    )
     start_time: Optional[int] = credentials.get("startTime")
     expired_time: Optional[int] = credentials.get("expiredTime")
     if not secret_id or not secret_key or not cos_key:
@@ -311,13 +290,8 @@ async def upload_to_cos(
 # ============ TIM 媒体消息构建（https://cloud.tencent.com/document/product/269/2720） ============
 
 def build_image_msg_body(
-    url: str,
-    uuid: Optional[str] = None,
-    filename: Optional[str] = None,
-    size: int = 0,
-    width: int = 0,
-    height: int = 0,
-    mime_type: str = "",
+    url: str, uuid: Optional[str] = None, filename: Optional[str] = None, size: int = 0, width: int = 0,
+    height: int = 0, mime_type: str = "",
 ) -> list[dict]:
     """TIMImageElem 消息体（可直接放入 msg_body）。uuid 缺省依次退到 filename / URL basename / "image"。"""
     return [{

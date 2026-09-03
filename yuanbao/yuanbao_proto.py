@@ -235,11 +235,10 @@ def _encode_head(
 
 
 def _decode_head(data: bytes) -> dict:
-    fdict = _parse_dict(data)
+    fd = _parse_dict(data)
     return {
-        "cmd_type": _get_varint(fdict, 1), "cmd": _get_string(fdict, 2), "seq_no": _get_varint(fdict, 3),
-        "msg_id": _get_string(fdict, 4), "module": _get_string(fdict, 5),
-        "need_ack": bool(_get_varint(fdict, 6)), "status": _get_varint(fdict, 10),
+        "cmd_type": _get_varint(fd, 1), "cmd": _get_string(fd, 2), "seq_no": _get_varint(fd, 3), "msg_id": _get_string(fd, 4),
+        "module": _get_string(fd, 5), "need_ack": bool(_get_varint(fd, 6)), "status": _get_varint(fd, 10),
     }
 
 
@@ -322,11 +321,8 @@ def _decode_msg_content(data: bytes) -> dict:
     fdict = _parse_dict(data)
     content = _decode_spec(fdict, _MSG_CONTENT_SPEC)
     imgs = [img for img in (_decode_spec(d, _IMAGE_INFO_SPEC) for d in _parse_repeated(fdict, 8)) if img]
-    if imgs:
-        content["image_info_array"] = imgs
     ext_map = {_get_string(e, 1): _get_string(e, 2) for e in _parse_repeated(fdict, 999) if _get_string(e, 1)}
-    if ext_map:
-        content["ext_map"] = ext_map
+    content.update({k: v for k, v in (("image_info_array", imgs), ("ext_map", ext_map)) if v})
     return content
 
 
@@ -395,21 +391,19 @@ def _decode_forward_msg_content(data: bytes) -> dict:
     return content
 
 
-def _decode_forward_msg(fdict: dict) -> dict:
-    return {
-        "sender": _get_string(fdict, 1), "time": _get_varint(fdict, 2), "plainText": _get_string(fdict, 3),
-        "msgContent": [_decode_forward_msg_content(b) for b in _get_repeated_bytes(fdict, 4)],
-    }
+def _decode_forward_msg(fd: dict) -> dict:
+    return {"sender": _get_string(fd, 1), "time": _get_varint(fd, 2), "plainText": _get_string(fd, 3),
+            "msgContent": [_decode_forward_msg_content(b) for b in _get_repeated_bytes(fd, 4)]}
 
 
 def decode_forward_msg_data(data: bytes) -> Optional[dict]:
     """Parse ForwardMsgData bytes (base64-decoded ext_map value) into the {sub_type, nick_name, msg, ...}
     structure consumed by ForwardedRecordsParseMiddleware.build_forward_text; None on parse failure."""
     try:
-        fdict = _parse_dict(data)
+        fd = _parse_dict(data)
         return {
-            "sub_type": _get_varint(fdict, 1), "begin_time": _get_varint(fdict, 2), "end_time": _get_varint(fdict, 3),
-            "nick_name": _get_string(fdict, 4), "msg": [_decode_forward_msg(d) for d in _parse_repeated(fdict, 5)],
+            "sub_type": _get_varint(fd, 1), "begin_time": _get_varint(fd, 2), "end_time": _get_varint(fd, 3),
+            "nick_name": _get_string(fd, 4), "msg": [_decode_forward_msg(d) for d in _parse_repeated(fd, 5)],
         }
     except Exception:
         return None
@@ -532,15 +526,14 @@ def decode_get_group_member_list_rsp(data: bytes) -> Optional[dict]:
     member dict 过滤空值但保留 role；解析失败返回 None。"""
     try:
         fdict = _parse_dict(data)
-        members = []
-        for m in _parse_repeated(fdict, 3):
-            member = {
-                "user_id": _get_string(m, 1), "nickname": _get_string(m, 2), "role": _get_varint(m, 3),
-                "join_time": _get_varint(m, 4), "name_card": _get_string(m, 5),
-            }
-            members.append({k: v for k, v in member.items() if v or k == "role"})
+        members = [
+            {"user_id": _get_string(m, 1), "nickname": _get_string(m, 2), "role": _get_varint(m, 3),
+             "join_time": _get_varint(m, 4), "name_card": _get_string(m, 5)}
+            for m in _parse_repeated(fdict, 3)
+        ]
         return {
-            "code": _get_varint(fdict, 1), "message": _get_string(fdict, 2), "members": members,
+            "code": _get_varint(fdict, 1), "message": _get_string(fdict, 2),
+            "members": [{k: v for k, v in mem.items() if v or k == "role"} for mem in members],
             "next_offset": _get_varint(fdict, 4), "is_complete": bool(_get_varint(fdict, 5)),
         }
     except Exception:
