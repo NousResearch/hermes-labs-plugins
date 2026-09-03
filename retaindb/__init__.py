@@ -45,10 +45,6 @@ def _load_retaindb_config() -> dict[str, Any]:
         return {}
 
 
-def _config_str(value: Any) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
-
 def _q(s: str) -> str:
     return quote(s, safe="")
 
@@ -226,16 +222,16 @@ class _WriteQueue:
         cur.connection.commit()
         return cur
 
-    def _close(self, conn: sqlite3.Connection) -> None:
-        with self._connections_lock:
-            self._connections.discard(conn)
-        with suppress(Exception):
-            conn.close()
+    def _close(self, *conns: sqlite3.Connection) -> None:
+        for conn in conns:
+            with self._connections_lock:
+                self._connections.discard(conn)
+            with suppress(Exception):
+                conn.close()
 
     def _close_thread_conn(self) -> None:
-        conn = getattr(self._local, "conn", None)
+        conn, self._local.conn = getattr(self._local, "conn", None), None
         if conn is not None:
-            self._local.conn = None
             self._close(conn)
 
     def enqueue(self, user_id: str, session_id: str, messages: list) -> None:
@@ -279,8 +275,7 @@ class _WriteQueue:
             # check_same_thread=False lets shutdown close them deterministically.
             with self._connections_lock:
                 stragglers = list(self._connections)
-            for conn in stragglers:
-                self._close(conn)
+            self._close(*stragglers)
 
 
 def _compact(s: str) -> str:
@@ -351,10 +346,10 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         # Non-secret fields resolve env -> config.yaml (written by the Dashboard) -> default.
-        cfg = _load_retaindb_config()
-        base_url = re.sub(r"/+$", "", os.environ.get("RETAINDB_BASE_URL") or _config_str(cfg.get("base_url")) or _DEFAULT_BASE_URL)
+        cfg = {k: v.strip() for k, v in _load_retaindb_config().items() if isinstance(v, str)}
+        base_url = re.sub(r"/+$", "", os.environ.get("RETAINDB_BASE_URL") or cfg.get("base_url") or _DEFAULT_BASE_URL)
         # Project: RETAINDB_PROJECT > config.yaml > hermes-<profile> > "default" (API auto-creates "default").
-        project = os.environ.get("RETAINDB_PROJECT") or _config_str(cfg.get("project"))
+        project = os.environ.get("RETAINDB_PROJECT") or cfg.get("project")
         if not project:
             profile_name = os.path.basename(str(kwargs.get("hermes_home", "")))
             project = f"hermes-{profile_name}" if profile_name not in {"", ".hermes"} else "default"
@@ -392,10 +387,11 @@ class RetainDBMemoryProvider(MemoryProvider):
         if any(t.is_alive() for t in self._prefetch_threads):
             logger.debug("RetainDB prefetch still running; skipping new batch")
             return
-        jobs = (  # (thread name, log label, cache attr, fetch)
+        jobs = (  # (thread name, log label, cache attr, fetch) — fetch returns None to leave the cache untouched
             ("retaindb-ctx", "context", "_context_result", lambda: self._context_overlay(query)["context"]),
-            ("retaindb-dialectic", "dialectic", "_dialectic_result", lambda: self._fetch_dialectic(query)),
-            ("retaindb-agent-model", "agent model", "_agent_model", self._fetch_agent_model),
+            ("retaindb-dialectic", "dialectic", "_dialectic_result", lambda: str(
+                self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query)).get("answer") or "") or None),
+            ("retaindb-agent-model", "agent model", "_agent_model", lambda: self._agent_model_or_none(self._client.get_agent_model(self._agent_id))),
         )
         self._prefetch_threads = [threading.Thread(target=self._store, args=(label, attr, fetch), name=name, daemon=True)
                                   for name, label, attr, fetch in jobs]
@@ -406,12 +402,8 @@ class RetainDBMemoryProvider(MemoryProvider):
         query_result = self._client.query_context(self._user_id, self._session_id, query)
         return {"context": _build_overlay(self._client.get_profile(self._user_id), query_result), "raw": query_result}
 
-    def _fetch_dialectic(self, query: str) -> str | None:
-        result = self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query))
-        return str(result.get("answer") or "") or None
-
-    def _fetch_agent_model(self) -> dict | None:
-        model = self._client.get_agent_model(self._agent_id)
+    @staticmethod
+    def _agent_model_or_none(model: dict) -> dict | None:
         return model if model.get("memory_count", 0) > 0 else None
 
     def _store(self, label: str, attr: str, fetch: Callable[[], Any]) -> None:
