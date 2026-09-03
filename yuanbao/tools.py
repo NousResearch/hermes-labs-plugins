@@ -3,7 +3,7 @@
 get_group_info / query_group_members / search_sticker / send_sticker / send_dm. Sticker
 flow mirrors chatbot-web's sticker-search/sticker-send: the LLM should search_sticker for
 a sticker_id (or pass the Chinese name), then send_sticker — never bare Unicode emoji.
-The active adapter singleton lives in ``gateway.platforms.yuanbao.get_active_adapter``.
+The active adapter singleton lives in ``gateway.platforms.yuanbao.YuanbaoAdapter.get_active``.
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ def _yb_tool(label: str):
 def _get_active_adapter():
     """Lazy import to avoid ImportError when gateway.platforms.yuanbao is unavailable."""
     with suppress(ImportError):
-        from gateway.platforms.yuanbao import get_active_adapter
-        return get_active_adapter()
+        from gateway.platforms.yuanbao import YuanbaoAdapter
+        return YuanbaoAdapter.get_active()
     return None
 
 
