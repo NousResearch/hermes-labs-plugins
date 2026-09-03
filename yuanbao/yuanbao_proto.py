@@ -1,52 +1,26 @@
 """
-yuanbao_proto.py - Yuanbao WebSocket 协议编解码（纯 Python 实现）
+yuanbao_proto.py - Yuanbao WebSocket 协议编解码（手写 protobuf wire-format，不依赖 google.protobuf）
 
-协议层级：
-  WebSocket frame
-    └── ConnMsg (protobuf: trpc.yuanbao.conn_common.ConnMsg)
-          ├── head: Head  (cmd_type, cmd, seq_no, msg_id, module, ...)
-          └── data: bytes  (业务 payload，标准 protobuf)
-                └── InboundMessagePush / SendC2CMessageReq / SendGroupMessageReq / ...
-                      (trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy.*)
-
-注意：conn 层（ConnMsg）本身是标准 protobuf，不是自定义二进制格式；conn.proto 注释里的
-magic+head_len+body_len 格式仅用于 quic/tcp。WebSocket 每个 frame = 一条 ConnMsg protobuf。
-
-实现方式：手写 varint / protobuf wire-format 编解码，不依赖第三方 protobuf 库。
+每个 WebSocket frame = 一条 ConnMsg protobuf（标准 protobuf，非 conn.proto 注释里的 magic+len 二进制格式，
+那只用于 quic/tcp）：
+  ConnMsg { Head head=1 (cmd_type, cmd, seq_no, msg_id, module, ...); bytes data=2 }
+  data = 业务 payload（InboundMessagePush / SendC2CMessageReq / SendGroupMessageReq / ...，
+         包 trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy.*）
 """
 
 from __future__ import annotations
 
-import logging
 import threading
+import time
 from typing import Optional
-
-logger = logging.getLogger(__name__)
-
-DEBUG_MODE = False
-
-
-def _dbg(label: str, data: bytes) -> None:
-    if DEBUG_MODE:
-        hex_str = " ".join(f"{b:02x}" for b in data[:64])
-        ellipsis = "..." if len(data) > 64 else ""
-        logger.debug("[yuanbao_proto] %s (%dB): %s", label, len(data), hex_str + ellipsis)
-
-
-# ============================================================
-# 常量
-# ============================================================
 
 # conn 层消息类型（ConnMsg.Head.cmd_type）
 PB_MSG_TYPES = {
     n: f"trpc.yuanbao.conn_common.{n}"
     for n in ("ConnMsg", "AuthBindReq", "AuthBindRsp", "PingReq", "PingRsp", "KickoutMsg", "DirectedPush", "PushMsg")
 }
-
 # cmd_type: 上行请求 / 请求回包 / 下行推送 / 推送 ACK
 CMD_TYPE = {"Request": 0, "Response": 1, "Push": 2, "PushAck": 3}
-
-# 内置命令字 / 模块名
 CMD = {"AuthBind": "auth-bind", "Ping": "ping", "Kickout": "kickout", "UpdateMeta": "update-meta"}
 MODULE = {"ConnAccess": "conn_access"}
 
@@ -65,16 +39,9 @@ BIZ_SERVICES = {
     )
 }
 
-# openclaw instance_id（固定值 17）
-HERMES_INSTANCE_ID = 17
-
-# Reply Heartbeat 状态常量
+HERMES_INSTANCE_ID = 17  # openclaw instance_id（固定值）
 WS_HEARTBEAT_RUNNING = 1
 WS_HEARTBEAT_FINISH = 2
-
-# ============================================================
-# 序列号生成
-# ============================================================
 
 _seq_lock = threading.Lock()
 _seq_counter = 0
@@ -91,7 +58,7 @@ def next_seq_no() -> int:
 
 
 # ============================================================
-# Protobuf wire-format 基础工具（手写，不依赖 google.protobuf）
+# Protobuf wire-format 基础工具
 # ============================================================
 
 WT_VARINT = 0
@@ -102,19 +69,17 @@ _FIXED_SIZE = {WT_64BIT: 8, WT_32BIT: 4}
 
 
 def _encode_varint(value: int) -> bytes:
-    """将整数编码为 protobuf varint（负数按 64-bit two's complement）"""
+    """protobuf varint（负数按 64-bit two's complement）"""
     if value < 0:
-        value = value & 0xFFFFFFFFFFFFFFFF
+        value &= 0xFFFFFFFFFFFFFFFF
     out = []
     while True:
         bits = value & 0x7F
         value >>= 7
-        if value:
-            out.append(bits | 0x80)
-        else:
+        if not value:
             out.append(bits)
-            break
-    return bytes(out)
+            return bytes(out)
+        out.append(bits | 0x80)
 
 
 def _decode_varint(data: bytes, pos: int) -> tuple[int, int]:
@@ -134,19 +99,16 @@ def _decode_varint(data: bytes, pos: int) -> tuple[int, int]:
 
 
 def _encode_field(field_number: int, wire_type: int, value: bytes) -> bytes:
-    """编码一个 protobuf field（tag + value）"""
     return _encode_varint((field_number << 3) | wire_type) + value
-
-
-def _encode_string(s: str) -> bytes:
-    """length-prefixed UTF-8 string value"""
-    encoded = s.encode("utf-8")
-    return _encode_varint(len(encoded)) + encoded
 
 
 def _encode_message(b: bytes) -> bytes:
     """length-prefixed bytes / 嵌套 message value"""
     return _encode_varint(len(b)) + b
+
+
+def _encode_string(s: str) -> bytes:
+    return _encode_message(s.encode("utf-8"))
 
 
 # 完整 field 编码快捷方式：string / varint / 嵌套 message
@@ -163,33 +125,29 @@ def _m(fn: int, b: bytes) -> bytes:
 
 
 def _parse_fields(data: bytes) -> list[tuple[int, int, bytes | int]]:
-    """解析 message 的所有字段 → [(field_number, wire_type, raw_value)]；
-    raw_value 为 int（VARINT）或 bytes（LEN / 64BIT / 32BIT）。"""
+    """→ [(field_number, wire_type, raw_value)]；raw_value 为 int（VARINT）或 bytes（LEN / 64BIT / 32BIT）"""
     fields = []
     pos = 0
-    n = len(data)
-    while pos < n:
+    while pos < len(data):
         tag, pos = _decode_varint(data, pos)
-        field_number = tag >> 3
         wire_type = tag & 0x07
         if wire_type == WT_VARINT:
             val, pos = _decode_varint(data, pos)
-        elif wire_type == WT_LEN:
-            length, pos = _decode_varint(data, pos)
+        else:
+            if wire_type == WT_LEN:
+                length, pos = _decode_varint(data, pos)
+            elif wire_type in _FIXED_SIZE:
+                length = _FIXED_SIZE[wire_type]
+            else:
+                raise ValueError(f"unknown wire type {wire_type} at pos {pos - 1}")
             val = data[pos: pos + length]
             pos += length
-        elif wire_type in _FIXED_SIZE:
-            size = _FIXED_SIZE[wire_type]
-            val = data[pos: pos + size]
-            pos += size
-        else:
-            raise ValueError(f"unknown wire type {wire_type} at pos {pos - 1}")
-        fields.append((field_number, wire_type, val))
+        fields.append((tag >> 3, wire_type, val))
     return fields
 
 
 def _fields_to_dict(fields: list) -> dict[int, list]:
-    """fields 列表 → {field_number: [(wire_type, value), ...]}（repeated 字段有多个）"""
+    """→ {field_number: [(wire_type, value), ...]}（repeated 字段有多个）"""
     d: dict[int, list] = {}
     for fn, wt, val in fields:
         d.setdefault(fn, []).append((wt, val))
@@ -201,18 +159,14 @@ def _parse_dict(data: bytes) -> dict[int, list]:
 
 
 def _first(fdict: dict, fn: int, wt: int):
-    """第一个 wire type 匹配的字段值，无则 None"""
+    """第一个字段值（仅当其 wire type 匹配），无则 None"""
     entries = fdict.get(fn)
-    if entries and entries[0][0] == wt:
-        return entries[0][1]
-    return None
+    return entries[0][1] if entries and entries[0][0] == wt else None
 
 
 def _get_string(fdict: dict, fn: int, default: str = "") -> str:
     val = _first(fdict, fn, WT_LEN)
-    if isinstance(val, (bytes, bytearray)):
-        return val.decode("utf-8", errors="replace")
-    return default
+    return val.decode("utf-8", errors="replace") if isinstance(val, (bytes, bytearray)) else default
 
 
 def _get_varint(fdict: dict, fn: int, default: int = 0) -> int:
@@ -227,6 +181,10 @@ def _get_bytes(fdict: dict, fn: int, default: bytes = b"") -> bytes:
 
 def _get_repeated_bytes(fdict: dict, fn: int) -> list[bytes]:
     return [bytes(val) for wt, val in fdict.get(fn, []) if wt == WT_LEN]
+
+
+def _parse_repeated(fdict: dict, fn: int) -> list[dict]:
+    return [_parse_dict(b) for b in _get_repeated_bytes(fdict, fn)]
 
 
 # 字段表驱动编解码：spec = [(field_number, key, kind)]，kind:
@@ -255,10 +213,10 @@ def _decode_spec(fdict: dict, spec: list) -> dict:
 
 # ============================================================
 # ConnMsg 层编解码
-# ============================================================
 #   message Head { uint32 cmd_type=1; string cmd=2; uint32 seq_no=3; string msg_id=4;
 #                  string module=5; bool need_ack=6; ... int32 status=10; }
 #   message ConnMsg { Head head=1; bytes data=2; }
+# ============================================================
 
 
 def _encode_head(
@@ -285,42 +243,34 @@ def _encode_head(
 def _decode_head(data: bytes) -> dict:
     fdict = _parse_dict(data)
     return {
-        "cmd_type": _get_varint(fdict, 1, 0),
-        "cmd": _get_string(fdict, 2, ""),
-        "seq_no": _get_varint(fdict, 3, 0),
-        "msg_id": _get_string(fdict, 4, ""),
-        "module": _get_string(fdict, 5, ""),
-        "need_ack": bool(_get_varint(fdict, 6, 0)),
-        "status": _get_varint(fdict, 10, 0),
+        "cmd_type": _get_varint(fdict, 1), "cmd": _get_string(fdict, 2), "seq_no": _get_varint(fdict, 3),
+        "msg_id": _get_string(fdict, 4), "module": _get_string(fdict, 5),
+        "need_ack": bool(_get_varint(fdict, 6)), "status": _get_varint(fdict, 10),
     }
-
-
-def _conn_msg(label: str, cmd_type: int, cmd: str, seq_no: int, msg_id: str, module: str, data: bytes, need_ack: bool) -> bytes:
-    buf = _m(1, _encode_head(cmd_type, cmd, seq_no, msg_id, module, need_ack))
-    if data:
-        buf += _m(2, data)
-    _dbg(label, buf)
-    return buf
-
-
-def encode_conn_msg(msg_type: int, seq_no: int, data: bytes) -> bytes:
-    """编码 ConnMsg（简化接口：仅 cmd_type + seq_no + payload）"""
-    return _conn_msg("encode_conn_msg", msg_type, "", seq_no, "", "", data, False)
 
 
 def encode_conn_msg_full(
     cmd_type: int, cmd: str, seq_no: int, msg_id: str, module: str, data: bytes, need_ack: bool = False,
 ) -> bytes:
     """编码完整的 ConnMsg（含 cmd/msg_id/module 等 head 字段）"""
-    return _conn_msg("encode_conn_msg_full", cmd_type, cmd, seq_no, msg_id, module, data, need_ack)
+    buf = _m(1, _encode_head(cmd_type, cmd, seq_no, msg_id, module, need_ack))
+    return buf + _m(2, data) if data else buf
+
+
+def encode_conn_msg(msg_type: int, seq_no: int, data: bytes) -> bytes:
+    """编码 ConnMsg（简化接口：仅 cmd_type + seq_no + payload）"""
+    return encode_conn_msg_full(msg_type, "", seq_no, "", "", data)
 
 
 def decode_conn_msg(data: bytes) -> dict:
     """解码 ConnMsg → {msg_type, seq_no, data, head}（head 为完整 Head dict）"""
-    _dbg("decode_conn_msg", data)
     fdict = _parse_dict(data)
     head = _decode_head(_get_bytes(fdict, 1))
     return {"msg_type": head["cmd_type"], "seq_no": head["seq_no"], "data": _get_bytes(fdict, 2), "head": head}
+
+
+def _conn_request(cmd_type: int, cmd: str, msg_id: str, module: str, data: bytes = b"") -> bytes:
+    return encode_conn_msg_full(cmd_type, cmd, next_seq_no(), msg_id, module, data)
 
 
 # ============================================================
@@ -331,9 +281,7 @@ def decode_conn_msg(data: bytes) -> dict:
 
 def encode_biz_msg(service: str, method: str, req_id: str, body: bytes) -> bytes:
     """将已编码的业务 protobuf 包装为可直接发送的 ConnMsg bytes"""
-    return encode_conn_msg_full(
-        cmd_type=CMD_TYPE["Request"], cmd=method, seq_no=next_seq_no(), msg_id=req_id, module=service, data=body,
-    )
+    return _conn_request(CMD_TYPE["Request"], method, req_id, service, body)
 
 
 def decode_biz_msg(data: bytes) -> dict:
@@ -341,19 +289,14 @@ def decode_biz_msg(data: bytes) -> dict:
     result = decode_conn_msg(data)
     head = result["head"]
     return {
-        "service": head["module"],
-        "method": head["cmd"],
-        "req_id": head["msg_id"],
-        "body": result["data"],
-        "is_response": head["cmd_type"] == CMD_TYPE["Response"],
-        "head": head,
+        "service": head["module"], "method": head["cmd"], "req_id": head["msg_id"], "body": result["data"],
+        "is_response": head["cmd_type"] == CMD_TYPE["Response"], "head": head,
     }
 
 
 def _biz_request(method: str, prefix: str, body: bytes, msg_id: str = "") -> bytes:
     """biz 请求 ConnMsg；req_id 为 msg_id，空则 '<prefix>_<seq>'（seq 在 conn seq_no 之前分配）"""
-    req_id = msg_id or f"{prefix}_{next_seq_no()}"
-    return encode_biz_msg(service=_BIZ_PKG, method=method, req_id=req_id, body=body)
+    return encode_biz_msg(_BIZ_PKG, method, msg_id or f"{prefix}_{next_seq_no()}", body)
 
 
 # ============================================================
@@ -388,67 +331,43 @@ def _encode_msg_content(content: dict) -> bytes:
 def _decode_msg_content(data: bytes) -> dict:
     fdict = _parse_dict(data)
     content = _decode_spec(fdict, _MSG_CONTENT_SPEC)
-    imgs = [img for img in (_decode_spec(_parse_dict(b), _IMAGE_INFO_SPEC) for b in _get_repeated_bytes(fdict, 8)) if img]
+    imgs = [img for img in (_decode_spec(d, _IMAGE_INFO_SPEC) for d in _parse_repeated(fdict, 8)) if img]
     if imgs:
         content["image_info_array"] = imgs
-    ext_map: dict[str, str] = {}
-    for entry_bytes in _get_repeated_bytes(fdict, 999):
-        efdict = _parse_dict(entry_bytes)
-        k = _get_string(efdict, 1)
-        if k:
-            ext_map[k] = _get_string(efdict, 2)
+    ext_map = {_get_string(e, 1): _get_string(e, 2) for e in _parse_repeated(fdict, 999) if _get_string(e, 1)}
     if ext_map:
         content["ext_map"] = ext_map
     return content
 
 
 # MsgBodyElement：1 msg_type (string, e.g. "TIMTextElem"), 2 msg_content (MsgContent)
-
-
 def _encode_msg_body_element(element: dict) -> bytes:
     buf = b""
-    msg_type = element.get("msg_type", "")
-    if msg_type:
-        buf += _s(1, msg_type)
-    content = element.get("msg_content", {})
-    if content:
-        buf += _m(2, _encode_msg_content(content))
+    if element.get("msg_type", ""):
+        buf += _s(1, element["msg_type"])
+    if element.get("msg_content", {}):
+        buf += _m(2, _encode_msg_content(element["msg_content"]))
     return buf
 
 
 def _decode_msg_body_element(data: bytes) -> dict:
     fdict = _parse_dict(data)
     content_bytes = _get_bytes(fdict, 2)
-    return {"msg_type": _get_string(fdict, 1, ""), "msg_content": _decode_msg_content(content_bytes) if content_bytes else {}}
-
-
-def _encode_msg_body(fn: int, msg_body: list) -> bytes:
-    return b"".join(_m(fn, _encode_msg_body_element(el)) for el in msg_body)
-
-
-def _encode_log_ext(trace_id: str) -> bytes:
-    """LogInfoExt：1 trace_id"""
-    return _s(1, trace_id) if trace_id else b""
+    return {"msg_type": _get_string(fdict, 1), "msg_content": _decode_msg_content(content_bytes) if content_bytes else {}}
 
 
 # ============================================================
 # 入站消息解析
 # ============================================================
-# InboundMessagePush: 1 callback_command, 2 from_account, 3 to_account, 4 sender_nickname,
-#   5 group_id, 6 group_code, 7 group_name, 8 msg_seq, 9 msg_random, 10 msg_time, 11 msg_key,
-#   12 msg_id, 13 msg_body (repeated MsgBodyElement), 14 cloud_custom_data, 15 event_time,
-#   16 bot_owner_id, 17 recall_msg_seq_list (repeated ImMsgSeq{1 msg_seq, 2 msg_id}),
-#   18 claw_msg_type, 19 private_from_group_code, 20 log_ext (LogInfoExt{1 trace_id})
 
 
 def decode_inbound_push(data: bytes) -> Optional[dict]:
-    """解析 InboundMessagePush biz payload。
+    """解析 InboundMessagePush biz payload（字段号见 dict）。
 
-    Returns: 上述字段的 dict（空值已过滤，msg_body / msg_seq 始终保留；
-    recall_msg_seq_list 为 [{msg_seq, msg_id}] 或 None），解析失败返回 None。
+    空值已过滤，msg_body / msg_seq 始终保留；recall_msg_seq_list 为 [{msg_seq, msg_id}] 或 None；
+    解析失败返回 None。
     """
     try:
-        _dbg("decode_inbound_push input", data)
         fdict = _parse_dict(data)
         log_ext_bytes = _get_bytes(fdict, 20)
         result: dict = {
@@ -469,17 +388,14 @@ def decode_inbound_push(data: bytes) -> Optional[dict]:
             "event_time": _get_varint(fdict, 15),
             "bot_owner_id": _get_string(fdict, 16),
             "recall_msg_seq_list": [
-                {"msg_seq": _get_varint(d, 1), "msg_id": _get_string(d, 2)}
-                for d in map(_parse_dict, _get_repeated_bytes(fdict, 17))
+                {"msg_seq": _get_varint(d, 1), "msg_id": _get_string(d, 2)} for d in _parse_repeated(fdict, 17)
             ] or None,
             "claw_msg_type": _get_varint(fdict, 18),
             "private_from_group_code": _get_string(fdict, 19),
-            "trace_id": _get_string(_parse_dict(log_ext_bytes), 1) if log_ext_bytes else "",
+            "trace_id": _get_string(_parse_dict(log_ext_bytes), 1) if log_ext_bytes else "",  # 20 log_ext{1 trace_id}
         }
         return {k: v for k, v in result.items() if v or k in {"msg_body", "msg_seq"}}
-    except Exception as e:
-        if DEBUG_MODE:
-            logger.debug("[yuanbao_proto] decode_inbound_push failed: %s", e)
+    except Exception:
         return None
 
 
@@ -503,49 +419,52 @@ def _decode_forward_msg_content(data: bytes) -> dict:
     """MsgContent → {type, text?, multimedia?}（shape 与 _format_multimedia 对齐）"""
     fdict = _parse_dict(data)
     content: dict = {"type": _get_varint(fdict, 1)}
-    text = _get_string(fdict, 2)
-    if text:
-        content["text"] = text
-    multimedia = [_decode_spec(_parse_dict(b), _FORWARD_MULTIMEDIA_SPEC) for b in _get_repeated_bytes(fdict, 3)]
-    if multimedia:
-        content["multimedia"] = multimedia
+    if _get_string(fdict, 2):
+        content["text"] = _get_string(fdict, 2)
+    if _get_repeated_bytes(fdict, 3):
+        content["multimedia"] = [_decode_spec(d, _FORWARD_MULTIMEDIA_SPEC) for d in _parse_repeated(fdict, 3)]
     return content
 
 
-def _decode_forward_msg(data: bytes) -> dict:
-    fdict = _parse_dict(data)
+def _decode_forward_msg(fdict: dict) -> dict:
     return {
-        "sender": _get_string(fdict, 1),
-        "time": _get_varint(fdict, 2),
-        "plainText": _get_string(fdict, 3),
+        "sender": _get_string(fdict, 1), "time": _get_varint(fdict, 2), "plainText": _get_string(fdict, 3),
         "msgContent": [_decode_forward_msg_content(b) for b in _get_repeated_bytes(fdict, 4)],
     }
 
 
 def decode_forward_msg_data(data: bytes) -> Optional[dict]:
-    """Parse ForwardMsgData protobuf bytes (the base64-decoded ext_map value).
-
-    Returns the ``sub_type`` / ``nick_name`` / ``msg`` structure consumed by
-    ``ForwardedRecordsParseMiddleware.build_forward_text``; ``None`` on parse failure.
-    """
+    """Parse ForwardMsgData bytes (base64-decoded ext_map value) into the {sub_type, nick_name, msg, ...}
+    structure consumed by ForwardedRecordsParseMiddleware.build_forward_text; None on parse failure."""
     try:
         fdict = _parse_dict(data)
         return {
-            "sub_type": _get_varint(fdict, 1),
-            "begin_time": _get_varint(fdict, 2),
-            "end_time": _get_varint(fdict, 3),
-            "nick_name": _get_string(fdict, 4),
-            "msg": [_decode_forward_msg(b) for b in _get_repeated_bytes(fdict, 5)],
+            "sub_type": _get_varint(fdict, 1), "begin_time": _get_varint(fdict, 2), "end_time": _get_varint(fdict, 3),
+            "nick_name": _get_string(fdict, 4), "msg": [_decode_forward_msg(d) for d in _parse_repeated(fdict, 5)],
         }
-    except Exception as e:
-        if DEBUG_MODE:
-            logger.debug("[yuanbao_proto] decode_forward_msg_data failed: %s", e)
+    except Exception:
         return None
 
 
 # ============================================================
 # Outbound message encoding
 # ============================================================
+# 发送请求字段表 [(field_number, kind, value)]；kind:
+#   "S" string 总是编码  "s" string 非空才编码  "v" varint 非零才编码  "n" varint 非 None 才编码
+#   "b" repeated MsgBodyElement  "t" LogInfoExt{1 trace_id} 非空才编码
+_SEND_ENCODERS = {
+    "S": _s, "s": _s, "v": _v, "n": _v,
+    "b": lambda fn, body: b"".join(_m(fn, _encode_msg_body_element(el)) for el in body),
+    "t": lambda fn, trace_id: _m(fn, _s(1, trace_id)),
+}
+
+
+def _send_request(method: str, prefix: str, msg_id: str, parts: list) -> bytes:
+    buf = b""
+    for fn, kind, val in parts:
+        if kind == "S" or (val is not None if kind == "n" else val):
+            buf += _SEND_ENCODERS[kind](fn, val)
+    return _biz_request(method, prefix, buf, msg_id)
 
 
 def encode_send_c2c_message(
@@ -558,30 +477,15 @@ def encode_send_c2c_message(
     group_code: str = "",
     trace_id: str = "",
 ) -> bytes:
-    """Encode a SendC2CMessageReq and return the full ConnMsg bytes (ready to send over WebSocket).
+    """SendC2CMessageReq → 完整 ConnMsg bytes（可直接发送）。
 
-    SendC2CMessageReq: 1 msg_id, 2 to_account, 3 from_account, 4 msg_random,
-      5 msg_body (repeated MsgBodyElement), 6 group_code, 7 msg_seq, 8 log_ext.
     msg_body items are {"msg_type": str, "msg_content": dict}; msg_id doubles as req_id when set;
     group_code is filled for the "private chat originating from a group" case.
     """
-    biz_bytes = b""
-    if msg_id:
-        biz_bytes += _s(1, msg_id)
-    biz_bytes += _s(2, to_account)
-    if from_account:
-        biz_bytes += _s(3, from_account)
-    if msg_random:
-        biz_bytes += _v(4, msg_random)
-    biz_bytes += _encode_msg_body(5, msg_body)
-    if group_code:
-        biz_bytes += _s(6, group_code)
-    if msg_seq is not None:
-        biz_bytes += _v(7, msg_seq)
-    if trace_id:
-        biz_bytes += _m(8, _encode_log_ext(trace_id))
-    _dbg("encode_send_c2c biz payload", biz_bytes)
-    return _biz_request("send_c2c_message", "c2c", biz_bytes, msg_id)
+    return _send_request("send_c2c_message", "c2c", msg_id, [
+        (1, "s", msg_id), (2, "S", to_account), (3, "s", from_account), (4, "v", msg_random),
+        (5, "b", msg_body), (6, "s", group_code), (7, "n", msg_seq), (8, "t", trace_id),
+    ])
 
 
 def encode_send_group_message(
@@ -595,30 +499,11 @@ def encode_send_group_message(
     ref_msg_id: str = "",
     trace_id: str = "",
 ) -> bytes:
-    """Encode a SendGroupMessageReq and return the full ConnMsg bytes (ready to send over WebSocket).
-
-    SendGroupMessageReq: 1 msg_id, 2 group_code, 3 from_account, 4 to_account (usually empty),
-      5 random (string), 6 msg_body, 7 ref_msg_id (quoted message), 8 msg_seq, 9 log_ext.
-    """
-    biz_bytes = b""
-    if msg_id:
-        biz_bytes += _s(1, msg_id)
-    biz_bytes += _s(2, group_code)
-    if from_account:
-        biz_bytes += _s(3, from_account)
-    if to_account:
-        biz_bytes += _s(4, to_account)
-    if random:
-        biz_bytes += _s(5, random)
-    biz_bytes += _encode_msg_body(6, msg_body)
-    if ref_msg_id:
-        biz_bytes += _s(7, ref_msg_id)
-    if msg_seq is not None:
-        biz_bytes += _v(8, msg_seq)
-    if trace_id:
-        biz_bytes += _m(9, _encode_log_ext(trace_id))
-    _dbg("encode_send_group biz payload", biz_bytes)
-    return _biz_request("send_group_message", "grp", biz_bytes, msg_id)
+    """SendGroupMessageReq → 完整 ConnMsg bytes。to_account usually empty; ref_msg_id = quoted message."""
+    return _send_request("send_group_message", "grp", msg_id, [
+        (1, "s", msg_id), (2, "S", group_code), (3, "s", from_account), (4, "s", to_account), (5, "s", random),
+        (6, "b", msg_body), (7, "s", ref_msg_id), (8, "n", msg_seq), (9, "t", trace_id),
+    ])
 
 
 # ============================================================
@@ -637,13 +522,12 @@ def encode_auth_bind(
     bot_version: str = "",
     route_env: str = "",
 ) -> bytes:
-    """构造 auth-bind 请求 ConnMsg bytes。
+    """auth-bind 请求 ConnMsg bytes。
 
     AuthBindReq: 1 biz_id, 2 auth_info (AuthInfo{1 uid, 2 source, 3 token}),
       3 device_info (DeviceInfo{1 app_version, 2 app_operation_system, 10 instance_id, 24 bot_version}),
       5 env_name
     """
-    auth_buf = _s(1, uid) + _s(2, source) + _s(3, token)
     dev_buf = b""
     if app_version:
         dev_buf += _s(1, app_version)
@@ -652,28 +536,21 @@ def encode_auth_bind(
     dev_buf += _s(10, str(HERMES_INSTANCE_ID))
     if bot_version:
         dev_buf += _s(24, bot_version)
-    req_buf = _s(1, biz_id) + _m(2, auth_buf) + _m(3, dev_buf)
+    req_buf = _s(1, biz_id) + _m(2, _s(1, uid) + _s(2, source) + _s(3, token)) + _m(3, dev_buf)
     if route_env:
         req_buf += _s(5, route_env)
-    return encode_conn_msg_full(
-        cmd_type=CMD_TYPE["Request"], cmd=CMD["AuthBind"], seq_no=next_seq_no(), msg_id=msg_id,
-        module=MODULE["ConnAccess"], data=req_buf,
-    )
+    return _conn_request(CMD_TYPE["Request"], CMD["AuthBind"], msg_id, MODULE["ConnAccess"], req_buf)
 
 
 def encode_ping(msg_id: str) -> bytes:
-    """构造 ping 请求 ConnMsg bytes（PingReq 为空消息）"""
-    return encode_conn_msg_full(
-        cmd_type=CMD_TYPE["Request"], cmd=CMD["Ping"], seq_no=next_seq_no(), msg_id=msg_id,
-        module=MODULE["ConnAccess"], data=b"",
-    )
+    """ping 请求 ConnMsg bytes（PingReq 为空消息）"""
+    return _conn_request(CMD_TYPE["Request"], CMD["Ping"], msg_id, MODULE["ConnAccess"])
 
 
 def encode_push_ack(original_head: dict) -> bytes:
-    """构造 push ACK 回包（回显原 head 的 cmd / msg_id / module）"""
-    return encode_conn_msg_full(
-        cmd_type=CMD_TYPE["PushAck"], cmd=original_head.get("cmd", ""), seq_no=next_seq_no(),
-        msg_id=original_head.get("msg_id", ""), module=original_head.get("module", ""), data=b"",
+    """push ACK 回包（回显原 head 的 cmd / msg_id / module）"""
+    return _conn_request(
+        CMD_TYPE["PushAck"], original_head.get("cmd", ""), original_head.get("msg_id", ""), original_head.get("module", ""),
     )
 
 
@@ -684,8 +561,7 @@ def encode_push_ack(original_head: dict) -> bytes:
 
 def encode_send_private_heartbeat(from_account: str, to_account: str, heartbeat: int = WS_HEARTBEAT_RUNNING) -> bytes:
     """SendPrivateHeartbeatReq{1 from_account, 2 to_account, 3 heartbeat (RUNNING=1, FINISH=2)} → ConnMsg bytes"""
-    buf = _s(1, from_account) + _s(2, to_account) + _v(3, heartbeat)
-    return _biz_request("send_private_heartbeat", "hb_priv", buf)
+    return _biz_request("send_private_heartbeat", "hb_priv", _s(1, from_account) + _s(2, to_account) + _v(3, heartbeat))
 
 
 def encode_send_group_heartbeat(
@@ -693,8 +569,7 @@ def encode_send_group_heartbeat(
 ) -> bytes:
     """SendGroupHeartbeatReq{1 from_account, 2 to_account (群场景留空), 3 group_code,
     4 send_time (ms; 0 → now), 5 heartbeat} → ConnMsg bytes"""
-    import time as _time
-    ts = send_time or int(_time.time() * 1000)
+    ts = send_time or int(time.time() * 1000)
     buf = _s(1, from_account) + _s(2, "") + _s(3, group_code) + _v(4, ts) + _v(5, heartbeat)
     return _biz_request("send_group_heartbeat", "hb_grp", buf)
 
@@ -705,26 +580,22 @@ def encode_query_group_info(group_code: str) -> bytes:
 
 
 def decode_query_group_info_rsp(data: bytes) -> Optional[dict]:
-    """解码 QueryGroupInfoRsp（对齐 TS biz-codec / member.ts queryGroupInfo）。
-
-    QueryGroupInfoRsp{1 code, 2 message, 3 GroupInfo{1 group_name, 2 group_owner_user_id,
-    3 group_owner_nickname, 4 group_size}} → {code, message?, group_name, owner_id,
-    owner_nickname, member_count}，解析失败返回 None。
-    """
+    """QueryGroupInfoRsp{1 code, 2 message, 3 GroupInfo{1 group_name, 2 group_owner_user_id,
+    3 group_owner_nickname, 4 group_size}} → {code, message?, group_name, owner_id, owner_nickname,
+    member_count}（对齐 TS member.ts queryGroupInfo）；解析失败返回 None。"""
     try:
         fdict = _parse_dict(data)
-        result: dict = {"code": _get_varint(fdict, 1, 0)}
-        msg = _get_string(fdict, 2)
-        if msg:
-            result["message"] = msg
+        result: dict = {"code": _get_varint(fdict, 1)}
+        if _get_string(fdict, 2):
+            result["message"] = _get_string(fdict, 2)
         # field 3 taken regardless of wire type; non-bytes payloads fall back to defaults
         gi_entries = fdict.get(3, [])
         gi_bytes = gi_entries[0][1] if gi_entries else b""
         gi = _parse_dict(gi_bytes) if gi_bytes and isinstance(gi_bytes, (bytes, bytearray)) else {}
-        result["group_name"] = _get_string(gi, 1)
-        result["owner_id"] = _get_string(gi, 2)
-        result["owner_nickname"] = _get_string(gi, 3)
-        result["member_count"] = _get_varint(gi, 4, 0)
+        result.update(
+            group_name=_get_string(gi, 1), owner_id=_get_string(gi, 2), owner_nickname=_get_string(gi, 3),
+            member_count=_get_varint(gi, 4),
+        )
         return result
     except Exception:
         return None
@@ -732,36 +603,25 @@ def decode_query_group_info_rsp(data: bytes) -> Optional[dict]:
 
 def encode_get_group_member_list(group_code: str, offset: int = 0, limit: int = 200) -> bytes:
     """GetGroupMemberListReq{1 group_code, 2 offset, 3 limit} → ConnMsg bytes"""
-    buf = _s(1, group_code)
-    if offset:
-        buf += _v(2, offset)
-    buf += _v(3, limit)
-    return _biz_request("get_group_member_list", "gml", buf)
+    return _biz_request("get_group_member_list", "gml", _s(1, group_code) + (_v(2, offset) if offset else b"") + _v(3, limit))
 
 
 def decode_get_group_member_list_rsp(data: bytes) -> Optional[dict]:
-    """解码 GetGroupMemberListRsp{1 code, 2 message, 3 members (repeated MemberInfo), 4 next_offset,
-    5 is_complete}；MemberInfo{1 user_id, 2 nickname, 3 role (0=member,1=admin,2=owner),
-    4 join_time, 5 name_card (群昵称)}。member dict 过滤空值但保留 role；解析失败返回 None。
-    """
+    """GetGroupMemberListRsp{1 code, 2 message, 3 members (repeated MemberInfo), 4 next_offset, 5 is_complete}；
+    MemberInfo{1 user_id, 2 nickname, 3 role (0=member,1=admin,2=owner), 4 join_time, 5 name_card (群昵称)}。
+    member dict 过滤空值但保留 role；解析失败返回 None。"""
     try:
         fdict = _parse_dict(data)
         members = []
-        for mdict in map(_parse_dict, _get_repeated_bytes(fdict, 3)):
+        for m in _parse_repeated(fdict, 3):
             member = {
-                "user_id": _get_string(mdict, 1),
-                "nickname": _get_string(mdict, 2),
-                "role": _get_varint(mdict, 3),
-                "join_time": _get_varint(mdict, 4),
-                "name_card": _get_string(mdict, 5),
+                "user_id": _get_string(m, 1), "nickname": _get_string(m, 2), "role": _get_varint(m, 3),
+                "join_time": _get_varint(m, 4), "name_card": _get_string(m, 5),
             }
             members.append({k: v for k, v in member.items() if v or k == "role"})
         return {
-            "code": _get_varint(fdict, 1, 0),
-            "message": _get_string(fdict, 2),
-            "members": members,
-            "next_offset": _get_varint(fdict, 4),
-            "is_complete": bool(_get_varint(fdict, 5)),
+            "code": _get_varint(fdict, 1), "message": _get_string(fdict, 2), "members": members,
+            "next_offset": _get_varint(fdict, 4), "is_complete": bool(_get_varint(fdict, 5)),
         }
     except Exception:
         return None
