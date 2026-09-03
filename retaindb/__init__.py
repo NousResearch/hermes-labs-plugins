@@ -126,8 +126,7 @@ class _Client:
     def _raw(self, method: str, path: str, **kwargs) -> Any:
         """Non-JSON request (multipart upload / binary download); raises on HTTP error."""
         resp = self._http(method, path, json_body=False, **kwargs)
-        resp.raise_for_status()
-        return resp
+        return resp.raise_for_status() or resp
 
     @staticmethod
     def _with_fallback(primary: Callable[[], dict], fallback: Callable[[], dict]) -> dict:
@@ -195,14 +194,11 @@ class _WriteQueue:
         self._local = threading.local()  # one cached connection per thread, all tracked in _connections
         self._connections: set[sqlite3.Connection] = set()
         self._connections_lock, self._shutdown_lock, self._shutdown = threading.Lock(), threading.Lock(), False
-        conn = self._execute(
-            "CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
-            "session_id TEXT, messages_json TEXT, created_at TEXT, last_error TEXT)"
-        ).connection
+        conn = self._execute("CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
+                             "session_id TEXT, messages_json TEXT, created_at TEXT, last_error TEXT)").connection
         self._thread.start()
-        for row_id, user_id, session_id, msgs_json in conn.execute(  # replay rows left from a previous crash
-            "SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200"
-        ).fetchall():
+        replay = conn.execute("SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200").fetchall()
+        for row_id, user_id, session_id, msgs_json in replay:  # rows left from a previous crash
             self._q.put((row_id, user_id, session_id, json.loads(msgs_json)))
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -293,14 +289,11 @@ def _build_overlay(profile: dict, query_result: dict, local_entries: list[str] |
                 out.append(c)
         return out
 
-    profile_items = _dedupe((profile or {}).get("memories"))
-    query_items = _dedupe((query_result or {}).get("results"))
+    profile_items, query_items = _dedupe((profile or {}).get("memories")), _dedupe((query_result or {}).get("results"))
     if not profile_items and not query_items:
         return ""
-    return "\n".join(
-        ["[RetainDB Context]", "Profile:"] + ([f"- {i}" for i in profile_items] or ["- None"])
-        + ["Relevant memories:"] + ([f"- {i}" for i in query_items] or ["- None"])
-    )
+    return "\n".join(["[RetainDB Context]", "Profile:"] + ([f"- {i}" for i in profile_items] or ["- None"])
+                     + ["Relevant memories:"] + ([f"- {i}" for i in query_items] or ["- None"]))
 
 
 # Agent self-model keys -> prefetch line formatter, in display order.
@@ -361,11 +354,8 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def system_prompt_block(self) -> str:
         project = self._client.project if self._client else "retaindb"
-        return (
-            f"# RetainDB Memory\nActive. Project: {project}.\n"
-            "Use retaindb_search to find memories, retaindb_remember to store facts, "
-            "retaindb_profile for a user overview, retaindb_context for current-task context."
-        )
+        return (f"# RetainDB Memory\nActive. Project: {project}.\nUse retaindb_search to find memories, retaindb_remember to store facts, "
+                "retaindb_profile for a user overview, retaindb_context for current-task context.")
 
     # Background prefetch (fires at turn-end, consumed next turn-start)
 

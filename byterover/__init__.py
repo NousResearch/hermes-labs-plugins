@@ -41,15 +41,13 @@ def _load_plugin_config() -> Dict[str, Any]:
     """Read ``memory.byterover``; fall back to legacy ``memory.provider_config`` (early docs used it)."""
     try:
         from hermes_cli.config import load_config
-
         memory_config = load_config().get("memory", {})
-        if isinstance(memory_config, dict):
-            for key in ("byterover", "provider_config"):
-                block = memory_config.get(key, {})
-                if isinstance(block, dict) and (block or key == "provider_config"):
-                    return dict(block)
     except Exception:
-        pass
+        return {}
+    for key in ("byterover", "provider_config") if isinstance(memory_config, dict) else ():
+        block = memory_config.get(key, {})
+        if isinstance(block, dict) and (block or key == "provider_config"):
+            return dict(block)
     return {}
 
 
@@ -112,16 +110,13 @@ def _schema(name: str, description: str, arg: str = "", arg_desc: str = "") -> d
 
 
 QUERY_SCHEMA = _schema(
-    "brv_query",
-    "Search ByteRover's persistent knowledge tree for relevant context. Returns memories, project knowledge, "
+    "brv_query", "Search ByteRover's persistent knowledge tree for relevant context. Returns memories, project knowledge, "
     "architectural decisions, and patterns from previous sessions. Use for any question where past context would help.",
     "query", "What to search for.")
 CURATE_SCHEMA = _schema(
-    "brv_curate",
-    "Store important information in ByteRover's persistent knowledge tree. Use for architectural decisions, bug fixes, "
+    "brv_curate", "Store important information in ByteRover's persistent knowledge tree. Use for architectural decisions, bug fixes, "
     "user preferences, project patterns — anything worth remembering across sessions. ByteRover's LLM automatically "
-    "categorizes and organizes the memory.",
-    "content", "The information to remember.")
+    "categorizes and organizes the memory.", "content", "The information to remember.")
 STATUS_SCHEMA = _schema("brv_status", "Check ByteRover status — CLI version, context tree stats, cloud sync state.")
 
 
@@ -158,12 +153,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not _resolve_brv_path():
             return ""
-        return (
-            "# ByteRover Memory\n"
-            "Active. Persistent knowledge tree with hierarchical context.\n"
-            "Use brv_query to search past knowledge, brv_curate to store "
-            "important facts, brv_status to check state."
-        )
+        return ("# ByteRover Memory\nActive. Persistent knowledge tree with hierarchical context.\n"
+                "Use brv_query to search past knowledge, brv_curate to store important facts, brv_status to check state.")
 
     def _query(self, query: str) -> dict:
         return _run_brv(["query", "--", query.strip()[:5000]], timeout=_QUERY_TIMEOUT, cwd=self._cwd)
