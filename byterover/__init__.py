@@ -1,14 +1,9 @@
 """ByteRover memory plugin — MemoryProvider interface.
 
-Persistent memory via the ByteRover CLI (``brv``): hierarchical context tree with
-tiered retrieval (fuzzy text → LLM-driven search), local-first with optional cloud sync.
-Original PR #3499 by hieuntg81, adapted to the MemoryProvider ABC.
-
-Requires the ``brv`` CLI (npm install -g byterover-cli, or byterover.dev/install.sh).
-
-Config: BRV_API_KEY env var (cloud features; optional for local), and in config.yaml
-``memory.byterover.auto_extract: false`` to disable automatic brv curate hooks.
-Working directory: $HERMES_HOME/byterover/ (profile-scoped context tree).
+Persistent memory via the ByteRover CLI (``brv``): hierarchical context tree with tiered retrieval
+(fuzzy text → LLM-driven search), local-first with optional cloud sync (BRV_API_KEY). Requires the
+``brv`` CLI (npm install -g byterover-cli, or byterover.dev/install.sh). Working directory is
+$HERMES_HOME/byterover/ (profile-scoped); ``memory.byterover.auto_extract: false`` disables curate hooks.
 """
 
 from __future__ import annotations
@@ -58,10 +53,15 @@ def _load_plugin_config() -> Dict[str, Any]:
     return {}
 
 
-# ── brv binary resolution (cached, thread-safe) ─────────────────────────────
+def _get_brv_cwd() -> Path:
+    """Profile-scoped working directory for the brv context tree."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "byterover"
 
+
+# brv binary resolution (cached, thread-safe): None = unresolved, "" = resolved-missing
 _brv_path_lock = threading.Lock()
-_cached_brv_path: Optional[str] = None  # None = unresolved, "" = resolved-missing
+_cached_brv_path: Optional[str] = None
 
 
 def _resolve_brv_path() -> Optional[str]:
@@ -84,7 +84,6 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT, cwd: str = None) ->
     brv_path = _resolve_brv_path()
     if not brv_path:
         return {"success": False, "error": "brv CLI not found. Install: npm install -g byterover-cli"}
-
     effective_cwd = cwd or str(_get_brv_cwd())
     Path(effective_cwd).mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PATH": str(Path(brv_path).parent) + os.pathsep + os.environ.get("PATH", "")}
@@ -93,10 +92,6 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT, cwd: str = None) ->
             [brv_path] + args, capture_output=True, text=True, encoding='utf-8', errors='replace',
             timeout=timeout, cwd=effective_cwd, env=env, stdin=subprocess.DEVNULL,
         )
-        stdout, stderr = result.stdout.strip(), result.stderr.strip()
-        if result.returncode == 0:
-            return {"success": True, "output": stdout}
-        return {"success": False, "error": stderr or stdout or f"brv exited {result.returncode}"}
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"brv timed out after {timeout}s"}
     except FileNotFoundError:
@@ -105,15 +100,11 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT, cwd: str = None) ->
         return {"success": False, "error": "brv CLI not found"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    stdout, stderr = result.stdout.strip(), result.stderr.strip()
+    if result.returncode == 0:
+        return {"success": True, "output": stdout}
+    return {"success": False, "error": stderr or stdout or f"brv exited {result.returncode}"}
 
-
-def _get_brv_cwd() -> Path:
-    """Profile-scoped working directory for the brv context tree."""
-    from hermes_constants import get_hermes_home
-    return get_hermes_home() / "byterover"
-
-
-# ── Tool schemas ─────────────────────────────────────────────────────────────
 
 def _schema(name: str, description: str, arg: str = "", arg_desc: str = "") -> dict:
     props = {arg: {"type": "string", "description": arg_desc}} if arg else {}
@@ -124,19 +115,15 @@ QUERY_SCHEMA = _schema(
     "brv_query",
     "Search ByteRover's persistent knowledge tree for relevant context. Returns memories, project knowledge, "
     "architectural decisions, and patterns from previous sessions. Use for any question where past context would help.",
-    "query", "What to search for.",
-)
+    "query", "What to search for.")
 CURATE_SCHEMA = _schema(
     "brv_curate",
     "Store important information in ByteRover's persistent knowledge tree. Use for architectural decisions, bug fixes, "
     "user preferences, project patterns — anything worth remembering across sessions. ByteRover's LLM automatically "
     "categorizes and organizes the memory.",
-    "content", "The information to remember.",
-)
+    "content", "The information to remember.")
 STATUS_SCHEMA = _schema("brv_status", "Check ByteRover status — CLI version, context tree stats, cloud sync state.")
 
-
-# ── MemoryProvider implementation ────────────────────────────────────────────
 
 class ByteRoverMemoryProvider(MemoryProvider):
     """ByteRover persistent memory via the brv CLI."""
@@ -144,8 +131,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._auto_extract = _coerce_bool(self._config.get("auto_extract"), True)
-        self._cwd = ""
-        self._session_id = ""
+        self._cwd = self._session_id = ""
         self._turn_count = 0
         self._sync_thread: Optional[threading.Thread] = None
 
@@ -166,9 +152,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._cwd = str(_get_brv_cwd())
-        self._session_id = session_id
-        self._turn_count = 0
+        self._cwd, self._session_id, self._turn_count = str(_get_brv_cwd()), session_id, 0
         Path(self._cwd).mkdir(parents=True, exist_ok=True)
 
     def system_prompt_block(self) -> str:
@@ -222,33 +206,26 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._turn_count += 1
         if not self._auto_extract_enabled("sync_turn") or len(user_content.strip()) < _MIN_QUERY_LEN:
             return
-        # Wait for the previous sync so curates don't pile up.
-        if self._sync_thread and self._sync_thread.is_alive():
+        if self._sync_thread and self._sync_thread.is_alive():  # wait for the previous sync so curates don't pile up
             self._sync_thread.join(timeout=5.0)
         combined = f"User: {user_content[:2000]}\nAssistant: {assistant_content[:2000]}"
         self._sync_thread = self._curate_in_background(combined, name="brv-sync", what="sync")
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to ByteRover."""
-        if not self._auto_extract_enabled("memory mirror") or action not in {"add", "replace"} or not content:
-            return
-        label = "User profile" if target == "user" else "Agent memory"
-        self._curate_in_background(f"[{label}] {content}", name="brv-memwrite", what="memory mirror")
+        if self._auto_extract_enabled("memory mirror") and action in {"add", "replace"} and content:
+            label = "User profile" if target == "user" else "Agent memory"
+            self._curate_in_background(f"[{label}] {content}", name="brv-memwrite", what="memory mirror")
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Extract insights from the last 10 user/assistant messages before compression discards them."""
         if not self._auto_extract_enabled("pre-compression flush") or not messages:
             return ""
-        parts = []
-        for msg in messages[-10:]:
-            role, content = msg.get("role", ""), msg.get("content", "")
-            if isinstance(content, str) and content.strip() and role in {"user", "assistant"}:
-                parts.append(f"{role}: {content[:500]}")
+        parts = [f"{msg.get('role', '')}: {msg.get('content', '')[:500]}" for msg in messages[-10:]
+                 if msg.get("role", "") in {"user", "assistant"} and isinstance(msg.get("content", ""), str) and msg.get("content", "").strip()]
         if parts:
-            self._curate_in_background(
-                "[Pre-compression context]\n" + "\n".join(parts), name="brv-flush", what="pre-compression flush",
-                on_done=f"ByteRover pre-compression flush: {len(parts)} messages",
-            )
+            self._curate_in_background("[Pre-compression context]\n" + "\n".join(parts), name="brv-flush", what="pre-compression flush",
+                                       on_done=f"ByteRover pre-compression flush: {len(parts)} messages")
         return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -256,9 +233,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         handler = self._TOOLS.get(tool_name)
-        if handler is None:
-            return tool_error(f"Unknown tool: {tool_name}")
-        return handler(self, args)
+        return handler(self, args) if handler else tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
