@@ -288,30 +288,25 @@ class InboundContext:
     """Mutable context passed through every inbound middleware in registration order."""
     adapter: Any  # YuanbaoAdapter (forward-ref avoids circular import)
     raw_frames: list = dc_field(default_factory=list)  # debounce-aggregated raw frames
-    # DecodeMiddleware
-    push: Optional[dict] = None
+    push: Optional[dict] = None  # DecodeMiddleware
     decoded_via: str = ""  # "json" | "protobuf"
-    # ExtractFieldsMiddleware
-    from_account: str = ""
+    from_account: str = ""  # ExtractFieldsMiddleware …
     group_code: str = ""
     group_name: str = ""
     sender_nickname: str = ""
     msg_body: list = dc_field(default_factory=list)
     msg_id: str = ""
     cloud_custom_data: str = ""
-    # ChatRoutingMiddleware
-    chat_id: str = ""
+    chat_id: str = ""  # ChatRoutingMiddleware …
     chat_type: str = ""  # "dm" | "group"
     chat_name: str = ""
-    # ExtractContentMiddleware (forwarded_records = parsed ForwardMsgData for elem_type 1009)
-    raw_text: str = ""
+    raw_text: str = ""  # ExtractContentMiddleware …
     media_refs: list = dc_field(default_factory=list)
-    forwarded_records: Optional[dict] = None
+    forwarded_records: Optional[dict] = None  # parsed ForwardMsgData for elem_type 1009
     owner_command: Optional[str] = None  # OwnerCommandMiddleware
     source: Optional[Any] = None  # SessionSource, BuildSourceMiddleware
     msg_type: Optional[Any] = None  # MessageType | YuanbaoMessageType, ClassifyMessageTypeMiddleware
-    # QuoteContextMiddleware
-    reply_to_message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None  # QuoteContextMiddleware …
     reply_to_text: Optional[str] = None
     quote_media_refs: list = dc_field(default_factory=list)  # (rid, kind, filename)
     # MediaResolveMiddleware: deduped local paths — own media, then quoted media, else group-observed media
@@ -555,6 +550,16 @@ class RecallGuardMiddleware(InboundMiddleware):
     def _resolve_sid(cls, store, adapter, group_code: str, from_account: str) -> str:
         return store.get_or_create_session(cls._build_source(adapter, group_code, from_account)).session_id
 
+    @classmethod
+    def _redact(cls, adapter, store, sid: str, transcript: list, entry: dict, ok_msg: str, fail_msg: str, *ok_args) -> None:
+        """Blank *entry* in place and persist *transcript* (warns, never raises)."""
+        entry["content"] = cls._REDACTED
+        try:
+            store.rewrite_transcript(sid, transcript, active_only=True)
+            logger.info(ok_msg, adapter.name, *ok_args)
+        except Exception as exc:
+            logger.warning(fail_msg, adapter.name, exc)
+
     def _handle_recall(self, ctx: InboundContext, cmd: str) -> None:
         adapter = ctx.adapter
         push = ctx.push or {}
@@ -632,12 +637,8 @@ class RecallGuardMiddleware(InboundMiddleware):
                     continue
                 for entry in transcript:
                     if entry.get("role") == "user" and entry.get("content") == recalled_text:
-                        entry["content"] = cls._REDACTED
-                        try:
-                            store.rewrite_transcript(sid, transcript, active_only=True)
-                            logger.info("[%s] Recall redact: session %s", adapter.name, session_key[:30])
-                        except Exception as exc:
-                            logger.warning("[%s] Recall redact failed: %s", adapter.name, exc)
+                        cls._redact(adapter, store, sid, transcript, entry, "[%s] Recall redact: session %s",
+                                    "[%s] Recall redact failed: %s", session_key[:30])
                         return
             logger.debug("[%s] Recall redact: content not found after polling, session %s", adapter.name, session_key[:30])
         adapter._track_task(asyncio.create_task(_redact()))
@@ -668,12 +669,8 @@ class RecallGuardMiddleware(InboundMiddleware):
             target = next((e for e in transcript if e.get("role") == "user" and e.get("content") == recalled_content), None)
             branch_label = "branch A2: content match"
         if target is not None:
-            target["content"] = cls._REDACTED
-            try:
-                store.rewrite_transcript(sid, transcript, active_only=True)
-                logger.info("[%s] Recall: redacted msg_id=%s (%s)", adapter.name, recalled_id, branch_label)
-            except Exception as exc:
-                logger.warning("[%s] Recall: rewrite_transcript failed: %s", adapter.name, exc)
+            cls._redact(adapter, store, sid, transcript, target, "[%s] Recall: redacted msg_id=%s (%s)",
+                        "[%s] Recall: rewrite_transcript failed: %s", recalled_id, branch_label)
             return
         # Branch B: not found in transcript → append system note
         store.append_to_transcript(sid, {
@@ -901,9 +898,11 @@ class ExtractContentMiddleware(InboundMiddleware):
             if elem_type == _TEXT_ELEM_TYPE:
                 if content.get("text", ""):
                     parts.append(content["text"])
-            elif elem_type == "TIMImageElem":
-                rid = cls._parse_resource_id(cls._pick_image_url(content))
-                parts.append(f"[image|ybres:{rid}]" if rid else "[image]")
+            elif elem_type in ("TIMImageElem", "TIMSoundElem", "TIMVideoFileElem"):
+                kind = {"TIMImageElem": "image", "TIMSoundElem": "voice", "TIMVideoFileElem": "video"}[elem_type]
+                url = cls._pick_image_url(content) if kind == "image" else str(content.get("url") or "").strip()
+                rid = cls._parse_resource_id(url)
+                parts.append(f"[{kind}|ybres:{rid}]" if rid else f"[{kind}]")
             elif elem_type == "TIMFileElem":
                 filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
                 rid = cls._parse_resource_id(str(content.get("url") or "").strip())
@@ -911,10 +910,6 @@ class ExtractContentMiddleware(InboundMiddleware):
                     parts.append(f"[file:{filename}|ybres:{rid}]" if filename else f"[file|ybres:{rid}]")
                 else:
                     parts.append(f"[file: {filename}]" if filename else "[file]")
-            elif elem_type in ("TIMSoundElem", "TIMVideoFileElem"):
-                kind = "voice" if elem_type == "TIMSoundElem" else "video"
-                rid = cls._parse_resource_id(str(content.get("url") or "").strip())
-                parts.append(f"[{kind}|ybres:{rid}]" if rid else f"[{kind}]")
             elif elem_type == "TIMCustomElem":
                 parts.append(cls._custom_elem_text(content.get("data", "")))
             elif elem_type == "TIMFaceElem":
@@ -1410,25 +1405,25 @@ class MediaResolveMiddleware(InboundMiddleware):
         resource_id = resource_id.strip()
         if not resource_id:
             raise RuntimeError("missing resource_id")
-        token_data = await adapter._get_cached_token()
-        token = str(token_data.get("token") or "").strip()
-        source = str(token_data.get("source") or "web").strip() or "web"
-        bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
-        if not token or not bot_id:
+        def _auth_headers(token_data: dict, fallback_source: str) -> Optional[dict]:
+            token = str(token_data.get("token") or "").strip()
+            bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
+            if not token or not bot_id:
+                return None
+            source = str(token_data.get("source") or fallback_source).strip() or "web"
+            return {"Content-Type": "application/json", "X-ID": bot_id, "X-Token": token, "X-Source": source}
+        headers = _auth_headers(await adapter._get_cached_token(), "web")
+        if headers is None:
             raise RuntimeError("missing token or bot_id for resource download")
         api_url = f"{adapter._api_domain}/api/resource/v1/download"
-        headers = {"Content-Type": "application/json", "X-ID": bot_id, "X-Token": token, "X-Source": source}
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             for attempt in range(2):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
                     token_data = await SignManager.force_refresh(adapter._app_key, adapter._app_secret, adapter._api_domain)
-                    token = str(token_data.get("token") or "").strip()
-                    source = str(token_data.get("source") or source or "web").strip() or "web"
-                    bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
-                    if not token or not bot_id:
+                    headers = _auth_headers(token_data, headers["X-Source"] or "web")
+                    if headers is None:
                         break
-                    headers.update({"X-ID": bot_id, "X-Token": token, "X-Source": source})
                     continue
                 resp.raise_for_status()
                 payload = resp.json()
@@ -1559,11 +1554,11 @@ class MediaResolveMiddleware(InboundMiddleware):
             if isinstance(result, BaseException):
                 fmt, args = crash_msg(item, result)
                 logger.warning(fmt, *args)
-            if isinstance(result, BaseException) or result is None:
+            if result is None or isinstance(result, BaseException):
                 _failed += 1
-                continue
-            out_paths.append(result[0])
-            out_mimes.append(result[1])
+            else:
+                out_paths.append(result[0])
+                out_mimes.append(result[1])
         logger.info(
             "[%s] media resolve batch: scope=%s concurrency=%d total=%d ok=%d failed=%d elapsed_ms=%d",
             adapter.name, scope, adapter.media_resolve_concurrency, len(active), len(out_paths), _failed, _elapsed_ms,
@@ -2549,18 +2544,14 @@ class MessageSender:
     def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
         """Parse @nickname patterns against the (unexpired) member cache into mixed TIMTextElem +
         TIMCustomElem(elem_type 1002) msg_body; plain text when no members are cached."""
-        members: list = []
         cached = self._adapter._member_cache.get(group_code)
-        if cached:
-            ts, member_list = cached
-            if time.time() - ts < self._adapter.MEMBER_CACHE_TTL_S:
-                members = member_list
-            else:
-                del self._adapter._member_cache[group_code]
-        if not members:
+        if cached and time.time() - cached[0] >= self._adapter.MEMBER_CACHE_TTL_S:
+            del self._adapter._member_cache[group_code]
+            cached = None
+        if not cached or not cached[1]:
             return [_text_elem(text)]
         nickname_to_uid = {}
-        for m in members:
+        for m in cached[1]:
             nick = m.get("nickname") or m.get("nick_name") or ""
             uid = m.get("user_id") or ""
             if nick and uid:
