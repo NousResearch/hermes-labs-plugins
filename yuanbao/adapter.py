@@ -62,8 +62,7 @@ from gateway.platforms.yuanbao_proto import (
     encode_send_private_heartbeat, encode_send_group_heartbeat, encode_query_group_info,
     encode_get_group_member_list, next_seq_no,
 )
-from gateway.session import build_session_key
-from gateway.session_transcript import TranscriptReadError
+from gateway.session import TranscriptReadError, build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +144,20 @@ async def _cancel_task(task: asyncio.Task) -> None:
 
 
 class MarkdownProcessor:
-    """Yuanbao's fence/table-aware chunking policy over the shared chunker in gateway.platforms.helpers."""
+    """Thin delegates to the shared fence-aware chunker in gateway.platforms.helpers; method names
+    kept for existing call sites and tests."""
+    @staticmethod
+    def has_unclosed_fence(text: str) -> bool:
+        return _mdchunk.text_has_unclosed_fence(text)
+
+    @staticmethod
+    def ends_with_table_row(text: str) -> bool:
+        return _mdchunk.text_ends_with_table_row(text)
+
+    @staticmethod
+    def split_at_paragraph_boundary(text: str, max_chars: int, len_fn: Optional[Callable[[str], int]] = None) -> tuple[str, str]:
+        return _mdchunk.split_at_paragraph_boundary(text, max_chars, len_fn=len_fn)
+
     @classmethod
     def chunk_markdown_text(cls, text: str, max_chars: int = 4000, len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
         """<= max_chars chunks at paragraph boundaries, never inside a fence or table (an oversized
@@ -2187,7 +2199,7 @@ class MediaSendHandler(ABC):
                      caption: Optional[str] = None, **kwargs: Any) -> "SendResult":
         if adapter._connection.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
-        adapter._outbound.slow_notifier.cancel(chat_id)
+        adapter._outbound.cancel_slow_notifier(chat_id)
         try:
             file_bytes, filename, content_type = await self.acquire_file(adapter, **kwargs)
             if self.needs_cos_upload():
@@ -2408,7 +2420,7 @@ class MessageSender:
         adapter = self._adapter
         if adapter._connection.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
-        adapter._outbound.slow_notifier.cancel(chat_id)
+        adapter._outbound.cancel_slow_notifier(chat_id)
         async with self.get_chat_lock(chat_id):
             content_to_send = self.strip_cron_wrapper(content)
             chunks = self.truncate_message(content_to_send, adapter.MAX_TEXT_CHUNK)
@@ -2582,11 +2594,21 @@ class MessageSender:
 class OutboundManager:
     """Composes MessageSender, HeartbeatManager and SlowResponseNotifier (sender cancels the notifier
     before a send and emits the FINISH heartbeat after)."""
+    CHAT_DICT_MAX_SIZE: ClassVar[int] = MessageSender.CHAT_DICT_MAX_SIZE
+
     def __init__(self, adapter: "YuanbaoAdapter") -> None:
         self._adapter = adapter
         self.sender: MessageSender = MessageSender(adapter)
         self.heartbeat: HeartbeatManager = HeartbeatManager(adapter)
         self.slow_notifier: SlowResponseNotifier = SlowResponseNotifier(adapter, self.sender)
+        # Delegates kept for callers/tests that address the outbound facade.
+        self.start_slow_notifier = self.slow_notifier.start
+        self.cancel_slow_notifier = self.slow_notifier.cancel
+        self.get_chat_lock = self.sender.get_chat_lock
+
+    @property
+    def _chat_locks(self) -> collections.OrderedDict:
+        return self.sender._chat_locks
 
     async def close(self) -> None:
         await self.sender.close()
@@ -2726,11 +2748,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def _process_message_background(self, event, session_key: str) -> None:
         """Wrap base class processing with a slow-response notifier."""
         chat_id = event.source.chat_id
-        await self._outbound.slow_notifier.start(chat_id)
+        await self._outbound.start_slow_notifier(chat_id)
         try:
             await super()._process_message_background(event, session_key)
         finally:
-            self._outbound.slow_notifier.cancel(chat_id)
+            self._outbound.cancel_slow_notifier(chat_id)
             # Clear RecallGuard tracking only if our msg_id is still current: a concurrent message may have
             # overwritten it (the drain task then owns it); id-less events never wrote one and must not pop.
             msg_id = event.message_id
@@ -2802,3 +2824,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """Current valid sign token (module-level cache)."""
         return await SignManager.get_token(self._app_key, self._app_secret, self._api_domain, route_env=self._route_env)
 
+
+# Module-level delegates kept for external importers (tools/send_message_tool, tools/yuanbao_tools).
+def get_active_adapter() -> Optional["YuanbaoAdapter"]:
+    return YuanbaoAdapter.get_active()
+
+
+async def send_yuanbao_direct(adapter: "YuanbaoAdapter", chat_id: str, message: str,
+                              media_files: Optional[List[Tuple[str, bool]]] = None) -> Dict[str, Any]:
+    return await adapter._outbound.sender.send_direct(chat_id, message, media_files)
