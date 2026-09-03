@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
@@ -36,8 +37,7 @@ def _api_post(path: str, payload: dict) -> dict:
 
 def begin_registration() -> dict:
     """Start a device-flow registration: init → nonce, begin → device_code + verification URL."""
-    init_data = _api_post("/app/registration/init", {"source": REGISTRATION_SOURCE})
-    nonce = str(init_data.get("nonce", "")).strip()
+    nonce = str(_api_post("/app/registration/init", {"source": REGISTRATION_SOURCE}).get("nonce", "")).strip()
     if not nonce:
         raise RegistrationError("init response missing nonce")
     begin_data = _api_post("/app/registration/begin", {"nonce": nonce})
@@ -74,8 +74,8 @@ def wait_for_registration_success(
         nonlocal retry_start
         if retry_start == 0:
             retry_start = time.monotonic()
-
         return time.monotonic() - retry_start < _RETRY_WINDOW
+
     while time.monotonic() < deadline:
         time.sleep(interval)
         try:
@@ -89,33 +89,27 @@ def wait_for_registration_success(
             retry_start = 0
             if on_waiting:
                 on_waiting()
-            continue
-        if status == "SUCCESS":
+        elif status == "SUCCESS":
             cid, csecret = result["client_id"], result["client_secret"]
             if not cid or not csecret:
                 raise RegistrationError("authorization succeeded but credentials are missing")
             return cid, csecret
-        if _within_retry_window():
-            continue
-        raise RegistrationError(f"authorization failed: {result.get('fail_reason') or status}")
+        elif not _within_retry_window():
+            raise RegistrationError(f"authorization failed: {result.get('fail_reason') or status}")
     raise RegistrationError("authorization timed out, please retry")
 
 
 def _ensure_qrcode_installed() -> bool:
     """Try to import qrcode; if missing, auto-install it via pip/uv."""
-    try:
+    with contextlib.suppress(ImportError):
         import qrcode  # noqa: F401
         return True
-    except ImportError:
-        pass
     import subprocess
     from hermes_cli.tools_config import _pip_install
-    try:
+    with contextlib.suppress(subprocess.SubprocessError, ImportError, OSError):
         if _pip_install(["-q", "qrcode"], timeout=120).returncode == 0:
             import qrcode  # noqa: F401,F811
             return True
-    except (subprocess.SubprocessError, ImportError, OSError):
-        pass
     return False
 
 
@@ -169,8 +163,8 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
         dot_count += 1
         if dot_count % 10 == 0:
             sys.stdout.write(".")
-
             sys.stdout.flush()
+
     try:
         client_id, client_secret = wait_for_registration_success(
             device_code=reg["device_code"], interval=reg["interval"], expires_in=reg["expires_in"],
