@@ -8,9 +8,10 @@ The active adapter singleton lives in ``gateway.platforms.yuanbao.get_active_ada
 
 from __future__ import annotations
 
+import functools
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 from tools.registry import registry, tool_result
 
@@ -26,6 +27,36 @@ MENTION_HINT = (
 # Image extensions for media dispatch (mirrors MessageSender.IMAGE_EXTS)
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
 
+
+class _YbError(Exception):
+    """Tool-level failure; ``payload`` is the error envelope returned to the model."""
+
+    def __init__(self, msg: str, **extra):
+        super().__init__(msg)
+        self.payload = {"success": False, "error": msg, **extra}
+
+
+def _err(msg: str) -> dict:
+    return {"success": False, "error": msg}
+
+
+def _yb_tool(label: str):
+    """Handler decorator: ``fn(args)`` result → tool_result; ``_YbError`` → its envelope;
+    any other exception → logged + ``_err(str(exc))``."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def handler(args, **kw):
+            try:
+                return tool_result(await fn(args))
+            except _YbError as exc:
+                return tool_result(exc.payload)
+            except Exception as exc:
+                logger.exception("[yuanbao_tools] %s error", label)
+                return tool_result(_err(str(exc)))
+        return handler
+    return deco
+
+
 def _get_active_adapter():
     """Lazy import to avoid ImportError when gateway.platforms.yuanbao is unavailable."""
     try:
@@ -35,333 +66,194 @@ def _get_active_adapter():
         return None
 
 
-def _err(msg: str) -> dict:
-    return {"success": False, "error": msg}
+def _adapter():
+    adapter = _get_active_adapter()
+    if adapter is None:
+        raise _YbError("Yuanbao adapter is not connected")
+    return adapter
+
+
+def _session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env(name, "")
+    except Exception:
+        return ""
 
 
 def _nick(m: dict) -> str:
     return m.get("nickname", m.get("nick_name", ""))
 
 
-async def _resolve_dm_recipient(adapter, group_code: str, name: str) -> Tuple[str, str, Optional[dict]]:
+async def _members(adapter, group_code: str) -> list:
+    raw = await adapter.get_group_member_list(group_code)
+    if raw is None:
+        raise _YbError("get_group_member_list returned None")
+    return raw.get("members", [])
+
+
+async def _resolve_dm_recipient(adapter, group_code: str, name: str) -> Tuple[str, str]:
     """Resolve ``name`` to (user_id, nickname) via the group member list.
 
-    Returns ``("", "", error_dict)`` on failure; >1 partial match yields candidates
-    for disambiguation instead of guessing.
+    >1 partial match raises with ``candidates`` for disambiguation instead of guessing.
     """
     if not group_code:
-        return "", "", _err("group_code is required when user_id is not provided")
+        raise _YbError("group_code is required when user_id is not provided")
     if not name:
-        return "", "", _err("name is required when user_id is not provided")
-    try:
-        raw = await adapter.get_group_member_list(group_code)
-        if raw is None:
-            return "", "", _err("get_group_member_list returned None")
-        filt = name.strip().lower()
-        matched = [
-            m for m in raw.get("members", [])
-            if filt in (m.get("nickname") or m.get("nick_name") or "").lower()
-        ]
-        if not matched:
-            return "", "", _err(f'No member matching "{name}" found in group {group_code}.')
-        if len(matched) > 1:
-            return "", "", {
-                "success": False,
-                "error": f'Multiple members match "{name}". Please specify which one.',
-                "candidates": [
-                    {"user_id": m.get("user_id", ""), "nickname": _nick(m)} for m in matched
-                ],
-            }
-        m = matched[0]
-        return m.get("user_id", ""), m.get("nickname", m.get("nick_name", name)), None
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] send_dm member lookup error")
-        return "", "", _err(str(exc))
+        raise _YbError("name is required when user_id is not provided")
+    filt = name.strip().lower()
+    matched = [
+        m for m in await _members(adapter, group_code)
+        if filt in (m.get("nickname") or m.get("nick_name") or "").lower()
+    ]
+    if not matched:
+        raise _YbError(f'No member matching "{name}" found in group {group_code}.')
+    if len(matched) > 1:
+        raise _YbError(
+            f'Multiple members match "{name}". Please specify which one.',
+            candidates=[{"user_id": m.get("user_id", ""), "nickname": _nick(m)} for m in matched],
+        )
+    m = matched[0]
+    return m.get("user_id", ""), m.get("nickname", m.get("nick_name", name))
 
 
-async def get_group_info(group_code: str) -> dict:
+@_yb_tool("get_group_info")
+async def get_group_info(args) -> dict:
     """查询群基本信息（群名、群主、成员数）。"""
+    group_code = args.get("group_code", "")
     if not group_code:
         return _err("group_code is required")
-    adapter = _get_active_adapter()
-    if adapter is None:
-        return _err("Yuanbao adapter is not connected")
-    try:
-        gi = await adapter.query_group_info(group_code)
-        if gi is None:
-            return _err("query_group_info returned None")
-        return {
-            "success": True,
-            "group_code": group_code,
-            "group_name": gi.get("group_name", ""),
-            "member_count": gi.get("member_count", 0),
-            "owner": {
-                "user_id": gi.get("owner_id", ""),
-                "nickname": gi.get("owner_nickname", ""),
-            },
-            "note": 'The group is called "派 (Pai)" in the app.',
-        }
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] get_group_info error")
-        return _err(str(exc))
+    gi = await _adapter().query_group_info(group_code)
+    if gi is None:
+        return _err("query_group_info returned None")
+    return {
+        "success": True,
+        "group_code": group_code,
+        "group_name": gi.get("group_name", ""),
+        "member_count": gi.get("member_count", 0),
+        "owner": {"user_id": gi.get("owner_id", ""), "nickname": gi.get("owner_nickname", "")},
+        "note": 'The group is called "派 (Pai)" in the app.',
+    }
 
 
-async def query_group_members(
-    group_code: str,
-    action: str = "list_all",
-    name: str = "",
-    mention: bool = False,
-) -> dict:
+@_yb_tool("query_group_members")
+async def query_group_members(args) -> dict:
     """统一的群成员查询（对齐 TS query_session_members）。
 
     action: find (按昵称模糊搜索; 无 name 时等同 list_all) / list_bots / list_all (默认).
     """
+    group_code, action, name = args.get("group_code", ""), args.get("action", "list_all"), args.get("name", "")
     if not group_code:
         return _err("group_code is required")
-    adapter = _get_active_adapter()
-    if adapter is None:
-        return _err("Yuanbao adapter is not connected")
-    try:
-        raw = await adapter.get_group_member_list(group_code)
-        if raw is None:
-            return _err("get_group_member_list returned None")
+    all_members = [
+        {
+            "user_id": m.get("user_id", ""),
+            "nickname": _nick(m),
+            "role": _USER_TYPE_LABEL.get(m.get("user_type", m.get("role", 0)), "unknown"),
+        }
+        for m in await _members(_adapter(), group_code)
+    ]
+    if not all_members:
+        return _err("No members found in this group.")
 
-        all_members = [
-            {
-                "user_id": m.get("user_id", ""),
-                "nickname": _nick(m),
-                "role": _USER_TYPE_LABEL.get(m.get("user_type", m.get("role", 0)), "unknown"),
-            }
-            for m in raw.get("members", [])
-        ]
-        if not all_members:
-            return _err("No members found in this group.")
+    hint = {"mention_hint": MENTION_HINT} if args.get("mention", False) else {}
 
-        hint = {"mention_hint": MENTION_HINT} if mention else {}
+    def _listing(ok: bool, msg: str, members: list) -> dict:
+        return {"success": ok, "msg": msg, "members": members, **hint}
 
-        def _listing(ok: bool, msg: str, members: list) -> dict:
-            return {"success": ok, "msg": msg, "members": members, **hint}
+    if action == "list_bots":
+        bots = [m for m in all_members if m["role"] in {"yuanbao_ai", "bot"}]
+        if not bots:
+            return _err("No bots found in this group.")
+        return _listing(True, f"Found {len(bots)} bot(s).", bots)
 
-        if action == "list_bots":
-            bots = [m for m in all_members if m["role"] in {"yuanbao_ai", "bot"}]
-            if not bots:
-                return _err("No bots found in this group.")
-            return _listing(True, f"Found {len(bots)} bot(s).", bots)
+    if action == "find" and name:
+        filt = name.strip().lower()
+        matched = [m for m in all_members if filt in m["nickname"].lower()]
+        if matched:
+            return _listing(True, f'Found {len(matched)} member(s) matching "{name}".', matched)
+        return _listing(False, f'No match for "{name}". All members listed below.', all_members)
 
-        if action == "find" and name:
-            filt = name.strip().lower()
-            matched = [m for m in all_members if filt in m["nickname"].lower()]
-            if matched:
-                return _listing(True, f'Found {len(matched)} member(s) matching "{name}".', matched)
-            return _listing(False, f'No match for "{name}". All members listed below.', all_members)
-
-        return _listing(True, f"Found {len(all_members)} member(s).", all_members)
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] query_group_members error")
-        return _err(str(exc))
+    return _listing(True, f"Found {len(all_members)} member(s).", all_members)
 
 
-async def search_sticker(query: str = "", limit: int = 10) -> dict:
+@_yb_tool("search_sticker")
+async def search_sticker(args) -> dict:
     """在内置贴纸表中按关键词模糊搜索，返回 Top-N 候选（空 query 返回前 N 条）。"""
     from gateway.platforms.yuanbao_sticker import search_stickers
 
+    query, limit = args.get("query", ""), args.get("limit", 10)
     try:
         safe_limit = max(1, min(50, int(limit) if limit else 10))
     except (TypeError, ValueError):
         safe_limit = 10
-
-    try:
-        matches = search_stickers(query or "", limit=safe_limit)
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] search_sticker error")
-        return _err(str(exc))
-
+    matches = search_stickers(query or "", limit=safe_limit)
     return {
         "success": True,
         "query": query or "",
         "count": len(matches),
         "results": [
-            {
-                "sticker_id": s.get("sticker_id", ""),
-                "name": s.get("name", ""),
-                "description": s.get("description", ""),
-                "package_id": s.get("package_id", ""),
-            }
+            {k: s.get(k, "") for k in ("sticker_id", "name", "description", "package_id")}
             for s in matches
         ],
     }
 
 
-async def send_sticker(
-    sticker: str = "",
-    chat_id: str = "",
-    reply_to: str = "",
-) -> dict:
+@_yb_tool("send_sticker")
+async def send_sticker(args) -> dict:
     """向 chat_id（缺省取当前会话 HERMES_SESSION_CHAT_ID）发送一张内置贴纸（TIMFaceElem）。
 
     ``sticker``: 名称（如 "六六六"）或 sticker_id（如 "278"）；为空时随机发送。
     ``chat_id``: ``direct:{account_id}`` / ``group:{group_code}`` / 裸 account_id。
     """
-    from gateway.session_context import get_session_env
-    from gateway.platforms.yuanbao_sticker import (
-        get_sticker_by_id,
-        get_sticker_by_name,
-        get_random_sticker,
-    )
+    from gateway.platforms.yuanbao_sticker import get_sticker_by_id, get_sticker_by_name, get_random_sticker
 
-    target = (chat_id or "").strip() or get_session_env("HERMES_SESSION_CHAT_ID", "")
+    target = (args.get("chat_id", "") or "").strip() or _session_env("HERMES_SESSION_CHAT_ID")
     if not target:
         return _err("chat_id is required (no active yuanbao session detected)")
-    adapter = _get_active_adapter()
-    if adapter is None:
-        return _err("Yuanbao adapter is not connected")
+    adapter = _adapter()
 
-    raw = (sticker or "").strip()
-    sticker_obj: Optional[dict] = None
+    raw = (args.get("sticker", "") or "").strip()
     if not raw:
         sticker_obj = get_random_sticker()
     else:
-        if raw.isdigit():
-            sticker_obj = get_sticker_by_id(raw)
+        sticker_obj = get_sticker_by_id(raw) if raw.isdigit() else None
         if sticker_obj is None:
             sticker_obj = get_sticker_by_name(raw)
     if sticker_obj is None:
-        return _err(
-            f"Sticker not found: {raw!r}. "
-            f"Use search_sticker first to discover available stickers."
-        )
+        return _err(f"Sticker not found: {raw!r}. Use search_sticker first to discover available stickers.")
 
-    try:
-        result = await adapter.send_sticker(
-            chat_id=target,
-            sticker_name=sticker_obj.get("name", ""),
-            reply_to=reply_to or None,
-        )
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] send_sticker error")
-        return _err(str(exc))
-
+    result = await adapter.send_sticker(
+        chat_id=target, sticker_name=sticker_obj.get("name", ""), reply_to=args.get("reply_to", "") or None,
+    )
     if getattr(result, "success", False):
         return {
             "success": True,
             "chat_id": target,
-            "sticker": {
-                "sticker_id": sticker_obj.get("sticker_id", ""),
-                "name": sticker_obj.get("name", ""),
-            },
+            "sticker": {"sticker_id": sticker_obj.get("sticker_id", ""), "name": sticker_obj.get("name", "")},
             "message_id": getattr(result, "message_id", None),
             "note": "Sticker delivered to the chat. If you have additional text to say, reply now; otherwise end your turn without generating text.",
         }
     return _err(getattr(result, "error", "send_sticker failed"))
 
 
-async def send_dm(
-    group_code: str,
-    name: str,
-    message: str,
-    user_id: str = "",
-    media_files: Optional[List[Tuple[str, bool]]] = None,
-) -> dict:
+@_yb_tool("send_dm")
+async def send_dm(args) -> dict:
     """Send a DM to a group member, with optional media.
 
-    Without ``user_id`` the member list of ``group_code`` is searched by ``name``
-    (partial, case-insensitive; >1 match returns candidates). Text goes via
-    adapter.send_dm; media_files (path, is_voice) go via send_image_file (images) or
-    send_document. Partial media failures are reported in ``note``, not as failure.
+    group_code: explicit arg, else the session's "group:<code>" chat_id. Without ``user_id``
+    the member list is searched by ``name`` (partial, case-insensitive; >1 match returns
+    candidates). media_files items are {"path", "is_voice"} dicts or (path, is_voice) pairs;
+    ``MEDIA:<path>`` tags embedded in the text are extracted too. Text goes via adapter.send_dm;
+    media via send_image_file (images) or send_document. Partial media failures are reported
+    in ``note``, not as failure.
     """
-    if not message and not media_files:
-        return _err("message or media_files is required")
-    adapter = _get_active_adapter()
-    if adapter is None:
-        return _err("Yuanbao adapter is not connected")
-
-    resolved_user_id = user_id.strip() if user_id else ""
-    resolved_nickname = name.strip()
-
-    if not resolved_user_id:
-        resolved_user_id, resolved_nickname, err = await _resolve_dm_recipient(adapter, group_code, name)
-        if err is not None:
-            return err
-
-    if not resolved_user_id:
-        return _err("Could not resolve user_id")
-
-    chat_id = f"direct:{resolved_user_id}"
-    last_result = None
-    errors: list[str] = []
-    try:
-        if message and message.strip():
-            last_result = await adapter.send_dm(resolved_user_id, message, group_code=group_code)
-            if not last_result.success:
-                errors.append(last_result.error or "text send failed")
-
-        for media_path, _is_voice in media_files or []:
-            send = adapter.send_image_file if Path(media_path).suffix.lower() in _IMAGE_EXTS else adapter.send_document
-            last_result = await send(chat_id, media_path, group_code=group_code)
-            if not last_result.success:
-                errors.append(last_result.error or "media send failed")
-
-        if last_result is None:
-            return _err("No deliverable text or media remained")
-        if errors and not last_result.success:
-            return _err("; ".join(errors))
-
-        result = {
-            "success": True,
-            "user_id": resolved_user_id,
-            "nickname": resolved_nickname,
-            "message_id": last_result.message_id,
-            "note": f'DM sent to "{resolved_nickname}" successfully.',
-        }
-        if errors:
-            result["note"] += f" (partial failure: {'; '.join(errors)})"
-        return result
-    except Exception as exc:
-        logger.exception("[yuanbao_tools] send_dm error")
-        return _err(str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Registry registration
-# ---------------------------------------------------------------------------
-
-def _check_yuanbao():
-    """Toolset availability check — True when running in a yuanbao gateway session."""
-    try:
-        from gateway.session_context import get_session_env
-        if get_session_env("HERMES_SESSION_PLATFORM", "") == "yuanbao":
-            return True
-    except Exception:
-        pass
-    return _get_active_adapter() is not None
-
-
-async def _handle_yb_query_group_info(args, **kw):
-    return tool_result(await get_group_info(group_code=args.get("group_code", "")))
-
-
-async def _handle_yb_query_group_members(args, **kw):
-    return tool_result(await query_group_members(
-        group_code=args.get("group_code", ""),
-        action=args.get("action", "list_all"),
-        name=args.get("name", ""),
-        mention=bool(args.get("mention", False)),
-    ))
-
-
-async def _handle_yb_send_dm(args, **kw):
-    # group_code: explicit arg, else the session's "group:<code>" chat_id.
     group_code = args.get("group_code", "")
     if not group_code:
-        try:
-            from gateway.session_context import get_session_env
-            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-            if chat_id.startswith("group:"):
-                group_code = chat_id.split(":", 1)[1]
-        except Exception:
-            pass
+        chat_id = _session_env("HERMES_SESSION_CHAT_ID")
+        if chat_id.startswith("group:"):
+            group_code = chat_id.split(":", 1)[1]
 
-    # media_files items: {"path", "is_voice"} dicts or (path, is_voice) pairs.
     media_files = []
     for item in args.get("media_files") or []:
         if isinstance(item, dict):
@@ -369,32 +261,56 @@ async def _handle_yb_send_dm(args, **kw):
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             media_files.append((str(item[0]), bool(item[1])))
 
-    # LLMs often embed MEDIA:<path> tags in the text instead of using media_files.
     from gateway.platforms.base import BasePlatformAdapter
     embedded_media, message = BasePlatformAdapter.extract_media(args.get("message", ""))
-    if embedded_media:
-        media_files.extend(embedded_media)
+    media_files.extend(embedded_media or [])
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
-    return tool_result(await send_dm(
-        group_code=group_code,
-        name=args.get("name", ""),
-        message=message,
-        user_id=args.get("user_id", ""),
-        media_files=media_files or None,
-    ))
+    if not message and not media_files:
+        return _err("message or media_files is required")
+    adapter = _adapter()
+
+    name, user_id = args.get("name", ""), args.get("user_id", "")
+    resolved_user_id, resolved_nickname = user_id.strip() if user_id else "", name.strip()
+    if not resolved_user_id:
+        resolved_user_id, resolved_nickname = await _resolve_dm_recipient(adapter, group_code, name)
+    if not resolved_user_id:
+        return _err("Could not resolve user_id")
+
+    chat_id = f"direct:{resolved_user_id}"
+    last_result = None
+    errors: list[str] = []
+    if message and message.strip():
+        last_result = await adapter.send_dm(resolved_user_id, message, group_code=group_code)
+        if not last_result.success:
+            errors.append(last_result.error or "text send failed")
+
+    for media_path, _is_voice in media_files:
+        send = adapter.send_image_file if Path(media_path).suffix.lower() in _IMAGE_EXTS else adapter.send_document
+        last_result = await send(chat_id, media_path, group_code=group_code)
+        if not last_result.success:
+            errors.append(last_result.error or "media send failed")
+
+    if last_result is None:
+        return _err("No deliverable text or media remained")
+    if errors and not last_result.success:
+        return _err("; ".join(errors))
+
+    result = {
+        "success": True,
+        "user_id": resolved_user_id,
+        "nickname": resolved_nickname,
+        "message_id": last_result.message_id,
+        "note": f'DM sent to "{resolved_nickname}" successfully.',
+    }
+    if errors:
+        result["note"] += f" (partial failure: {'; '.join(errors)})"
+    return result
 
 
-async def _handle_yb_search_sticker(args, **kw):
-    return tool_result(await search_sticker(query=args.get("query", ""), limit=args.get("limit", 10)))
-
-
-async def _handle_yb_send_sticker(args, **kw):
-    return tool_result(await send_sticker(
-        sticker=args.get("sticker", ""),
-        chat_id=args.get("chat_id", ""),
-        reply_to=args.get("reply_to", ""),
-    ))
+def _check_yuanbao():
+    """Toolset availability check — True when running in a yuanbao gateway session."""
+    return _session_env("HERMES_SESSION_PLATFORM") == "yuanbao" or _get_active_adapter() is not None
 
 
 # (schema, handler, emoji); the tool name is schema["name"].
@@ -417,7 +333,7 @@ _TOOLS = (
                 "required": ["group_code"],
             },
         },
-        _handle_yb_query_group_info,
+        get_group_info,
         "👥",
     ),
     (
@@ -464,7 +380,7 @@ _TOOLS = (
                 "required": ["group_code", "action"],
             },
         },
-        _handle_yb_query_group_members,
+        query_group_members,
         "📋",
     ),
     (
@@ -532,7 +448,7 @@ _TOOLS = (
                 "required": [],
             },
         },
-        _handle_yb_send_dm,
+        send_dm,
         "✉️",
     ),
     (
@@ -563,7 +479,7 @@ _TOOLS = (
                 "required": [],
             },
         },
-        _handle_yb_search_sticker,
+        search_sticker,
         "🔍",
     ),
     (
@@ -606,7 +522,7 @@ _TOOLS = (
                 "required": [],
             },
         },
-        _handle_yb_send_sticker,
+        send_sticker,
         "🎨",
     ),
 )
