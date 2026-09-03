@@ -150,7 +150,6 @@ class MarkdownProcessor:
 
     @staticmethod
     def split_at_paragraph_boundary(text: str, max_chars: int, len_fn: Optional[Callable[[str], int]] = None) -> tuple[str, str]:
-        """Nearest paragraph boundary within max_chars → (head, tail)."""
         return _mdchunk.split_at_paragraph_boundary(text, max_chars, len_fn=len_fn)
 
     @classmethod
@@ -485,10 +484,9 @@ class DecodeMiddleware(InboundMiddleware):
 class ExtractFieldsMiddleware(InboundMiddleware):
     """Copy common push fields onto ctx."""
     name = "extract-fields"
-    _FIELDS = ("from_account", "group_code", "group_name", "sender_nickname", "msg_id", "cloud_custom_data")
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        for f in self._FIELDS:
+        for f in ("from_account", "group_code", "group_name", "sender_nickname", "msg_id", "cloud_custom_data"):
             setattr(ctx, f, ctx.push.get(f, ""))
         ctx.msg_body = ctx.push.get("msg_body", [])
         await next_fn()
@@ -1592,8 +1590,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                 if u and u not in urls:
                     urls.append(u)
                     types.append(m)
-        # 1) Media carried by the current message itself.
-        own_pairs = await self._resolve_media_urls(adapter, ctx.media_refs)
+        own_pairs = await self._resolve_media_urls(adapter, ctx.media_refs)  # 1) media carried by this message
         own_count = sum(1 for u in own_pairs[0] if u)
         _add_unique_pairs(own_pairs)
         # 2) Quoted media takes priority; else observed-media backfill in groups only (DM media
@@ -1796,7 +1793,6 @@ class ConnectionManager:
         try:
             logger.info("[%s] Fetching sign token from %s", adapter.name, adapter._api_domain)
             token_data = await adapter._get_cached_token()
-            self._apply_bot_id(token_data)
             logger.info("[%s] Connecting to %s", adapter.name, adapter._ws_url)
             if not await self._dial(token_data):
                 return False
@@ -1812,13 +1808,11 @@ class ConnectionManager:
         adapter._release_platform_lock()
         return False
 
-    def _apply_bot_id(self, token_data: dict) -> None:
-        """Adopt bot_id returned by the sign-token API, if any."""
+    async def _dial(self, token_data: dict) -> bool:
+        """Adopt the sign-token bot_id, open the WS (built-in ping/pong disabled) and run AUTH_BIND;
+        cleans up on auth failure."""
         if token_data.get("bot_id"):
             self._adapter._bot_id = str(token_data["bot_id"])
-
-    async def _dial(self, token_data: dict) -> bool:
-        """Open the WS (built-in ping/pong disabled) and run AUTH_BIND; cleans up on auth failure."""
         self._ws = await asyncio.wait_for(
             websockets.connect(  # type: ignore[attr-defined]
                 self._adapter._ws_url, ping_interval=None, ping_timeout=None, close_timeout=5,
@@ -2106,7 +2100,6 @@ class ConnectionManager:
                 token_data = await SignManager.force_refresh(
                     adapter._app_key, adapter._app_secret, adapter._api_domain, route_env=adapter._route_env,
                 )
-                self._apply_bot_id(token_data)
                 if not await self._dial(token_data):
                     logger.warning("[%s] Re-auth failed on attempt %d", adapter.name, attempt + 1)
                     continue
@@ -2377,11 +2370,10 @@ class MessageSender:
         """Per-chat-id lock with LRU eviction (prefers evicting an unlocked entry)."""
         if chat_id in self._chat_locks:
             self._chat_locks.move_to_end(chat_id)
-            return self._chat_locks[chat_id]
-        if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
-            victim = next((k for k in self._chat_locks if not self._chat_locks[k].locked()), next(iter(self._chat_locks)))
-            self._chat_locks.pop(victim)
-        self._chat_locks[chat_id] = asyncio.Lock()
+        else:
+            if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
+                self._chat_locks.pop(next((k for k in self._chat_locks if not self._chat_locks[k].locked()), next(iter(self._chat_locks))))
+            self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
 
     async def send_text(self, chat_id: str, content: str, reply_to: Optional[str] = None, group_code: str = "") -> "SendResult":
@@ -2529,7 +2521,7 @@ class MessageSender:
     @staticmethod
     def validate_media(file_bytes: Optional[bytes], filename: str, max_size_mb: int = 20) -> Optional[str]:
         """Pre-upload check; error description or None."""
-        if file_bytes is None or len(file_bytes) == 0:
+        if not file_bytes:
             return f"Empty file: {filename}"
         if len(file_bytes) > max_size_mb * 1024 * 1024:
             return f"File too large: {filename} ({len(file_bytes) / 1024 / 1024:.1f}MB > {max_size_mb}MB)"
