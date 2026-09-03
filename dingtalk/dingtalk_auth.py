@@ -5,23 +5,16 @@ from __future__ import annotations
 import os
 import sys
 import time
-import logging
 from typing import Optional, Tuple
 
 import requests
 
-logger = logging.getLogger(__name__)
-
-# ── Configuration ──────────────────────────────────────────────────────────
-
-REGISTRATION_BASE_URL = os.environ.get(
-    "DINGTALK_REGISTRATION_BASE_URL", "https://oapi.dingtalk.com"
-).rstrip("/")
-
+REGISTRATION_BASE_URL = os.environ.get("DINGTALK_REGISTRATION_BASE_URL", "https://oapi.dingtalk.com").rstrip("/")
 REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "openClaw")
 
+_POLL_STATUSES = {"WAITING", "SUCCESS", "FAIL", "EXPIRED"}
+_RETRY_WINDOW = 120  # seconds of transient errors / non-success statuses tolerated before giving up
 
-# ── API helpers ────────────────────────────────────────────────────────────
 
 class RegistrationError(Exception):
     """Raised when a DingTalk registration API call fails."""
@@ -39,22 +32,17 @@ def _api_post(path: str, payload: dict) -> dict:
 
     errcode = data.get("errcode", -1)
     if errcode != 0:
-        errmsg = data.get("errmsg", "unknown error")
-        raise RegistrationError(f"API error [{path}]: {errmsg} (errcode={errcode})")
+        raise RegistrationError(f"API error [{path}]: {data.get('errmsg', 'unknown error')} (errcode={errcode})")
     return data
 
 
-# ── Core flow ──────────────────────────────────────────────────────────────
-
 def begin_registration() -> dict:
-    """Start a device-flow registration."""
-    # Step 1: init → nonce
+    """Start a device-flow registration: init → nonce, begin → device_code + verification URL."""
     init_data = _api_post("/app/registration/init", {"source": REGISTRATION_SOURCE})
     nonce = str(init_data.get("nonce", "")).strip()
     if not nonce:
         raise RegistrationError("init response missing nonce")
 
-    # Step 2: begin → device_code, verification_uri_complete
     begin_data = _api_post("/app/registration/begin", {"nonce": nonce})
     device_code = str(begin_data.get("device_code", "")).strip()
     verification_uri_complete = str(begin_data.get("verification_uri_complete", "")).strip()
@@ -75,9 +63,7 @@ def poll_registration(device_code: str) -> dict:
     """Poll the registration status once."""
     data = _api_post("/app/registration/poll", {"device_code": device_code})
     status_raw = str(data.get("status", "")).strip().upper()
-    if status_raw not in {"WAITING", "SUCCESS", "FAIL", "EXPIRED"}:
-        status_raw = "UNKNOWN"
-    result = {"status": status_raw}
+    result = {"status": status_raw if status_raw in _POLL_STATUSES else "UNKNOWN"}
     for key in ("client_id", "client_secret", "fail_reason"):
         result[key] = str(data.get(key, "")).strip() or None
     return result
@@ -89,19 +75,26 @@ def wait_for_registration_success(
     expires_in: int = 7200,
     on_waiting: Optional[callable] = None,
 ) -> Tuple[str, str]:
-    """Block until the registration succeeds or times out."""
+    """Block until the registration succeeds or times out.
+
+    Transient errors and FAIL/EXPIRED/UNKNOWN statuses are retried for ``_RETRY_WINDOW`` seconds
+    before being raised; a WAITING status resets that window.
+    """
     deadline = time.monotonic() + expires_in
-    retry_window = 120  # 2 minutes for transient errors
     retry_start = 0.0
+
+    def _within_retry_window() -> bool:
+        nonlocal retry_start
+        if retry_start == 0:
+            retry_start = time.monotonic()
+        return time.monotonic() - retry_start < _RETRY_WINDOW
 
     while time.monotonic() < deadline:
         time.sleep(interval)
         try:
             result = poll_registration(device_code)
         except RegistrationError:
-            if retry_start == 0:
-                retry_start = time.monotonic()
-            if time.monotonic() - retry_start < retry_window:
+            if _within_retry_window():
                 continue
             raise
 
@@ -112,23 +105,16 @@ def wait_for_registration_success(
                 on_waiting()
             continue
         if status == "SUCCESS":
-            cid = result["client_id"]
-            csecret = result["client_secret"]
+            cid, csecret = result["client_id"], result["client_secret"]
             if not cid or not csecret:
                 raise RegistrationError("authorization succeeded but credentials are missing")
             return cid, csecret
-        # FAIL / EXPIRED / UNKNOWN
-        if retry_start == 0:
-            retry_start = time.monotonic()
-        if time.monotonic() - retry_start < retry_window:
+        if _within_retry_window():
             continue
-        reason = result.get("fail_reason") or status
-        raise RegistrationError(f"authorization failed: {reason}")
+        raise RegistrationError(f"authorization failed: {result.get('fail_reason') or status}")
 
     raise RegistrationError("authorization timed out, please retry")
 
-
-# ── QR code rendering ─────────────────────────────────────────────────────
 
 def _ensure_qrcode_installed() -> bool:
     """Try to import qrcode; if missing, auto-install it via pip/uv."""
@@ -143,8 +129,7 @@ def _ensure_qrcode_installed() -> bool:
     from hermes_cli.tools_config import _pip_install
 
     try:
-        result = _pip_install(["-q", "qrcode"], timeout=120)
-        if result.returncode == 0:
+        if _pip_install(["-q", "qrcode"], timeout=120).returncode == 0:
             import qrcode  # noqa: F401,F811
             return True
     except (subprocess.SubprocessError, ImportError, OSError):
@@ -153,43 +138,31 @@ def _ensure_qrcode_installed() -> bool:
 
 
 def render_qr_to_terminal(url: str) -> bool:
-    """Render *url* as a compact QR code in the terminal."""
+    """Render *url* as a compact QR code (half-block glyphs, 2 rows per character) in the terminal."""
     try:
         import qrcode
     except ImportError:
         return False
 
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=1,
-        border=1,
-    )
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=1)
     qr.add_data(url)
     qr.make(fit=True)
 
-    # Use half-block characters for compact rendering (2 rows per character)
     matrix = qr.get_matrix()
     rows = len(matrix)
-    lines: list[str] = []
-
-    # (top, bottom) -> ▀ ▄ █ or space
-    glyph = {(True, True): "\u2588", (True, False): "\u2580",
-             (False, True): "\u2584", (False, False): " "}
-
+    # (top, bottom) -> █ ▀ ▄ or space
+    glyph = {(True, True): "\u2588", (True, False): "\u2580", (False, True): "\u2584", (False, False): " "}
+    lines = []
     for r in range(0, rows, 2):
         bottom_row = matrix[r + 1] if r + 1 < rows else [False] * len(matrix[r])
-        lines.append("    " + "".join(
-            glyph[(bool(top), bool(bottom))] for top, bottom in zip(matrix[r], bottom_row)))
+        lines.append("    " + "".join(glyph[(bool(top), bool(bottom))] for top, bottom in zip(matrix[r], bottom_row)))
 
     print("\n".join(lines))
     return True
 
 
-# ── High-level entry point for the setup wizard ───────────────────────────
-
 def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
-    """Run the interactive QR-code device-flow authorization."""
+    """Run the interactive QR-code device-flow authorization (setup wizard entry point)."""
     from hermes_cli.setup import print_info, print_success, print_warning, print_error
 
     print()
@@ -205,7 +178,6 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
 
     url = reg["verification_uri_complete"]
 
-    # Ensure qrcode library is available (auto-install if missing)
     if not _ensure_qrcode_installed():
         print_warning("  qrcode library install failed, will show link only.")
 
@@ -232,9 +204,7 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
 
     try:
         client_id, client_secret = wait_for_registration_success(
-            device_code=reg["device_code"],
-            interval=reg["interval"],
-            expires_in=reg["expires_in"],
+            device_code=reg["device_code"], interval=reg["interval"], expires_in=reg["expires_in"],
             on_waiting=_on_waiting,
         )
     except RegistrationError as exc:
