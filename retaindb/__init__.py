@@ -38,11 +38,10 @@ def _load_retaindb_config() -> dict[str, Any]:
     """``memory.retaindb`` block from config.yaml (empty on error): Dashboard-persisted base_url/project; api_key stays in scoped secrets."""
     try:
         from hermes_cli.config import load_config_readonly
-
         block = load_config_readonly().get("memory", {}).get("retaindb", {})
-        return dict(block) if isinstance(block, dict) else {}
     except Exception:
-        return {}
+        block = None
+    return dict(block) if isinstance(block, dict) else {}
 
 
 def _q(s: str) -> str:
@@ -190,11 +189,10 @@ class _WriteQueue:
     """SQLite-backed async write queue. Survives crashes — pending rows replay on startup."""
 
     def __init__(self, client: _Client, db_path: Path):
-        self._client, self._db_path = client, db_path
-        self._q: queue.Queue = queue.Queue()
+        self._client, self._db_path, self._q = client, db_path, queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="retaindb-writer", daemon=True)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()  # one cached connection per thread
+        self._local = threading.local()  # one cached connection per thread, all tracked in _connections
         self._connections: set[sqlite3.Connection] = set()
         self._connections_lock, self._shutdown_lock, self._shutdown = threading.Lock(), threading.Lock(), False
         conn = self._execute(
@@ -208,7 +206,6 @@ class _WriteQueue:
             self._q.put((row_id, user_id, session_id, json.loads(msgs_json)))
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Cached connection for the current thread (tracked so shutdown can close stragglers)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._local.conn = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
@@ -231,8 +228,7 @@ class _WriteQueue:
 
     def _close_thread_conn(self) -> None:
         conn, self._local.conn = getattr(self._local, "conn", None), None
-        if conn is not None:
-            self._close(conn)
+        self._close(*([conn] if conn is not None else []))
 
     def enqueue(self, user_id: str, session_id: str, messages: list) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -270,9 +266,7 @@ class _WriteQueue:
             self._q.put(_ASYNC_SHUTDOWN)
         self._close_thread_conn()  # caller thread owns the connection opened in __init__
         self._thread.join(timeout=10)
-        if not self._thread.is_alive():
-            # Executor workers that already exited may have left tracked handles;
-            # check_same_thread=False lets shutdown close them deterministically.
+        if not self._thread.is_alive():  # exited executor workers may have left tracked handles (check_same_thread=False)
             with self._connections_lock:
                 stragglers = list(self._connections)
             self._close(*stragglers)
@@ -357,12 +351,10 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._user_id = kwargs.get("user_id", "default") or "default"
         self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
-
         from hermes_constants import get_hermes_home
         home = get_hermes_home()
         self._queue = _WriteQueue(self._client, home / "retaindb_queue.db")
-        soul_path = home / "SOUL.md"
-        soul = soul_path.read_text(encoding="utf-8", errors="replace").strip() if soul_path.exists() else ""
+        soul = (home / "SOUL.md").read_text(encoding="utf-8", errors="replace").strip() if (home / "SOUL.md").exists() else ""
         if soul:  # seed agent identity from SOUL.md in background
             seed = lambda: self._client.seed_agent_identity(self._agent_id, soul, source="soul_md")  # noqa: E731
             threading.Thread(target=_quiet, args=("soul seed", seed), name="retaindb-soul-seed", daemon=True).start()
@@ -424,14 +416,10 @@ class RetainDBMemoryProvider(MemoryProvider):
             context, dialectic, agent_model = self._context_result, self._dialectic_result, self._agent_model
             self._context_result = self._dialectic_result = ""
             self._agent_model = {}
-        parts = [context] if context else []
-        if dialectic:
-            parts.append(f"[RetainDB User Synthesis]\n{dialectic}")
-        if agent_model.get("memory_count", 0) > 0:
-            model_lines = [fmt(agent_model[k]) for k, fmt in _AGENT_MODEL_FIELDS if agent_model.get(k)]
-            if model_lines:
-                parts.append("[RetainDB Agent Self-Model]\n" + "\n".join(model_lines))
-        return "\n\n".join(parts)
+        model_lines = [fmt(agent_model[k]) for k, fmt in _AGENT_MODEL_FIELDS if agent_model.get(k)] if agent_model.get("memory_count", 0) > 0 else []
+        parts = [context, dialectic and f"[RetainDB User Synthesis]\n{dialectic}",
+                 model_lines and "[RetainDB Agent Self-Model]\n" + "\n".join(model_lines)]
+        return "\n\n".join(p for p in parts if p)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Queue turn for async ingest. Returns immediately."""
@@ -455,14 +443,11 @@ class RetainDBMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def _dispatch(self, tool_name: str, args: dict) -> Any:
-        entry = _TOOLS.get(tool_name)
-        if entry is None:
+        required, handler = _TOOLS.get(tool_name, (None, None))
+        if handler is None:
             return {"error": f"Unknown tool: {tool_name}"}
-        required, handler = entry
         value = args.get(required, "") if required else None
-        if required and not value:
-            return {"error": f"{required} is required"}
-        return handler(self, args, value)
+        return {"error": f"{required} is required"} if required and not value else handler(self, args, value)
 
     def _tool_upload_file(self, args: dict, local_path: str) -> Any:
         path_obj = Path(local_path)
@@ -503,8 +488,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         for t in self._prefetch_threads:
             t.join(timeout=3.0)
-        self._prefetch_threads = []
-        queue_obj, self._queue, self._client = self._queue, None, None
+        queue_obj, self._prefetch_threads, self._queue, self._client = self._queue, [], None, None
         if queue_obj:
             queue_obj.shutdown()
 
