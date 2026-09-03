@@ -1,11 +1,9 @@
 """
 Yuanbao sticker (TIMFaceElem) support. Ported from yuanbao-openclaw-plugin/src/sticker/.
 
-TIMFaceElem wire format:
-    {"msg_type": "TIMFaceElem",
-     "msg_content": {"index": 0,          # always 0 per Yuanbao convention
-                     "data": "<json>"}}   # serialised sticker metadata so the receiver
-                                          # can look up the asset in the emoji pack
+TIMFaceElem wire format: {"msg_type": "TIMFaceElem", "msg_content": {"index": 0, "data": "<json>"}}
+index is always 0 per Yuanbao convention; data is serialised sticker metadata so the receiver
+can look up the asset in the emoji pack.
 """
 
 from __future__ import annotations
@@ -90,11 +88,7 @@ STICKER_MAP: dict[str, dict] = {
 
 
 def get_sticker_by_name(name: str) -> Optional[dict]:
-    """按名称查找贴纸，支持模糊匹配。
-
-    匹配优先级：完全相等 → name 与查询词互为子串 → description 包含查询词 →
-    search_stickers 模糊评分最高的一条。找不到返回 None。
-    """
+    """完全相等 → name 与查询词互为子串 → description 包含查询词 → search_stickers 最高分；找不到返回 None。"""
     if not name:
         return None
     query = name.strip()
@@ -104,7 +98,7 @@ def get_sticker_by_name(name: str) -> Optional[dict]:
         if query in key or key in query:
             return sticker
     for sticker in STICKER_MAP.values():
-        if query in sticker.get("description", ""):
+        if query in sticker["description"]:
             return sticker
     matches = search_stickers(query, limit=1)
     return matches[0] if matches else None
@@ -112,27 +106,18 @@ def get_sticker_by_name(name: str) -> Optional[dict]:
 
 def get_random_sticker(category: str = None) -> dict:
     """随机贴纸；指定 category 时优先在 description/name 含该词的贴纸中选取。"""
-    if category:
-        candidates = [
-            s for s in STICKER_MAP.values()
-            if category in s.get("description", "") or category in s.get("name", "")
-        ]
-        if candidates:
-            return random.choice(candidates)
-    return random.choice(list(STICKER_MAP.values()))
+    candidates = [s for s in STICKER_MAP.values() if category in s["description"] or category in s["name"]] if category else []
+    return random.choice(candidates or list(STICKER_MAP.values()))
 
 
 def get_sticker_by_id(sticker_id: str) -> Optional[dict]:
-    """按 sticker_id 精确查找贴纸。"""
     if not sticker_id:
         return None
     sid = str(sticker_id).strip()
-    return next((s for s in STICKER_MAP.values() if s.get("sticker_id") == sid), None)
+    return next((s for s in STICKER_MAP.values() if s["sticker_id"] == sid), None)
 
 
-# ---------------------------------------------------------------------------
 # 模糊搜索（对齐 chatbot-web yuanbao-openclaw-plugin/sticker-cache.ts.searchStickers）
-# ---------------------------------------------------------------------------
 
 _PUNCT_RE = re.compile(r"[\s\u3000\-_·.,，。!！?？\"“”'‘’、/\\]+")
 
@@ -153,10 +138,9 @@ def _multiset_char_hit_ratio(needle: str, haystack: str) -> float:
         bag[ch] = bag.get(ch, 0) + 1
     hits = 0
     for ch in needle:
-        n = bag.get(ch, 0)
-        if n > 0:
+        if bag.get(ch, 0) > 0:
             hits += 1
-            bag[ch] = n - 1
+            bag[ch] -= 1
     return hits / len(needle)
 
 
@@ -189,21 +173,16 @@ def _score_field(haystack: str, query: str) -> float:
         return 0.0
     hay_c = _compact_text(haystack)
     q_c = _compact_text(query)
-    best = 0.0
-    if hay == q:
-        best = max(best, 100.0)
-    if q in hay:
-        best = max(best, 92 + min(6, len(q)))
-    if len(q) >= 2 and hay.startswith(q):
-        best = max(best, 88.0)
-    if q_c and q_c in hay_c:
-        best = max(best, 86.0)
-    best = max(best, _multiset_char_hit_ratio(q_c, hay_c) * 62)
-    best = max(best, _bigram_jaccard(q_c, hay_c) * 58)
-    best = max(best, _longest_subsequence_ratio(q_c, hay_c) * 52)
-    if len(q) == 1 and q in hay:
-        best = max(best, 68.0)
-    return best
+    return max(
+        100.0 if hay == q else 0.0,
+        92 + min(6, len(q)) if q in hay else 0.0,
+        88.0 if len(q) >= 2 and hay.startswith(q) else 0.0,
+        86.0 if q_c and q_c in hay_c else 0.0,
+        _multiset_char_hit_ratio(q_c, hay_c) * 62,
+        _bigram_jaccard(q_c, hay_c) * 58,
+        _longest_subsequence_ratio(q_c, hay_c) * 52,
+        68.0 if len(q) == 1 and q in hay else 0.0,
+    )
 
 
 def search_stickers(query: str, limit: int = 10) -> list[dict]:
@@ -216,35 +195,23 @@ def search_stickers(query: str, limit: int = 10) -> list[dict]:
     q_norm = _normalize_text(query)
     if not query or not q_norm:
         return list(STICKER_MAP.values())[:safe_limit]
-
     scored: list[tuple[float, dict]] = []
     for sticker in STICKER_MAP.values():
-        name_s = _score_field(sticker.get("name", ""), query)
-        desc_s = _score_field(sticker.get("description", ""), query) * 0.88
-        sid_norm = _normalize_text(str(sticker.get("sticker_id", "")).strip())
+        sid_norm = _normalize_text(sticker["sticker_id"].strip())
         id_s = 100.0 if sid_norm == q_norm else 84.0 if sid_norm and q_norm in sid_norm else 0.0
-        scored.append((max(name_s, desc_s, id_s), sticker))
-
+        scored.append((max(_score_field(sticker["name"], query), _score_field(sticker["description"], query) * 0.88, id_s), sticker))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[0][0] if scored else 0
     if top <= 0:
         return [s for _, s in scored[:safe_limit]]
-    if top >= 22:
-        floor = 18.0
-    elif top >= 12:
-        floor = max(10.0, top * 0.5)
-    else:
-        floor = max(6.0, top * 0.35)
+    floor = 18.0 if top >= 22 else max(10.0, top * 0.5) if top >= 12 else max(6.0, top * 0.35)
     filtered = [pair for pair in scored if pair[0] >= floor]
     return [s for _, s in (filtered or scored)[:safe_limit]]
 
 
 def build_face_msg_body(face_index: int, face_type: int = 1, data: Optional[str] = None) -> list:
-    """构造 TIMFaceElem 消息体。
-
-    Yuanbao 约定 index 固定 0（服务端通过 data 字段识别表情）；face_index > 0 视为旧版 QQ 表情 ID。
-    face_type 为兼容旧接口保留，不影响 wire format。data 为 None 时仅传 index。
-    """
+    """TIMFaceElem 消息体。Yuanbao 约定 index 固定 0（服务端通过 data 字段识别表情）；face_index > 0 视为旧版 QQ
+    表情 ID。face_type 为兼容旧接口保留，不影响 wire format。data 为 None 时仅传 index。"""
     msg_content: dict = {"index": face_index}
     if data is not None:
         msg_content["data"] = data
@@ -255,14 +222,10 @@ def build_sticker_msg_body(sticker: dict) -> list:
     """从 STICKER_MAP 的 sticker dict 构造 TIMFaceElem 消息体（data 字段与原始 JS 插件一致）。"""
     data_payload = json.dumps(
         {
-            "sticker_id": sticker["sticker_id"],
-            "package_id": sticker["package_id"],
-            "width": sticker.get("width", 128),
-            "height": sticker.get("height", 128),
-            "formats": sticker.get("formats", "png"),
-            "name": sticker["name"],
+            "sticker_id": sticker["sticker_id"], "package_id": sticker["package_id"],
+            "width": sticker.get("width", 128), "height": sticker.get("height", 128),
+            "formats": sticker.get("formats", "png"), "name": sticker["name"],
         },
-        ensure_ascii=False,
-        separators=(",", ":"),
+        ensure_ascii=False, separators=(",", ":"),
     )
     return build_face_msg_body(face_index=0, data=data_payload)
