@@ -342,19 +342,13 @@ class InboundPipeline:
 
     def use(self, name_or_mw, handler=None, when=None) -> "InboundPipeline":
         """Append ``pipeline.use(SomeMiddleware())`` or ``pipeline.use("name", fn)``."""
-        name, h = self._normalize(name_or_mw, handler)
-        self._middlewares.append((name, h, when))
-        return self
+        return self._insert_relative(None, 0, name_or_mw, handler, when)
 
-    def _insert_relative(self, target: str, offset: int, name_or_mw, handler, when) -> "InboundPipeline":
-        """Insert at index(target)+offset; appends when *target* is not registered."""
+    def _insert_relative(self, target: Optional[str], offset: int, name_or_mw, handler, when) -> "InboundPipeline":
+        """Insert at index(target)+offset; appends when *target* is None or not registered."""
         name, h = self._normalize(name_or_mw, handler)
         idx = next((i for i, (n, _, _) in enumerate(self._middlewares) if n == target), None)
-        entry = (name, h, when)
-        if idx is None:
-            self._middlewares.append(entry)
-        else:
-            self._middlewares.insert(idx + offset, entry)
+        self._middlewares.insert(len(self._middlewares) if idx is None else idx + offset, (name, h, when))
         return self
 
     def use_before(self, target: str, name_or_mw, handler=None, when=None) -> "InboundPipeline":
@@ -836,15 +830,12 @@ class ExtractContentMiddleware(InboundMiddleware):
     @staticmethod
     def _format_shared_link(custom: dict) -> str:
         """elem_type 1010 (share card) → bracket-placeholder text."""
-        title = custom.get("title", "")
-        link = custom.get("link", "")
+        title, link = custom.get("title", ""), custom.get("link", "")
         lines = [f"[share_card: {title} | {link}]" if link else f"[share_card: {title}]"]
         max_len = ExtractContentMiddleware._CARD_CONTENT_MAX_LENGTH
-        for field in ("card_content", "wechat_des"):
-            val = custom.get(field)
-            if val and isinstance(val, str):
-                lines.append(f"Preview: {val[:max_len] + '...(truncated)' if len(val) > max_len else val}")
-                break
+        preview = next((v for v in (custom.get("card_content"), custom.get("wechat_des")) if v and isinstance(v, str)), None)
+        if preview:
+            lines.append(f"Preview: {preview[:max_len] + '...(truncated)' if len(preview) > max_len else preview}")
         if link:
             lines.append("[visit link for full content]")
         return "\n".join(lines)
@@ -865,10 +856,8 @@ class ExtractContentMiddleware(InboundMiddleware):
     @staticmethod
     def _parse_resource_id(url: str) -> str:
         """resourceId from a Yuanbao resource URL's query string, or ""."""
-        if not url:
-            return ""
         try:
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query) if url else {}
             ids = query.get("resourceId") or query.get("resourceid") or []
             return str(ids[0]).strip() if ids else ""
         except Exception:
@@ -935,13 +924,11 @@ class ExtractContentMiddleware(InboundMiddleware):
         ctype = custom.get("elem_type")
         if ctype == 1002:
             return custom.get("text", "[mention]")
-        if ctype == 1010:
-            return cls._format_shared_link(custom)
-        if ctype == 1007:
-            return cls._format_link_understanding(custom) or cls._UNSUPPORTED
         if ctype == 1009:
             return custom.get("text", "[chat record]")
-        return cls._UNSUPPORTED
+        if ctype == 1010:
+            return cls._format_shared_link(custom)
+        return (cls._format_link_understanding(custom) if ctype == 1007 else None) or cls._UNSUPPORTED
 
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
@@ -1092,11 +1079,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
     @classmethod
     def _extract_bot_mention_text(cls, msg_body: list, bot_id: Optional[str]) -> str:
         """Display text used to @-mention this bot (e.g. ``@yuanbao-bot``), or ""."""
-        for custom in cls._iter_bot_mentions(msg_body, bot_id):
-            mention_text = str(custom.get("text") or "").strip()
-            if mention_text:
-                return mention_text
-        return ""
+        return next((t for t in (str(c.get("text") or "").strip() for c in cls._iter_bot_mentions(msg_body, bot_id)) if t), "")
 
     @staticmethod
     def _build_group_channel_prompt(msg_body: list, bot_id: Optional[str]) -> str:
@@ -2460,10 +2443,8 @@ class MessageSender:
             if not last_result.success:
                 return {"error": f"Yuanbao send failed: {last_result.error}"}
         for media_path, _is_voice in media_files or []:
-            if Path(media_path).suffix.lower() in self.IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path)
-            else:
-                last_result = await adapter.send_document(chat_id, media_path)
+            send = adapter.send_image_file if Path(media_path).suffix.lower() in self.IMAGE_EXTS else adapter.send_document
+            last_result = await send(chat_id, media_path)
             if not last_result.success:
                 return {"error": f"Yuanbao media send failed: {last_result.error}"}
         if last_result is None:
@@ -2544,17 +2525,15 @@ class MessageSender:
 
     async def send_c2c_msg_body(self, to_account: str, msg_body: list, group_code: str = "") -> dict:
         req_id = f"c2c_{next_seq_no()}"
-        encoded = encode_send_c2c_message(
+        return await self._dispatch_encoded(self._adapter, encode_send_c2c_message(
             to_account=to_account, msg_body=msg_body, from_account=self._adapter._bot_id or "", msg_id=req_id, group_code=group_code,
-        )
-        return await self._dispatch_encoded(self._adapter, encoded, req_id)
+        ), req_id)
 
     async def send_group_msg_body(self, group_code: str, msg_body: list, reply_to: Optional[str] = None) -> dict:
         req_id = f"grp_{next_seq_no()}"
-        encoded = encode_send_group_message(
+        return await self._dispatch_encoded(self._adapter, encode_send_group_message(
             group_code=group_code, msg_body=msg_body, from_account=self._adapter._bot_id or "", msg_id=req_id, ref_msg_id=reply_to or "",
-        )
-        return await self._dispatch_encoded(self._adapter, encoded, req_id)
+        ), req_id)
 
     @staticmethod
     async def _dispatch_encoded(adapter: "YuanbaoAdapter", encoded: bytes, req_id: str) -> dict:
@@ -2682,10 +2661,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             policy = (_extra.get(f"{kind}_policy") or _yb_secret(f"YUANBAO_{kind.upper()}_POLICY") or "pairing").strip().lower()
             raw = _extra.get(f"{kind}_allow_from") or _yb_secret(f"YUANBAO_{kind.upper()}_ALLOW_FROM", "")
             return policy, [x.strip() for x in raw.split(",") if x.strip()]
-        dm_policy, dm_allow_from = _policy("dm")
-        group_policy, group_allow_from = _policy("group")
-        self._access_policy = AccessPolicy(dm_policy=dm_policy, dm_allow_from=dm_allow_from,
-                                           group_policy=group_policy, group_allow_from=group_allow_from)
+        self._access_policy = AccessPolicy(*_policy("dm"), *_policy("group"))
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
         # Auto-sethome stays open when no home is set or the home is a group (upgradable by first DM).
         _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (config.home_channel.chat_id if config.home_channel else "")
@@ -2771,9 +2747,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             await super()._process_message_background(event, session_key)
         finally:
             self._outbound.cancel_slow_notifier(chat_id)
-            # Clear RecallGuard tracking only if our msg_id is still current: a concurrent message
-            # may have overwritten it (the drain task then owns it), and id-less events never
-            # wrote one, so they must never pop another message's entry.
+            # Clear RecallGuard tracking only if our msg_id is still current: a concurrent message may have
+            # overwritten it (the drain task then owns it); id-less events never wrote one and must not pop.
             msg_id = event.message_id
             if msg_id and self._processing_msg_ids.get(session_key) == msg_id:
                 self._processing_msg_ids.pop(session_key, None)
