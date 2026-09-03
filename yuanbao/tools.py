@@ -142,7 +142,8 @@ async def query_group_members(args) -> dict:
 
     action: find (按昵称模糊搜索; 无 name 时等同 list_all) / list_bots / list_all (默认).
     """
-    group_code, action, name = args.get("group_code", ""), args.get("action", "list_all"), args.get("name", "")
+    group_code, name = args.get("group_code", ""), args.get("name", "")
+    action = args.get("action", "list_all")
     if not group_code:
         return _err("group_code is required")
     all_members = [
