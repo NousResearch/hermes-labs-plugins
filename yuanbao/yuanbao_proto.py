@@ -1,11 +1,8 @@
-"""
-yuanbao_proto.py - Yuanbao WebSocket 协议编解码（手写 protobuf wire-format，不依赖 google.protobuf）
+"""yuanbao_proto.py - Yuanbao WebSocket 协议编解码（手写 protobuf wire-format，不依赖 google.protobuf）
 
-每个 WebSocket frame = 一条 ConnMsg protobuf（标准 protobuf，非 conn.proto 注释里的 magic+len 二进制格式，
-那只用于 quic/tcp）：
+每个 WebSocket frame = 一条 ConnMsg protobuf（标准 protobuf；conn.proto 注释里的 magic+len 二进制格式只用于 quic/tcp）：
   ConnMsg { Head head=1 (cmd_type, cmd, seq_no, msg_id, module, ...); bytes data=2 }
-  data = 业务 payload（InboundMessagePush / SendC2CMessageReq / SendGroupMessageReq / ...，
-         包 trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy.*）
+  data = 业务 payload（InboundMessagePush / SendC2CMessageReq / ...，包 trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy.*）
 """
 
 from __future__ import annotations
@@ -28,14 +25,9 @@ MODULE = {"ConnAccess": "conn_access"}
 _BIZ_PKG = "yuanbao_openclaw_proxy"
 BIZ_SERVICES = {
     n: f"{_BIZ_PKG}.{n}"
-    for n in (
-        "InboundMessagePush",
-        "SendC2CMessageReq", "SendC2CMessageRsp",
-        "SendGroupMessageReq", "SendGroupMessageRsp",
-        "QueryGroupInfoReq", "QueryGroupInfoRsp",
-        "GetGroupMemberListReq", "GetGroupMemberListRsp",
-        "SendPrivateHeartbeatReq", "SendPrivateHeartbeatRsp",
-        "SendGroupHeartbeatReq", "SendGroupHeartbeatRsp",
+    for n in ("InboundMessagePush",) + tuple(
+        f"{m}{k}" for m in ("SendC2CMessage", "SendGroupMessage", "QueryGroupInfo", "GetGroupMemberList",
+                            "SendPrivateHeartbeat", "SendGroupHeartbeat") for k in ("Req", "Rsp")
     )
 }
 
@@ -57,9 +49,7 @@ def next_seq_no() -> int:
     return val
 
 
-# ============================================================
-# Protobuf wire-format 基础工具
-# ============================================================
+# ---- Protobuf wire-format 基础工具
 
 WT_VARINT = 0
 WT_64BIT = 1
@@ -187,6 +177,24 @@ def _parse_repeated(fdict: dict, fn: int) -> list[dict]:
     return [_parse_dict(b) for b in _get_repeated_bytes(fdict, fn)]
 
 
+# 字段表编码：parts = [(field_number, kind, value)]；kind:
+#   "S" string 总是编码  "s" string 非空才编码  "v" varint 非零才编码  "n" varint 非 None 才编码  "m" 嵌套 bytes 非空才编码
+#   "b" repeated MsgBodyElement  "t" LogInfoExt{1 trace_id} 非空才编码
+_PART_ENCODERS = {
+    "S": _s, "s": _s, "v": _v, "n": _v, "m": _m,
+    "b": lambda fn, body: b"".join(_m(fn, _encode_msg_body_element(el)) for el in body),
+    "t": lambda fn, trace_id: _m(fn, _s(1, trace_id)),
+}
+
+
+def _encode_parts(parts: list) -> bytes:
+    buf = b""
+    for fn, kind, val in parts:
+        if kind == "S" or (val is not None if kind == "n" else val):
+            buf += _PART_ENCODERS[kind](fn, val)
+    return buf
+
+
 # 字段表驱动编解码：spec = [(field_number, key, kind)]，kind:
 #   "s" string（编码时 str(v)）  "r" string（原值）  "i" varint（编码时 int(v)）
 # 编码跳过 falsy 值；解码只保留 truthy 值。spec 顺序即 wire 顺序和 dict 插入顺序。
@@ -211,33 +219,19 @@ def _decode_spec(fdict: dict, spec: list) -> dict:
     return out
 
 
-# ============================================================
-# ConnMsg 层编解码
+# ---- ConnMsg 层编解码
 #   message Head { uint32 cmd_type=1; string cmd=2; uint32 seq_no=3; string msg_id=4;
 #                  string module=5; bool need_ack=6; ... int32 status=10; }
 #   message ConnMsg { Head head=1; bytes data=2; }
-# ============================================================
 
 
 def _encode_head(
     cmd_type: int, cmd: str, seq_no: int, msg_id: str, module: str, need_ack: bool = False, status: int = 0,
 ) -> bytes:
-    buf = b""
-    if cmd_type != 0:
-        buf += _v(1, cmd_type)
-    if cmd:
-        buf += _s(2, cmd)
-    if seq_no != 0:
-        buf += _v(3, seq_no)
-    if msg_id:
-        buf += _s(4, msg_id)
-    if module:
-        buf += _s(5, module)
-    if need_ack:
-        buf += _v(6, 1)
-    if status != 0:
-        buf += _v(10, status & 0xFFFFFFFFFFFFFFFF)
-    return buf
+    return _encode_parts([
+        (1, "v", cmd_type), (2, "s", cmd), (3, "v", seq_no), (4, "s", msg_id), (5, "s", module),
+        (6, "v", 1 if need_ack else 0), (10, "v", status & 0xFFFFFFFFFFFFFFFF),
+    ])
 
 
 def _decode_head(data: bytes) -> dict:
@@ -273,10 +267,8 @@ def _conn_request(cmd_type: int, cmd: str, msg_id: str, module: str, data: bytes
     return encode_conn_msg_full(cmd_type, cmd, next_seq_no(), msg_id, module, data)
 
 
-# ============================================================
-# BizMsg 层：业务 body 包装成 ConnMsg（head.cmd = method, head.module = service）
+# ---- BizMsg 层：业务 body 包装成 ConnMsg（head.cmd = method, head.module = service）
 # 与 conn-codec.ts buildBusinessConnMsg(cmd, module, bizData, msgId) 行为一致。
-# ============================================================
 
 
 def encode_biz_msg(service: str, method: str, req_id: str, body: bytes) -> bytes:
@@ -299,9 +291,7 @@ def _biz_request(method: str, prefix: str, body: bytes, msg_id: str = "") -> byt
     return encode_biz_msg(_BIZ_PKG, method, msg_id or f"{prefix}_{next_seq_no()}", body)
 
 
-# ============================================================
-# 业务 protobuf 消息编解码（biz payload）
-# ============================================================
+# ---- 业务 protobuf 消息编解码（biz payload）
 
 # MsgContent：1 text, 2 uuid, 3 image_format, 4 data, 5 desc, 6 ext, 7 sound,
 #   8 image_info_array (repeated), 9 index, 10 url, 11 file_size, 12 file_name,
@@ -342,12 +332,8 @@ def _decode_msg_content(data: bytes) -> dict:
 
 # MsgBodyElement：1 msg_type (string, e.g. "TIMTextElem"), 2 msg_content (MsgContent)
 def _encode_msg_body_element(element: dict) -> bytes:
-    buf = b""
-    if element.get("msg_type", ""):
-        buf += _s(1, element["msg_type"])
-    if element.get("msg_content", {}):
-        buf += _m(2, _encode_msg_content(element["msg_content"]))
-    return buf
+    content = element.get("msg_content", {})
+    return _encode_parts([(1, "s", element.get("msg_type", "")), (2, "m", _encode_msg_content(content) if content else b"")])
 
 
 def _decode_msg_body_element(data: bytes) -> dict:
@@ -356,52 +342,35 @@ def _decode_msg_body_element(data: bytes) -> dict:
     return {"msg_type": _get_string(fdict, 1), "msg_content": _decode_msg_content(content_bytes) if content_bytes else {}}
 
 
-# ============================================================
-# 入站消息解析
-# ============================================================
+# ---- 入站消息解析
+
+
+# InboundMessagePush 字段表 [(field_number, key, getter)]；getter 为 _get_string / _get_varint 或自定义 (fdict, fn) -> value
+_INBOUND_PUSH_SPEC = [
+    (1, "callback_command", _get_string), (2, "from_account", _get_string), (3, "to_account", _get_string),
+    (4, "sender_nickname", _get_string), (5, "group_id", _get_string), (6, "group_code", _get_string),
+    (7, "group_name", _get_string), (8, "msg_seq", _get_varint), (9, "msg_random", _get_varint),
+    (10, "msg_time", _get_varint), (11, "msg_key", _get_string), (12, "msg_id", _get_string),
+    (13, "msg_body", lambda fd, fn: [_decode_msg_body_element(b) for b in _get_repeated_bytes(fd, fn)]),
+    (14, "cloud_custom_data", _get_string), (15, "event_time", _get_varint), (16, "bot_owner_id", _get_string),
+    (17, "recall_msg_seq_list", lambda fd, fn: [  # repeated ImMsgSeq{1 msg_seq, 2 msg_id}
+        {"msg_seq": _get_varint(d, 1), "msg_id": _get_string(d, 2)} for d in _parse_repeated(fd, fn)] or None),
+    (18, "claw_msg_type", _get_varint), (19, "private_from_group_code", _get_string),
+    (20, "trace_id", lambda fd, fn: _get_string(_parse_dict(_get_bytes(fd, fn)), 1) if _get_bytes(fd, fn) else ""),  # LogInfoExt
+]
 
 
 def decode_inbound_push(data: bytes) -> Optional[dict]:
-    """解析 InboundMessagePush biz payload（字段号见 dict）。
-
-    空值已过滤，msg_body / msg_seq 始终保留；recall_msg_seq_list 为 [{msg_seq, msg_id}] 或 None；
-    解析失败返回 None。
-    """
+    """解析 InboundMessagePush biz payload；空值已过滤（msg_body / msg_seq 始终保留），解析失败返回 None。"""
     try:
         fdict = _parse_dict(data)
-        log_ext_bytes = _get_bytes(fdict, 20)
-        result: dict = {
-            "callback_command": _get_string(fdict, 1),
-            "from_account": _get_string(fdict, 2),
-            "to_account": _get_string(fdict, 3),
-            "sender_nickname": _get_string(fdict, 4),
-            "group_id": _get_string(fdict, 5),
-            "group_code": _get_string(fdict, 6),
-            "group_name": _get_string(fdict, 7),
-            "msg_seq": _get_varint(fdict, 8),
-            "msg_random": _get_varint(fdict, 9),
-            "msg_time": _get_varint(fdict, 10),
-            "msg_key": _get_string(fdict, 11),
-            "msg_id": _get_string(fdict, 12),
-            "msg_body": [_decode_msg_body_element(b) for b in _get_repeated_bytes(fdict, 13)],
-            "cloud_custom_data": _get_string(fdict, 14),
-            "event_time": _get_varint(fdict, 15),
-            "bot_owner_id": _get_string(fdict, 16),
-            "recall_msg_seq_list": [
-                {"msg_seq": _get_varint(d, 1), "msg_id": _get_string(d, 2)} for d in _parse_repeated(fdict, 17)
-            ] or None,
-            "claw_msg_type": _get_varint(fdict, 18),
-            "private_from_group_code": _get_string(fdict, 19),
-            "trace_id": _get_string(_parse_dict(log_ext_bytes), 1) if log_ext_bytes else "",  # 20 log_ext{1 trace_id}
-        }
+        result = {key: get(fdict, fn) for fn, key, get in _INBOUND_PUSH_SPEC}
         return {k: v for k, v in result.items() if v or k in {"msg_body", "msg_seq"}}
     except Exception:
         return None
 
 
-# ============================================================
-# WeChat forwarded chat-history parsing (ForwardMsgData)
-# ============================================================
+# ---- WeChat forwarded chat-history parsing (ForwardMsgData)
 # ext_map["wexin_forward_msg_<id>_<userid>"] = base64(ForwardMsgData) — protobuf, NOT JSON.
 # Verified against live captures:
 #   ForwardMsgData { uint32 sub_type=1 (1 = WeChat chat-history forward); uint32 begin_time=2;
@@ -446,81 +415,39 @@ def decode_forward_msg_data(data: bytes) -> Optional[dict]:
         return None
 
 
-# ============================================================
-# Outbound message encoding
-# ============================================================
-# 发送请求字段表 [(field_number, kind, value)]；kind:
-#   "S" string 总是编码  "s" string 非空才编码  "v" varint 非零才编码  "n" varint 非 None 才编码
-#   "b" repeated MsgBodyElement  "t" LogInfoExt{1 trace_id} 非空才编码
-_SEND_ENCODERS = {
-    "S": _s, "s": _s, "v": _v, "n": _v,
-    "b": lambda fn, body: b"".join(_m(fn, _encode_msg_body_element(el)) for el in body),
-    "t": lambda fn, trace_id: _m(fn, _s(1, trace_id)),
-}
-
-
-def _send_request(method: str, prefix: str, msg_id: str, parts: list) -> bytes:
-    buf = b""
-    for fn, kind, val in parts:
-        if kind == "S" or (val is not None if kind == "n" else val):
-            buf += _SEND_ENCODERS[kind](fn, val)
-    return _biz_request(method, prefix, buf, msg_id)
-
-
+# ---- Outbound message encoding
 def encode_send_c2c_message(
-    to_account: str,
-    msg_body: list,
-    from_account: str,
-    msg_id: str = "",
-    msg_random: int = 0,
-    msg_seq: Optional[int] = None,
-    group_code: str = "",
-    trace_id: str = "",
+    to_account: str, msg_body: list, from_account: str, msg_id: str = "", msg_random: int = 0,
+    msg_seq: Optional[int] = None, group_code: str = "", trace_id: str = "",
 ) -> bytes:
     """SendC2CMessageReq → 完整 ConnMsg bytes（可直接发送）。
 
     msg_body items are {"msg_type": str, "msg_content": dict}; msg_id doubles as req_id when set;
     group_code is filled for the "private chat originating from a group" case.
     """
-    return _send_request("send_c2c_message", "c2c", msg_id, [
+    return _biz_request("send_c2c_message", "c2c", _encode_parts([
         (1, "s", msg_id), (2, "S", to_account), (3, "s", from_account), (4, "v", msg_random),
         (5, "b", msg_body), (6, "s", group_code), (7, "n", msg_seq), (8, "t", trace_id),
-    ])
+    ]), msg_id)
 
 
 def encode_send_group_message(
-    group_code: str,
-    msg_body: list,
-    from_account: str,
-    msg_id: str = "",
-    to_account: str = "",
-    random: str = "",
-    msg_seq: Optional[int] = None,
-    ref_msg_id: str = "",
-    trace_id: str = "",
+    group_code: str, msg_body: list, from_account: str, msg_id: str = "", to_account: str = "", random: str = "",
+    msg_seq: Optional[int] = None, ref_msg_id: str = "", trace_id: str = "",
 ) -> bytes:
     """SendGroupMessageReq → 完整 ConnMsg bytes。to_account usually empty; ref_msg_id = quoted message."""
-    return _send_request("send_group_message", "grp", msg_id, [
+    return _biz_request("send_group_message", "grp", _encode_parts([
         (1, "s", msg_id), (2, "S", group_code), (3, "s", from_account), (4, "s", to_account), (5, "s", random),
         (6, "b", msg_body), (7, "s", ref_msg_id), (8, "n", msg_seq), (9, "t", trace_id),
-    ])
+    ]), msg_id)
 
 
-# ============================================================
-# AuthBind / Ping / PushAck
-# ============================================================
+# ---- AuthBind / Ping / PushAck
 
 
 def encode_auth_bind(
-    biz_id: str,
-    uid: str,
-    source: str,
-    token: str,
-    msg_id: str,
-    app_version: str = "",
-    operation_system: str = "",
-    bot_version: str = "",
-    route_env: str = "",
+    biz_id: str, uid: str, source: str, token: str, msg_id: str, app_version: str = "", operation_system: str = "",
+    bot_version: str = "", route_env: str = "",
 ) -> bytes:
     """auth-bind 请求 ConnMsg bytes。
 
@@ -528,17 +455,12 @@ def encode_auth_bind(
       3 device_info (DeviceInfo{1 app_version, 2 app_operation_system, 10 instance_id, 24 bot_version}),
       5 env_name
     """
-    dev_buf = b""
-    if app_version:
-        dev_buf += _s(1, app_version)
-    if operation_system:
-        dev_buf += _s(2, operation_system)
-    dev_buf += _s(10, str(HERMES_INSTANCE_ID))
-    if bot_version:
-        dev_buf += _s(24, bot_version)
-    req_buf = _s(1, biz_id) + _m(2, _s(1, uid) + _s(2, source) + _s(3, token)) + _m(3, dev_buf)
-    if route_env:
-        req_buf += _s(5, route_env)
+    dev_buf = _encode_parts([
+        (1, "s", app_version), (2, "s", operation_system), (10, "S", str(HERMES_INSTANCE_ID)), (24, "s", bot_version),
+    ])
+    req_buf = _encode_parts([
+        (1, "S", biz_id), (2, "m", _s(1, uid) + _s(2, source) + _s(3, token)), (3, "m", dev_buf), (5, "s", route_env),
+    ])
     return _conn_request(CMD_TYPE["Request"], CMD["AuthBind"], msg_id, MODULE["ConnAccess"], req_buf)
 
 
@@ -554,9 +476,7 @@ def encode_push_ack(original_head: dict) -> bytes:
     )
 
 
-# ============================================================
-# Heartbeat / 群信息 / 群成员列表
-# ============================================================
+# ---- Heartbeat / 群信息 / 群成员列表
 
 
 def encode_send_private_heartbeat(from_account: str, to_account: str, heartbeat: int = WS_HEARTBEAT_RUNNING) -> bytes:
