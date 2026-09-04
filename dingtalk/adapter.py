@@ -743,10 +743,27 @@ def register(ctx) -> None:
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
 
+EXT_MAP = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "md": "text/markdown",
+    "txt": "text/plain",
+    "csv": "text/csv",
+    "zip": "application/zip",
+    "mp4": "video/mp4",
+}
+
 
 _PLUGIN_COMPAT_LAZY = {
     'DINGTALK_TYPE_MAPPING': ('plugins.platforms.dingtalk.inbound', 'DINGTALK_TYPE_MAPPING'),
-    'EXT_MAP': ('plugins.platforms.dingtalk.inbound', 'EXT_MAP'),
     'MessageType': ('gateway.platforms.base', 'MessageType'),
 }
 
