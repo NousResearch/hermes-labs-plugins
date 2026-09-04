@@ -2803,7 +2803,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return await SignManager.get_token(self._app_key, self._app_secret, self._api_domain, route_env=self._route_env)
 
 
-
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
@@ -3002,5 +3001,5 @@ async def send_yuanbao_direct(
     media_files: Optional[List[Tuple[str, bool]]] = None,
 ) -> Dict[str, Any]:
     """Delegate to ``OutboundManager.send_direct``."""
-    return await adapter._outbound.send_direct(chat_id, message, media_files)
+    return await adapter._outbound.sender.send_direct(chat_id, message, media_files)
 # ---- END PLUGIN-COMPAT ----
