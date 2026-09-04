@@ -497,6 +497,18 @@ def register(ctx) -> None:
 from typing import Dict  # noqa: F401,E402
 from typing import List  # noqa: F401,E402
 
+CONTEXT_SCHEMA = {
+    "name": "retaindb_context",
+    "description": "Synthesized context block — what matters most for the current task, pulled from long-term memory.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Current task or question."},
+        },
+        "required": ["query"],
+    },
+}
+
 FILE_DELETE_SCHEMA = {
     "name": "retaindb_delete_file",
     "description": "Delete a stored file.",
@@ -561,20 +573,52 @@ FILE_UPLOAD_SCHEMA = {
     },
 }
 
-
-_PLUGIN_COMPAT_LAZY = {
-    'CONTEXT_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'CONTEXT_SCHEMA'),
-    'FORGET_SCHEMA': ('plugins.memory.openviking', 'FORGET_SCHEMA'),
-    'PROFILE_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'PROFILE_SCHEMA'),
-    'REMEMBER_SCHEMA': ('plugins.memory.openviking', 'REMEMBER_SCHEMA'),
-    'SEARCH_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'SEARCH_SCHEMA'),
+FORGET_SCHEMA = {
+    "name": "retaindb_forget",
+    "description": "Delete a specific memory by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Memory ID to delete."},
+        },
+        "required": ["memory_id"],
+    },
 }
 
+PROFILE_SCHEMA = {
+    "name": "retaindb_profile",
+    "description": "Get the user's stable profile — preferences, facts, and patterns recalled from long-term memory.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    return getattr(importlib.import_module(target[0]), target[1])
+REMEMBER_SCHEMA = {
+    "name": "retaindb_remember",
+    "description": "Persist an explicit fact, preference, or decision to long-term memory.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The fact to remember."},
+            "memory_type": {
+                "type": "string",
+                "enum": ["factual", "preference", "goal", "instruction", "event", "opinion"],
+                "description": "Category (default: factual).",
+            },
+            "importance": {"type": "number", "description": "Importance 0-1 (default: 0.7)."},
+        },
+        "required": ["content"],
+    },
+}
+
+SEARCH_SCHEMA = {
+    "name": "retaindb_search",
+    "description": "Semantic search across stored memories. Returns ranked results with relevance scores.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "top_k": {"type": "integer", "description": "Max results (default: 8, max: 20)."},
+        },
+        "required": ["query"],
+    },
+}
 # ---- END PLUGIN-COMPAT ----
