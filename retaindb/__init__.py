@@ -488,3 +488,93 @@ _TOOLS: dict[str, tuple[str | None, Callable[..., Any]]] = {
 def register(ctx) -> None:
     """Register RetainDB as a memory provider plugin."""
     ctx.register_memory_provider(RetainDBMemoryProvider())
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Dict  # noqa: F401,E402
+from typing import List  # noqa: F401,E402
+
+FILE_DELETE_SCHEMA = {
+    "name": "retaindb_delete_file",
+    "description": "Delete a stored file.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_id": {"type": "string", "description": "File ID to delete."},
+        },
+        "required": ["file_id"],
+    },
+}
+
+FILE_INGEST_SCHEMA = {
+    "name": "retaindb_ingest_file",
+    "description": "Chunk, embed, and extract memories from a stored file. Makes its contents searchable.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_id": {"type": "string", "description": "File ID to ingest."},
+        },
+        "required": ["file_id"],
+    },
+}
+
+FILE_LIST_SCHEMA = {
+    "name": "retaindb_list_files",
+    "description": "List files in the shared file store.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prefix": {"type": "string", "description": "Path prefix to filter by, e.g. /reports/"},
+            "limit": {"type": "integer", "description": "Max results (default: 50)."},
+        },
+        "required": [],
+    },
+}
+
+FILE_READ_SCHEMA = {
+    "name": "retaindb_read_file",
+    "description": "Read the text content of a stored file by its file ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_id": {"type": "string", "description": "File ID returned from upload or list."},
+        },
+        "required": ["file_id"],
+    },
+}
+
+FILE_UPLOAD_SCHEMA = {
+    "name": "retaindb_upload_file",
+    "description": "Upload a file to the shared RetainDB file store. Returns an rdb:// URI any agent can reference.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "local_path": {"type": "string", "description": "Local file path to upload."},
+            "remote_path": {"type": "string", "description": "Destination path, e.g. /reports/q1.pdf"},
+            "scope": {"type": "string", "enum": ["USER", "PROJECT", "ORG"], "description": "Access scope (default: PROJECT)."},
+            "ingest": {"type": "boolean", "description": "Also extract memories from file after upload (default: false)."},
+        },
+        "required": ["local_path"],
+    },
+}
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'CONTEXT_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'CONTEXT_SCHEMA'),
+    'FORGET_SCHEMA': ('plugins.memory.openviking', 'FORGET_SCHEMA'),
+    'PROFILE_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'PROFILE_SCHEMA'),
+    'REMEMBER_SCHEMA': ('plugins.memory.openviking', 'REMEMBER_SCHEMA'),
+    'SEARCH_SCHEMA': ('plugins.memory.honcho.tool_schemas', 'SEARCH_SCHEMA'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
