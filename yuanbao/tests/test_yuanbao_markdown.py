@@ -3,10 +3,10 @@ test_yuanbao_markdown.py - Unit tests for yuanbao_markdown.py
 
 Run (no pytest needed):
     cd /root/.openclaw/workspace/hermes-agent
-    python3 tests/test_yuanbao_markdown.py -v
+    python3 tests/gateway/test_yuanbao_markdown.py -v
 
 Or with pytest if available:
-    python3 -m pytest tests/test_yuanbao_markdown.py -v
+    python3 -m pytest tests/gateway/test_yuanbao_markdown.py -v
 """
 
 import sys
@@ -14,7 +14,7 @@ import os
 import unittest
 
 # Ensure project root is on the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from gateway.platforms import helpers as _mdchunk
 from gateway.platforms.yuanbao import MarkdownProcessor
