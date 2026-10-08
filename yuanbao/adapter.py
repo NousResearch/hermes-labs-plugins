@@ -1730,7 +1730,7 @@ class DispatchMiddleware(InboundMiddleware):
             while True:
                 try:
                     dispatch_fn = await asyncio.wait_for(queue.get(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 logger.debug("[%s] Group queue: dispatching for %s (remaining=%d)", adapter.name, (session_key or "")[:50], queue.qsize())
                 try:
@@ -1823,7 +1823,7 @@ class ConnectionManager:
             self._connected(cancel_existing=False)
             logger.info("[%s] Connected. connectId=%s botId=%s", adapter.name, self._connect_id, adapter._bot_id)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("[%s] Connection timed out", adapter.name)
         except Exception as exc:
             logger.error("[%s] connect() failed: %s", adapter.name, exc, exc_info=True)
@@ -1915,7 +1915,7 @@ class ConnectionManager:
                     return False
                 logger.info("[%s] BIND_ACK received: connectId=%s", adapter.name, self._connect_id)
                 return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("[%s] AUTH_BIND timeout", adapter.name)
         except Exception as exc:
             logger.error("[%s] AUTH_BIND error: %s", adapter.name, exc, exc_info=True)
@@ -1959,7 +1959,7 @@ class ConnectionManager:
                     try:
                         await asyncio.wait_for(pong_future, timeout=10.0)
                         self._consecutive_hb_timeouts = 0
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         self._pending_acks.pop(msg_id, None)
                         self._consecutive_hb_timeouts += 1
                         logger.warning("[%s] PONG timeout (%d/%d)", adapter.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD)
@@ -2131,7 +2131,7 @@ class ConnectionManager:
                 self._connected(cancel_existing=True)
                 logger.info("[%s] Reconnected on attempt %d. connectId=%s", adapter.name, attempt + 1, self._connect_id)
                 return True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("[%s] Reconnect attempt %d timed out", adapter.name, attempt + 1)
             except Exception as exc:
                 logger.warning("[%s] Reconnect attempt %d failed: %s", adapter.name, attempt + 1, exc)
@@ -2146,7 +2146,7 @@ class ConnectionManager:
         if ws is not None:
             try:
                 await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # No close-frame echo in time; websockets force-closes the transport on cancel.
                 logger.debug("[%s] WS close handshake exceeded %.1fs — dropping connection", self._adapter.name, WS_CLOSE_TIMEOUT_S)
             except Exception:
@@ -2537,7 +2537,7 @@ class MessageSender:
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -2767,7 +2767,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
             return decode_rsp(biz_data) if biz_data and isinstance(biz_data, bytes) else empty
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("[%s] %s timeout: group=%s", self.name, label, group_code)
         except Exception as exc:
             logger.warning("[%s] %s failed: %s", self.name, label, exc)
