@@ -10,7 +10,7 @@ import re
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Dict, List, Optional, Set
 
 # Optional SDKs: catch broad Exception, not just ImportError — their transitive cryptography
@@ -487,9 +487,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                                    message_id=msg_id)
         create_at = getattr(message, "create_at", None)
         try:
-            timestamp = datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc) if create_at else datetime.now(tz=timezone.utc)
+            timestamp = datetime.fromtimestamp(int(create_at) / 1000, tz=UTC) if create_at else datetime.now(tz=UTC)
         except (ValueError, OSError, TypeError):
-            timestamp = datetime.now(tz=timezone.utc)
+            timestamp = datetime.now(tz=UTC)
         logger.debug("[%s] Message from %s in %s: %s", self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:80] if text else "(media)")
         await self.handle_message(MessageEvent(text=text, message_type=msg_type, source=source, message_id=msg_id, raw_message=message,
                                                media_urls=media_urls, media_types=media_types, timestamp=timestamp))
@@ -564,7 +564,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Get a non-expired session webhook for chat_id (5-minute safety margin)."""
         info = self._session_webhooks.get(chat_id)
         expired_time_ms = info[1] if info else 0
-        if expired_time_ms and expired_time_ms > 0 and int(datetime.now(tz=timezone.utc).timestamp() * 1000) + 5 * 60 * 1000 >= expired_time_ms:
+        if expired_time_ms and expired_time_ms > 0 and int(datetime.now(tz=UTC).timestamp() * 1000) + 5 * 60 * 1000 >= expired_time_ms:
             self._session_webhooks.pop(chat_id, None)
             return None
         return info or None
