@@ -410,7 +410,7 @@ class DingTalkAdapter(BasePlatformAdapter):
     def _message_matches_mention_patterns(self, text: str) -> bool:
         return bool(text and self._mention_patterns) and any(p.search(text) for p in self._mention_patterns)
 
-    def _should_process_message(self, message: "ChatbotMessage", text: str, is_group: bool, chat_id: str) -> bool:
+    def _should_process_message(self, message: ChatbotMessage, text: str, is_group: bool, chat_id: str) -> bool:
         """Group trigger rules (DMs always pass; ``allowed_users`` is enforced earlier): ``allowed_chats`` is a hard
         gate, then any of free_response_chats / require_mention off / @mentioned (SDK ``is_in_at_list``) / wake-word."""
         if not is_group:
@@ -455,7 +455,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             await self._send_emotion(msg_id, conversation_id, t("platform.dingtalk.emotion.done"), recall=False)
         self._spawn_bg(_swap())
 
-    async def _on_message(self, message: "ChatbotMessage") -> None:
+    async def _on_message(self, message: ChatbotMessage) -> None:
         """Process an incoming DingTalk chatbot message."""
         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
         if self._dedup.is_duplicate(msg_id):
@@ -496,7 +496,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     _extract_text = staticmethod(extract_text)
 
-    def _extract_media(self, message: "ChatbotMessage"):
+    def _extract_media(self, message: ChatbotMessage):
         return extract_media(message)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -664,7 +664,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] _send_emotion %s failed", self.name, action, exc_info=True)
 
-    async def _resolve_media_codes(self, message: "ChatbotMessage") -> None:
+    async def _resolve_media_codes(self, message: ChatbotMessage) -> None:
         """Resolve download codes in the message to real URLs (in place, in parallel)."""
         token = await self._get_access_token()
         if not token:
@@ -719,7 +719,7 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
         """No-op hook the SDK calls on every handler before opening the WebSocket (missing → AttributeError)."""
         return
 
-    async def process(self, message: "CallbackMessage"):
+    async def process(self, message: CallbackMessage):
         """Convert to ChatbotMessage, dispatch as a background task, ACK immediately (blocking would stall SDK heartbeats)."""
         try:
             data = json.loads(message.data) if isinstance(message.data, str) else message.data
@@ -739,7 +739,7 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
             return AckMessage.STATUS_SYSTEM_EXCEPTION, "error"
         return AckMessage.STATUS_OK, "OK"
 
-    async def _safe_on_message(self, chatbot_msg: "ChatbotMessage") -> None:
+    async def _safe_on_message(self, chatbot_msg: ChatbotMessage) -> None:
         try:
             await self._adapter._on_message(chatbot_msg)
         except Exception:
