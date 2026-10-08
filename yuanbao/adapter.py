@@ -26,7 +26,7 @@ import urllib.parse
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field as dc_field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, UTC
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Tuple
@@ -671,7 +671,7 @@ class RecallGuardMiddleware(InboundMiddleware):
             return
         # Branch B: not found in transcript → append system note
         store.append_to_transcript(sid, {
-            "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "role": "system", "timestamp": datetime.now(tz=UTC).isoformat(),
             "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
         })
         logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
@@ -1103,7 +1103,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                     body_text = f"{text}\n{summary}" if text else summary
             entry: dict = {
                 "role": "user", "content": f"[{sender_display}|{source.user_id or 'unknown'}]\n{body_text}",
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(), "observed": True,
+                "timestamp": datetime.now(tz=UTC).isoformat(), "observed": True,
             }
             if msg_id:
                 entry["message_id"] = msg_id
