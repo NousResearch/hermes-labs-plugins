@@ -357,7 +357,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._stream_task.cancel()
             try:
                 await asyncio.wait_for(self._stream_task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError):
                 logger.debug("[%s] stream task did not exit cleanly during disconnect", self.name)
             self._stream_task = None
         for task in list(self._bg_tasks):
