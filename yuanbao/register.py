@@ -1,9 +1,11 @@
 """Yuanbao plugin registration: setup row, configured check, standalone sender, ``register``."""
 
+import re
 import logging
 
 from gateway.platforms._shared import send_error
 from gateway.platforms._shared import config_connected_extra
+from gateway.platforms.send_targets import NOT_EXPLICIT, StandaloneSendPolicy
 
 # Absolute import (see __init__.py): one ``YuanbaoAdapter`` class object for the registry,
 # tools/yuanbao_tools.py and the standalone sender.
@@ -77,11 +79,22 @@ _PLATFORM_HINT = (
     "keyword, then yb_send_sticker with the chosen id \u2014 which send a real native sticker. Never "
     "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
 )
+_SEND_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+
+
+def _parse_send_target(ref):
+    # "group:<code>" / "direct:<id>"; a bare number is a group code (never generic rules).
+    match = _SEND_TARGET_RE.fullmatch(ref)
+    if match:
+        return match.group(1), None
+    return (f"group:{ref.strip()}", None) if ref.strip().isdigit() else NOT_EXPLICIT
 
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
+        target_ref_syntax_fn=_parse_send_target,
+        standalone_send=StandaloneSendPolicy(label="Yuanbao", media=True, text_direct=True),
         name="yuanbao", label="Yuanbao", adapter_factory=YuanbaoAdapter,
         check_fn=check_yuanbao_requirements, is_connected=_is_connected,
         config_connected_fn=config_connected_extra("app_id", "app_secret"),
