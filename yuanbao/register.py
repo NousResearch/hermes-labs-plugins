@@ -92,6 +92,7 @@ def _parse_send_target(ref):
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
         target_ref_syntax_fn=_parse_send_target,
         standalone_send=StandaloneSendPolicy(label="Yuanbao", media=True, text_direct=True),
@@ -107,4 +108,6 @@ def register(ctx) -> None:
         standalone_sender_fn=_standalone_send, emoji="💎", allow_update_command=False,
         own_policy_env=("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY"),
         platform_hint=_PLATFORM_HINT,
+        env_overrides=gateway_env.ENV_OVERRIDES,
+        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS,
     )
