@@ -13,7 +13,8 @@ class _Ctx:
 
 def test_register_shape_and_core_wiring_removed():
     from plugins.platforms.yuanbao import register
-    from plugins.platforms.yuanbao.adapter import YuanbaoAdapter, _standalone_send
+    from plugins.platforms.yuanbao.adapter import YuanbaoAdapter
+    from plugins.platforms.yuanbao.register import _standalone_send
 
     ctx = _Ctx()
     register(ctx)
