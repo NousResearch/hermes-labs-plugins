@@ -103,11 +103,9 @@ def register(ctx) -> None:
         check_fn=check_yuanbao_requirements, is_connected=_is_connected,
         config_connected_fn=config_connected_extra("app_id", "app_secret"),
         required_env=["YUANBAO_APP_ID", "YUANBAO_APP_SECRET"], install_hint=_INSTALL_HINT,
-        setup_fn=interactive_setup, allowed_users_env="YUANBAO_ALLOWED_USERS",
-        allow_all_env="YUANBAO_ALLOW_ALL_USERS", cron_deliver_env_var="YUANBAO_HOME_CHANNEL",
+        setup_fn=interactive_setup, cron_deliver_env_var="YUANBAO_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send, emoji="💎", allow_update_command=False,
-        own_policy_env=("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY"),
         platform_hint=_PLATFORM_HINT,
         env_overrides=gateway_env.ENV_OVERRIDES,
-        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS,
+        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )

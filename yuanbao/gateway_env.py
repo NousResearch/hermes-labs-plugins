@@ -18,3 +18,11 @@ ENV_OVERRIDES = (
         home="YUANBAO_HOME_CHANNEL",
     ),
 )
+
+# Authorization env names (``PlatformEntry`` fields). Core reads them from this file when the
+# live entry lacks them: a user plugin overriding this platform, safe mode, the plugin disabled.
+AUTHZ = {
+    "allowed_users_env": "YUANBAO_ALLOWED_USERS",
+    "allow_all_env": "YUANBAO_ALLOW_ALL_USERS",
+    "own_policy_env": ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY"),
+}
