@@ -852,6 +852,9 @@ def register(ctx) -> None:
     ctx.register_platform(
         standalone_send=StandaloneSendPolicy(text_direct=True),
         name="dingtalk", label="DingTalk", adapter_factory=DingTalkAdapter, check_fn=dingtalk_deps_present,
+        dashboard_description="Connect Hermes to DingTalk groups (钉钉).",
+        docs_url="https://open.dingtalk.com/document/orgapp/the-robot-development-process",
+        dashboard_env_vars=("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
         ensure_deps_fn=ensure_dingtalk_deps, is_connected=_is_connected, validate_config=_is_connected,
         required_env=["DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"], install_hint="pip install 'dingtalk-stream>=0.20' httpx",
         setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, allowed_users_env="DINGTALK_ALLOWED_USERS",
