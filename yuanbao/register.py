@@ -65,6 +65,20 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         return send_error(f"Yuanbao send failed: {e}")
 
 
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
+_PLATFORM_HINT = (
+    "You are on Yuanbao (\u817e\u8baf\u5143\u5b9d), a Chinese AI assistant "
+    "platform. Markdown renders (code blocks, tables, bold/italic). "
+    "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
+    "Images (.jpg, .png, .webp, .gif) send as photos, other files as downloadable documents (max 50 MB); "
+    "image URLs via ![alt](url) are downloaded and sent as photos. Never claim you lack file-sending. "
+    "Stickers (\u8d34\u7eb8/\u8868\u60c5\u5305): when the user sends one (you see '[emoji: "
+    "\u540d\u79f0]') or asks for one, use the sticker tools \u2014 yb_search_sticker with a Chinese "
+    "keyword, then yb_send_sticker with the chosen id \u2014 which send a real native sticker. Never "
+    "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
+)
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -76,4 +90,5 @@ def register(ctx) -> None:
         allow_all_env="YUANBAO_ALLOW_ALL_USERS", cron_deliver_env_var="YUANBAO_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send, emoji="💎", allow_update_command=False,
         own_policy_env=("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY"),
+        platform_hint=_PLATFORM_HINT,
     )
