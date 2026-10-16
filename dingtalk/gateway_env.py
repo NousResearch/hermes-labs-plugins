@@ -11,3 +11,10 @@ ENV_OVERRIDES = (
         home="DINGTALK_HOME_CHANNEL",
     ),
 )
+
+# Authorization env names (``PlatformEntry`` fields). Core reads them from this file when the
+# live entry lacks them: a user plugin overriding this platform, safe mode, the plugin disabled.
+AUTHZ = {
+    "allowed_users_env": "DINGTALK_ALLOWED_USERS",
+    "allow_all_env": "DINGTALK_ALLOW_ALL_USERS",
+}
