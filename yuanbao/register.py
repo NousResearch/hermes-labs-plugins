@@ -3,6 +3,7 @@
 import logging
 
 from gateway.platforms._shared import send_error
+from gateway.platforms._shared import config_connected_extra
 
 # Absolute import (see __init__.py): one ``YuanbaoAdapter`` class object for the registry,
 # tools/yuanbao_tools.py and the standalone sender.
@@ -69,6 +70,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="yuanbao", label="Yuanbao", adapter_factory=YuanbaoAdapter,
         check_fn=check_yuanbao_requirements, is_connected=_is_connected,
+        config_connected_fn=config_connected_extra("app_id", "app_secret"),
         required_env=["YUANBAO_APP_ID", "YUANBAO_APP_SECRET"], install_hint=_INSTALL_HINT,
         setup_fn=interactive_setup, allowed_users_env="YUANBAO_ALLOWED_USERS",
         allow_all_env="YUANBAO_ALLOW_ALL_USERS", cron_deliver_env_var="YUANBAO_HOME_CHANNEL",
