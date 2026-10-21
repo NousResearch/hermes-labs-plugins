@@ -28,6 +28,7 @@ Supported first-party plugins live in [hermes-official-plugins](https://github.c
 | Plugin | Install | What it does |
 |---|---|---|
 | [Telegram Business Mode](telegram-business/) | `hermes plugins install hermes-telegram-business` | Turns Hermes into an observe-with-approval secretary for your Telegram Business account. It drafts replies to your customers, and nothing is sent until you approve it. |
+| [Inbox](inbox/) | `hermes plugins install inbox` | `hermes inbox` shows everything in flight for the active profile in one read-only view: failed cron runs, stalled or dropped delegations, orphaned background processes and blocked kanban tasks, plus running work, undelivered results, upcoming jobs and open chat sessions. |
 | [Workflow Record](workflow-record/) | `hermes plugins install workflow-record` | `hermes record` captures a browser workflow you demonstrate once (clicks, field values, navigations; passwords masked inside the page), and its bundled skill lets `/learn` turn the recording into a skill that replays it. |
 
 ## Working on a plugin

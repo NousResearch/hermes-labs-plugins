@@ -1,0 +1,10 @@
+name: inbox
+version: 0.1.0
+description: >
+  hermes inbox: one read-only view of everything in flight for the active
+  profile. Stalled or dropped delegations, failed cron runs, orphaned
+  background processes and blocked kanban tasks; running work; finished
+  delegation results not yet delivered; upcoming cron jobs; open chat
+  surfaces. --json for scripts.
+author: "Nous Research"
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/inbox
