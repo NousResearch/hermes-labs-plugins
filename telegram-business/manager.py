@@ -63,6 +63,14 @@ CHOICE_EDIT = "edit"
 CHOICE_DISCARD = "discard"
 
 
+def _as_seconds(value: Any) -> float:
+    """A draft row's ``expires_at`` as a comparable float (0.0 when it is not one)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # Onboarding text the bot DMs the owner the first time a BusinessConnection
 # arrives. Plain text (Telegram MarkdownV2 escaping is fragile, and this
 # message is content-stable enough to hand-author).
@@ -425,6 +433,15 @@ class BusinessModeManager:
             await answer(text="That draft has already been resolved.")
             return True
 
+        # A pending draft past its TTL (default 24h) is stale: settle it and
+        # no-op the buttons. The store's expire helper is never invoked by the
+        # runtime, so this is the only path that can act on a draft — the
+        # freshness check lives here or TTLs would never be enforced.
+        if time.time() >= _as_seconds(draft.get("expires_at")):
+            self._db.resolve_telegram_business_draft(draft_id, status="expired")
+            await answer(text="That draft has expired.")
+            return True
+
         # Only the owner of this connection may act on the buttons. Reject
         # whenever the caller's identity doesn't match the connection owner —
         # including when caller_user_id is missing/falsy. The previous
@@ -535,7 +552,13 @@ class BusinessModeManager:
                 pass
             return True
 
+        # The owner may take arbitrarily long to write the override: re-check the
+        # TTL before anything is delivered, and settle a pending draft that aged out.
         draft = self._db.get_telegram_business_draft(draft_id)
+        if draft is not None and draft.get("status") == "pending" \
+                and time.time() >= _as_seconds(draft.get("expires_at")):
+            self._db.resolve_telegram_business_draft(draft_id, status="expired")
+            draft = None
         if not draft or draft.get("status") not in {"pending", "awaiting_edit"}:
             try:
                 await self._send(

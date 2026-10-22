@@ -29,7 +29,7 @@ Discard → dropped, the customer sees nothing
 
 - **No auto-send exists.** Every reply requires an owner button tap, even when `can_reply` is granted.
 - **Owner-only buttons.** Callbacks are authorized against the connection's `owner_user_id`; anyone else gets `⛔`.
-- **Drafts expire after 24h** (configurable). Stale buttons no-op.
+- **Drafts expire after 24h** (configurable). The TTL is checked where drafts are acted on — a button press or an edit override on an aged-out draft is rejected and the draft is settled as expired.
 - **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — new messages within the debounce window supersede the prior draft, one draft per coherent thought.
 - **Plugin state is owner-only.** `state.db` (customer conversations + drafts) and its directory are created readable and writable only by your user account on POSIX filesystems — a no-op on Windows, where your home directory's ACL already limits access.
@@ -95,7 +95,7 @@ Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (two tables: conne
 python3 -m pytest
 ```
 
-37 tests covering connection lifecycle, draft supersession, debounce coalescing, all three button paths, edit capture, owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
+The suite covers connection lifecycle, draft supersession, debounce coalescing, all three button paths, edit capture (including drafts that aged out before the override arrives), owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
 
 ## Credits
 

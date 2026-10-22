@@ -749,3 +749,91 @@ class TestBizCommand:
             owner_user_id="42", owner_chat_id="100", args=["unknown"],
         )
         assert "Usage" in reply
+
+
+class TestDraftTtlEnforcement:
+    """The README's "stale buttons no-op" promise: the store's expire helper is not
+    called by any runtime path, so the TTL must be enforced where drafts are acted
+    on — the button callbacks and the owner's edit-override reply."""
+
+    @staticmethod
+    def _backdate(db, draft):
+        with db._lock:
+            db._conn.execute(
+                "UPDATE business_drafts SET expires_at = ? WHERE draft_id = ?",
+                (time.time() - 1.0, draft["draft_id"]),
+            )
+            db._conn.commit()
+
+    @pytest.mark.asyncio
+    async def test_send_button_after_ttl_is_a_no_op(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        draft = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        self._backdate(db, draft)
+
+        answered: List[Dict[str, Any]] = []
+        edited: List[Dict[str, Any]] = []
+
+        async def _answer(**kw): answered.append(kw)
+        async def _edit(**kw): edited.append(kw)
+
+        dispatched = await mgr.handle_callback(
+            data=f"bd:send:{draft['draft_id']}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        )
+        assert dispatched is True
+        assert [c for c in sender.calls if c.get("chat_id") == 200] == []
+        assert "expired" in answered[0]["text"]
+        row = db.get_telegram_business_draft(draft["draft_id"])
+        assert row["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_edit_override_of_a_draft_that_aged_out_is_refused(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        draft = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        did = draft["draft_id"]
+
+        # The owner taps Edit while the draft is fresh ...
+        async def _answer(**kw): pass
+        async def _edit(**kw): pass
+
+        await mgr.handle_callback(
+            data=f"bd:edit:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        )
+        # ... and is slow: the draft ages out before the override arrives.
+        self._backdate(db, draft)
+
+        consumed = await mgr.maybe_handle_edit_capture(
+            owner_chat_id="100", text="late override",
+        )
+        assert consumed is True
+        assert [c for c in sender.calls if c.get("chat_id") == 200] == []
+        row = db.get_telegram_business_draft(did)
+        assert row["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_fresh_draft_is_never_rejected_by_the_ttl(self, db):
+        mgr, sender = _make_manager(db, draft_text="fresh")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        draft = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        did = draft["draft_id"]
+
+        answered: List[Dict[str, Any]] = []
+        edited: List[Dict[str, Any]] = []
+
+        async def _answer(**kw): answered.append(kw)
+        async def _edit(**kw): edited.append(kw)
+
+        dispatched = await mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        )
+        assert dispatched is True
+        assert [c for c in sender.calls if c.get("chat_id") == 200]
+        assert db.get_telegram_business_draft(did)["status"] == "sent"
