@@ -32,6 +32,7 @@ a hand-made event, still cannot put a raw password on disk.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -46,6 +47,19 @@ KNOWN_EVENT_TYPES = ("click", "input", "enter", "navigate", "manual")
 SECRET_INPUT_TYPES = ("password",)
 SECRET_AUTOCOMPLETE = ("current-password", "new-password", "one-time-code", "cc-number", "cc-csc")
 
+# ``autocomplete`` is a SPACE-SEPARATED token list in HTML, so a field that names a secret among
+# other tokens ("username current-password", "section-login one-time-code") is a secret field too.
+# Comparing the whole attribute string missed those: the recorder read the value, it crossed the
+# CDP socket, and the second masking pass missed it too, so the plaintext secret landed in the
+# recording file. One pattern for both sides - the recorder JS and the Python pass agree by
+# construction and cannot drift apart.
+_SECRET_AUTOCOMPLETE_RE = re.compile(
+    # ``\-`` is an identity escape in Python but not in a strict JS RegExp, so the dash stays plain.
+    r"(?:^|\s)(?:%s)(?:\s|$)" % "|".join(
+        re.escape(token).replace(r"\-", "-") for token in SECRET_AUTOCOMPLETE),
+    re.IGNORECASE,
+)
+
 BINDING_NAME = "__hermesRecord"
 
 _SECRET_PLACEHOLDER_RE = re.compile(r"^\{SECRET:[^{}]*\}$")
@@ -59,7 +73,7 @@ RECORDER_JS = r"""
   window.__hermesRecorderInstalled = true;
 
   const SECRET_TYPES = %(secret_types)s;
-  const SECRET_AUTOCOMPLETE = %(secret_autocomplete)s;
+  const SECRET_AUTOCOMPLETE = new RegExp(%(secret_autocomplete_pattern)s, "i");
   const BINDING = %(binding)s;
 
   const send = (ev) => {
@@ -100,7 +114,7 @@ RECORDER_JS = r"""
   const lower = (v) => String(v || "").toLowerCase();
   const autocompleteOf = (el) => lower(el.getAttribute && el.getAttribute("autocomplete"));
   const isSecretField = (el) =>
-    SECRET_TYPES.includes(lower(el.type)) || SECRET_AUTOCOMPLETE.includes(autocompleteOf(el));
+    SECRET_TYPES.includes(lower(el.type)) || SECRET_AUTOCOMPLETE.test(autocompleteOf(el));
   const fieldName = (el) =>
     el.name || el.id || el.getAttribute("aria-label") || el.placeholder || el.type || "secret";
 
@@ -153,7 +167,7 @@ RECORDER_JS = r"""
 })();
 """ % {
     "secret_types": json.dumps(list(SECRET_INPUT_TYPES)),
-    "secret_autocomplete": json.dumps(list(SECRET_AUTOCOMPLETE)),
+    "secret_autocomplete_pattern": json.dumps(_SECRET_AUTOCOMPLETE_RE.pattern),
     "binding": json.dumps(BINDING_NAME),
 }
 
@@ -164,9 +178,13 @@ def is_secret_placeholder(value: Any) -> bool:
 
 
 def is_secret_field(input_type: str = "", autocomplete: str = "") -> bool:
-    return (input_type or "").strip().lower() in SECRET_INPUT_TYPES or (
-        (autocomplete or "").strip().lower() in SECRET_AUTOCOMPLETE
-    )
+    """Whether this field holds a secret: a secret input type, or a secret ``autocomplete`` token.
+
+    ``autocomplete`` is a token list, so a field that names a secret among other tokens
+    ("username current-password") is one too.
+    """
+    return (input_type or "").strip().lower() in SECRET_INPUT_TYPES or bool(
+        _SECRET_AUTOCOMPLETE_RE.search(autocomplete or ""))
 
 
 def mask_value(value: Any, input_type: str = "", autocomplete: str = "", name: str = "") -> str:
@@ -283,10 +301,28 @@ def recordings_dir() -> Path:
     return get_hermes_home() / "recordings"
 
 
+def _restrict_to_owner(path: Path) -> None:
+    """Make ``path`` readable and writable by its owner only (a no-op on Windows).
+
+    Best-effort: a filesystem that does not carry POSIX modes (FAT, a network share) keeps the
+    default permissions rather than failing the save.
+    """
+    try:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
+
+
 def save_recording(recording: Dict[str, Any], slug: str, directory: Optional[Path] = None) -> Path:
-    """Write ``<dir>/<slug>-<UTC timestamp>.json`` and return its path."""
+    """Write ``<dir>/<slug>-<UTC timestamp>.json`` and return its path.
+
+    Owner-only: a recording holds what the user typed (a password the masking missed, an API key
+    typed into a plain field, the prompts themselves), so neither the directory nor the file may be
+    readable by another local account.
+    """
     rec_dir = directory or recordings_dir()
     rec_dir.mkdir(parents=True, exist_ok=True)
+    _restrict_to_owner(rec_dir)
     safe = re.sub(r"[^a-z0-9-]+", "-", (slug or "recording").strip().lower()).strip("-") or "recording"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     path = rec_dir / f"{safe}-{stamp}.json"
@@ -295,6 +331,7 @@ def save_recording(recording: Dict[str, Any], slug: str, directory: Optional[Pat
         path = rec_dir / f"{safe}-{stamp}-{n}.json"
         n += 1
     path.write_text(json.dumps(recording, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _restrict_to_owner(path)
     return path
 
 

@@ -7,6 +7,7 @@ read the recorder JS source (the live-browser test covers the in-page behaviour 
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -36,6 +37,39 @@ class TestMaskValue:
     def test_secret_autocomplete_is_masked(self, ac):
         assert mask_value("s3cr3t", autocomplete=ac, name="f") == "{SECRET:f}"
 
+    @pytest.mark.parametrize("ac", [
+        "username current-password",       # a token list naming the secret among others
+        "section-login new-password",
+        "one-time-code username",
+        "cc-number cc-csc",
+        "  current-password  ",             # stray whitespace is still the token
+        "Current-Password",                 # the attribute is case-insensitive
+    ])
+    def test_a_secret_autocomplete_token_in_a_list_is_masked(self, ac):
+        # ``autocomplete`` is a space-separated token list: a field that names a secret among
+        # other tokens is a secret field too, and its value must never reach the recording.
+        assert mask_value("s3cr3t", autocomplete=ac, name="f") == "{SECRET:f}"
+
+    @pytest.mark.parametrize("ac", [
+        "username email",                  # no secret token
+        "current-password-extra",           # not the token itself
+        "shipping address",
+    ])
+    def test_a_list_without_a_secret_token_is_not_masked(self, ac):
+        assert mask_value("alice@example.com", autocomplete=ac, name="user") == "alice@example.com"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes only")
+    def test_a_saved_recording_is_readable_by_its_owner_only(self, tmp_path):
+        # A recording holds what the user typed (a password the masking missed, an API key in a
+        # plain field, the prompts), so the file and its directory must not be readable by another
+        # local account.
+        from workflow_record_plugin.recording import save_recording
+
+        path = save_recording({"version": 1, "steps": []}, "demo", directory=tmp_path / "recordings")
+
+        assert path.stat().st_mode & 0o077 == 0, oct(path.stat().st_mode)
+        assert path.parent.stat().st_mode & 0o077 == 0, oct(path.parent.stat().st_mode)
+
     def test_plain_value_passes_through(self):
         assert mask_value("alice@example.com", input_type="email", name="user") == "alice@example.com"
 
@@ -44,6 +78,14 @@ class TestMaskValue:
 
     def test_nameless_field_falls_back_to_type(self):
         assert mask_value("x", input_type="password", name="") == "{SECRET:password}"
+
+    def test_the_recorder_js_shares_the_python_secret_rule(self):
+        # The JS decides whether to read a field's value at all, and the Python pass masks again.
+        # Both use the one pattern, so a secret cannot slip through one of them.
+        from workflow_record_plugin.recording import RECORDER_JS
+
+        assert "SECRET_AUTOCOMPLETE.test(autocompleteOf(el))" in RECORDER_JS
+        assert "SECRET_AUTOCOMPLETE.includes(autocompleteOf(el))" not in RECORDER_JS
 
     def test_is_secret_placeholder(self):
         assert is_secret_placeholder("{SECRET:pw}")
