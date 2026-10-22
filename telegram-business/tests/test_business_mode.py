@@ -12,6 +12,7 @@ never touched — pure unit-level coverage of the state machine.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -33,6 +34,20 @@ def db(tmp_path):
 # =========================================================================
 # Schema / CRUD
 # =========================================================================
+
+
+class TestStateDbIsOwnerOnly:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes only")
+    def test_state_db_is_readable_by_its_owner_only(self, tmp_path):
+        # The store holds the customer conversation and the drafts the owner approved,
+        # so neither the file nor its directory may be readable by another local account.
+        sdb = BusinessStateDB(tmp_path / "telegram-business" / "state.db")
+        try:
+            path = tmp_path / "telegram-business" / "state.db"
+            assert path.stat().st_mode & 0o077 == 0, oct(path.stat().st_mode)
+            assert path.parent.stat().st_mode & 0o077 == 0, oct(path.parent.stat().st_mode)
+        finally:
+            sdb.close()
 
 
 class TestBusinessConnectionPersistence:

@@ -101,7 +101,9 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
     db = home / "state.db"
     if not db.exists():
         return [], "absent"
-    live = ",".join(f"'{s}'" for s in LIVE_DELEGATION_STATES)
+    # The live states are a fixed tuple, but they travel as bound parameters like
+    # everything else: one interpolation bug never gets a chance to exist.
+    live = ",".join("?" for _ in LIVE_DELEGATION_STATES)
     try:
         conn = _connect_ro(db)
         try:
@@ -115,7 +117,8 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
                     ORDER BY CASE WHEN state IN ({live}) THEN 0 ELSE 1 END,
                              COALESCE(completed_at, dispatched_at) DESC
                     LIMIT ?""",
-                (time.time() - DROPPED_WINDOW_S, limit),
+                (*LIVE_DELEGATION_STATES, time.time() - DROPPED_WINDOW_S,
+                 *LIVE_DELEGATION_STATES, limit),
             ).fetchall()
         finally:
             conn.close()

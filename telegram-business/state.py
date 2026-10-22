@@ -16,6 +16,7 @@ Hermes' core ``state.db`` schema:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -59,14 +60,29 @@ CREATE INDEX IF NOT EXISTS idx_biz_drafts_conn_customer
 """
 
 
+def _restrict_to_owner(path: Path) -> None:
+    """Make ``path`` readable and writable by its owner only (a no-op on Windows).
+
+    The store holds the customer conversation and the drafts the owner approved, so another
+    local account must not read them. Best-effort: a filesystem that does not carry POSIX
+    modes (FAT, a network share) keeps the default permissions rather than failing the plugin.
+    """
+    try:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
+
+
 class BusinessStateDB:
     """Thread-safe SQLite store for connections + drafts."""
 
     def __init__(self, db_path: Path) -> None:
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_to_owner(db_path.parent)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        _restrict_to_owner(db_path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)

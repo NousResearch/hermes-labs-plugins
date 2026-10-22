@@ -29,7 +29,9 @@ already ships.
    - in a Hermes chat, `/browser connect` (launches Chrome with remote debugging on port 9222), or
    - start it yourself: `google-chrome --remote-debugging-port=9222 --user-data-dir=<dir>`, or
    - point Hermes at an existing endpoint with `browser.cdp_url` in `config.yaml`.
-2. Open the page where the workflow starts and keep that tab in front.
+2. Open the page where the workflow starts. With other tabs open, close them first: CDP
+   does not reveal which tab is frontmost, so the recorder captures the browser's first
+   web-page tab (see the One tab limit), which may not be the tab you are looking at.
 3. Run:
 
    ```bash
@@ -116,8 +118,10 @@ Then use the new skill like any other: "log into the shop and check my order sta
 
 ## Limits
 
-- **One tab.** Only the tab in front when recording starts is captured. Flows that open a new tab
-  or a popup stop being recorded at that point.
+- **One tab.** The browser's first web-page tab when recording starts is captured — CDP
+  does not reveal which tab is frontmost, so with several tabs open that may differ from
+  the one you were looking at. Flows that open a new tab or a popup stop being recorded
+  at that point.
 - **Values on change.** A field you never left (no blur, Tab or Enter) may be missing; press Tab
   before `Ctrl-C`.
 - **Only password-like fields are masked.** An API key typed into a plain text field, or a site

@@ -32,6 +32,7 @@ Discard → dropped, the customer sees nothing
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
 - **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — new messages within the debounce window supersede the prior draft, one draft per coherent thought.
+- **Plugin state is owner-only.** `state.db` (customer conversations + drafts) and its directory are created readable and writable only by your user account on POSIX filesystems — a no-op on Windows, where your home directory's ACL already limits access.
 
 ## Requirements
 
