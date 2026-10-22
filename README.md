@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hermes-labs-plugins-banner.jpg" alt="Hermes Labs Plugins: experimental, built by Nous Research, unsupported" width="100%">
+</p>
+
 <h1 align="center">Hermes Labs Plugins ⚗</h1>
 
 <p align="center">
