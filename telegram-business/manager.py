@@ -145,6 +145,12 @@ class BusinessModeManager:
         # Keyed by owner_chat_id → draft_id awaiting the override text.
         self._edit_capture: Dict[str, int] = {}
 
+        # Draft IDs with an in-flight customer send. The pending-status check in
+        # ``handle_callback`` runs before the awaited send, so a second tap on the
+        # same draft gets past it too; this claim set is what stops a double-tap
+        # from delivering the reply twice.
+        self._send_inflight: set[int] = set()
+
     # ------------------------------------------------------------------
     # BusinessConnection updates (established / edited / ended).
     # ------------------------------------------------------------------
@@ -492,6 +498,13 @@ class BusinessModeManager:
                     )
                 )
                 return True
+            # A double-tap delivers two callbacks before the first await settles, so
+            # both pass the pending check and the customer would get the reply twice.
+            # First tap claims the draft; the loser stops here.
+            if draft_id in self._send_inflight:
+                await answer(text="⏳ Already sending that draft.")
+                return True
+            self._send_inflight.add(draft_id)
             try:
                 await self._send(
                     chat_id=int(draft["customer_chat_id"]),
@@ -502,7 +515,8 @@ class BusinessModeManager:
                 logger.warning("Business send failed for draft %s: %s", draft_id, exc)
                 await answer(text=f"⚠️ Send failed: {exc}")
                 return True
-
+            finally:
+                self._send_inflight.discard(draft_id)
             self._db.resolve_telegram_business_draft(
                 draft_id, status="sent", final_sent_text=draft["draft_text"],
             )

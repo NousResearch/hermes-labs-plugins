@@ -534,6 +534,50 @@ class TestCallbackDispatch:
         assert edited and "Sent" in edited[0]["text"]
 
     @pytest.mark.asyncio
+    async def test_double_tap_send_delivers_once(self, db):
+        """Two Send taps arrive as two callbacks before the first send settles.
+
+        The pending-status check runs before any await, so both callbacks get
+        past it; without a claim the customer gets the reply twice.
+        """
+        release = asyncio.Event()
+        calls: List[Dict[str, Any]] = []
+
+        async def _slow_send(**kw):
+            calls.append(kw)
+            if kw.get("chat_id") == 200:  # customer send: hold until released
+                await release.wait()
+            return SimpleNamespace(message_id=1)
+
+        mgr, _ = _make_manager(db, send_recorder=_slow_send)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+
+        answered: List[Dict[str, Any]] = []
+
+        async def _answer(**kw): answered.append(kw)
+        async def _edit(**kw): pass
+
+        first = asyncio.create_task(mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        ))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        ))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        sends_to_customer = [c for c in calls if c.get("chat_id") == 200]
+        assert len(sends_to_customer) == 1
+        assert any("Already sending" in str(a.get("text")) for a in answered)
+        assert db.get_telegram_business_draft(did)["status"] == "sent"
+
+    @pytest.mark.asyncio
     async def test_discard_marks_status(self, db):
         mgr, sender = _make_manager(db)
         await mgr.handle_connection_update(_fake_business_connection())
