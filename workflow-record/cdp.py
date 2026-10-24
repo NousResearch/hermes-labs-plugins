@@ -58,10 +58,15 @@ def discovery_url(raw: str) -> Optional[str]:
         if parts.path not in ("", "/"):
             return None
         scheme = "http" if low.startswith("ws://") else "https"
-        value = f"{scheme}://{parts.netloc}"
+        # Relays in front of a browser carry their credential in the query
+        # (``ws://host:9222/?token=...``); keep it, and keep it after the path.
+        return f"{scheme}://{parts.netloc}/json/version" + (f"?{parts.query}" if parts.query else "")
     elif not low.startswith(("http://", "https://")):
         value = "http://" + value
-    return value if value.lower().endswith("/json/version") else value.rstrip("/") + "/json/version"
+    base, sep, query = value.partition("?")
+    if not base.lower().endswith("/json/version"):
+        base = base.rstrip("/") + "/json/version"
+    return base + sep + query
 
 
 def to_websocket_url(raw: str, timeout: float = 5.0) -> Tuple[str, str]:
