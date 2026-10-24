@@ -312,6 +312,7 @@ class BusinessModeManager:
             )
 
     async def _debounce_then_draft(self, key: str) -> None:
+        task = asyncio.current_task()
         try:
             await asyncio.sleep(self._debounce_seconds)
         except asyncio.CancelledError:
@@ -319,7 +320,12 @@ class BusinessModeManager:
         try:
             await self._run_draft(key)
         finally:
-            self._debounce_tasks.pop(key, None)
+            # Only drop our own entry: a message that arrived while we were being
+            # cancelled has already replaced the slot with its newer task, and
+            # popping blindly deleted that task's handle — after which later
+            # messages could no longer cancel it and an extra timer fired.
+            if self._debounce_tasks.get(key) is task:
+                self._debounce_tasks.pop(key, None)
 
     async def _run_draft(self, key: str) -> None:
         buf = self._debounce_buffers.pop(key, None)
