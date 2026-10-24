@@ -141,9 +141,11 @@ class BusinessModeManager:
         self._debounce_tasks: Dict[str, asyncio.Task] = {}
         self._debounce_buffers: Dict[str, Dict[str, Any]] = {}
 
-        # Owner DMs that are in "next message = edited reply" mode.
-        # Keyed by owner_chat_id → draft_id awaiting the override text.
-        self._edit_capture: Dict[str, int] = {}
+        # Owner DMs in "next message = edited reply" mode, one stack per owner chat
+        # (most recent Edit first). A plain owner_chat_id → draft_id dict lost the
+        # earlier draft when the owner tapped Edit on a second draft: only the last
+        # tap survived and the first draft was never deliverable.
+        self._edit_capture: Dict[str, List[int]] = {}
 
     # ------------------------------------------------------------------
     # BusinessConnection updates (established / edited / ended).
@@ -469,7 +471,7 @@ class BusinessModeManager:
             return True
 
         if choice == CHOICE_EDIT:
-            self._edit_capture[str(conn["owner_chat_id"])] = draft_id
+            self._edit_capture.setdefault(str(conn["owner_chat_id"]), []).append(draft_id)
             await answer(text="✎ Send me the text to deliver")
             try:
                 await edit_message_text(
@@ -534,14 +536,18 @@ class BusinessModeManager:
         Returns True if the message was consumed by the edit-capture flow
         (so the caller shouldn't dispatch it to the normal command path).
         """
-        draft_id = self._edit_capture.pop(str(owner_chat_id), None)
+        owner_key = str(owner_chat_id)
+        capture = self._edit_capture.get(owner_key) or []
+        draft_id = capture.pop() if capture else None
+        if not capture:
+            self._edit_capture.pop(owner_key, None)
         if draft_id is None:
             return False
 
         override = (text or "").strip()
         if not override:
             # Empty edit attempt → restore capture and let the user retry.
-            self._edit_capture[str(owner_chat_id)] = draft_id
+            self._edit_capture.setdefault(owner_key, []).append(draft_id)
             try:
                 await self._send(
                     chat_id=int(owner_chat_id),

@@ -692,6 +692,36 @@ class TestEditCapture:
         )
         assert consumed is False
 
+    @pytest.mark.asyncio
+    async def test_two_pending_edits_are_delivered_newest_first(self, db):
+        """Tapping Edit on two drafts used to keep only the last tap: the first
+        draft's capture was overwritten and its reply could never be delivered."""
+        mgr, sender = _make_manager(db, draft_text="draft")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=201))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=202))
+        drafts = db.get_pending_telegram_business_drafts_for_owner("100")
+        by_chat = {d["customer_chat_id"]: d["draft_id"] for d in drafts}
+
+        async def _answer(**kw): pass
+        async def _edit(**kw): pass
+
+        for chat in (201, 202):
+            await mgr.handle_callback(
+                data=f"bd:edit:{by_chat[str(chat)]}", caller_user_id="42",
+                answer=_answer, edit_message_text=_edit,
+            )
+
+        sender.calls.clear()
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="for 202") is True
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="for 201") is True
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="stray") is False
+
+        to_chat = {c["chat_id"]: c["text"] for c in sender.calls if c.get("chat_id") in (201, 202)}
+        assert to_chat == {202: "for 202", 201: "for 201"}
+        assert db.get_telegram_business_draft(by_chat["201"])["status"] == "edited"
+        assert db.get_telegram_business_draft(by_chat["202"])["status"] == "edited"
+
 
 class TestBizCommand:
     @pytest.mark.asyncio
