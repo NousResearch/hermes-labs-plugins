@@ -335,13 +335,21 @@ def save_recording(recording: Dict[str, Any], slug: str, directory: Optional[Pat
     return path
 
 
+def _mtime(path: Path) -> float:
+    """``stat`` mtime for sorting, or 0.0 when the file vanished mid-listing."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def list_recordings(directory: Optional[Path] = None) -> List[Dict[str, Any]]:
     """Saved recordings, newest first, with step counts and start URLs."""
     rec_dir = directory or recordings_dir()
     if not rec_dir.is_dir():
         return []
     out: List[Dict[str, Any]] = []
-    for path in sorted(rec_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for path in sorted(rec_dir.glob("*.json"), key=_mtime, reverse=True):
         entry: Dict[str, Any] = {"path": str(path), "name": path.name}
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))

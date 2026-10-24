@@ -280,6 +280,26 @@ class TestSaveAndList:
         (tmp_path / "broken.json").write_text("{nope", encoding="utf-8")
         assert list_recordings(directory=tmp_path)[0]["error"] == "unreadable"
 
+    def test_file_removed_during_listing_does_not_crash(self, tmp_path, monkeypatch):
+        """Glob sees a file that is gone by the time the entries are sorted.
+
+        The sort key called ``stat()`` unguarded, so one deletion in that window
+        (a concurrent prune, the user cleaning the folder) raised out of
+        ``hermes record --list`` instead of listing the rest.
+        """
+        from pathlib import Path
+
+        gone = tmp_path / "gone.json"
+        path = save_recording(build_recording("u", "s", []), "kept", directory=tmp_path)
+        real_glob = Path.glob
+        monkeypatch.setattr(
+            Path, "glob",
+            lambda self, pattern: iter([path, gone]) if self == tmp_path else real_glob(self, pattern),
+        )
+        listed = list_recordings(directory=tmp_path)
+        assert [r["name"] for r in listed] == [path.name, gone.name]
+        assert listed[0].get("steps") == 0 and listed[1]["error"] == "unreadable"
+
     def test_list_missing_dir(self, tmp_path):
         assert list_recordings(directory=tmp_path / "nope") == []
 
