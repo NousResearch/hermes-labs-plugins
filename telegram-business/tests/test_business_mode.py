@@ -462,6 +462,47 @@ class TestBusinessMessageDraftFlow:
         owner_dms = [c for c in sender.calls if c.get("chat_id") == 100]
         assert len(owner_dms) == 1
 
+    @pytest.mark.asyncio
+    async def test_superseded_timer_keeps_the_new_slot_handle(self, db):
+        """A timer superseded *while already running* must not pop the new slot.
+
+        The old cleanup popped the key unconditionally, so a timer that was
+        cancelled during its (slow) draft call deleted its replacement's handle:
+        a third message could then no longer cancel anything, and the slot ended
+        up pointing at a dead task.
+        """
+        gate = asyncio.Event()
+        calls = {"n": 0}
+
+        async def _draft(customer_text: str, customer_chat_id: str) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await gate.wait()  # first draft hangs until superseded
+            return "coalesced"
+
+        from telegram_business_plugin.manager import BusinessModeManager
+
+        sender = _SentRecorder()
+        mgr = BusinessModeManager(
+            session_db=db, send_message=sender, draft_generator=_draft, debounce_seconds=0.01,
+        )
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+
+        key = "conn1:200"
+        await mgr.handle_business_message(_fake_business_message(text="one"))
+        await asyncio.sleep(0.03)  # timer fired, generator is blocked
+        await mgr.handle_business_message(_fake_business_message(text="two"))
+        await asyncio.sleep(0.01)  # cancelled timer runs its cleanup
+
+        assert key in mgr._debounce_tasks
+
+        gate.set()
+        await asyncio.sleep(0.1)
+        owner_dms = [c for c in sender.calls if c.get("chat_id") == 100]
+        assert len(owner_dms) == 1
+        assert "two" in owner_dms[0]["text"]
+
 
     @pytest.mark.asyncio
     async def test_owner_outgoing_message_not_drafted(self, db):
