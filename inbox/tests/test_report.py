@@ -52,7 +52,7 @@ def test_render_lists_every_section(hermes_home):
     for needle in ("Needs attention (3)", "GONE (stale checkpoint)", "last run FAILED: boom",
                    "kanban t_blk  [blocked]", "In progress (3)", "npm run dev",
                    "Finished, result not yet delivered (1)", "(result awaiting delivery)",
-                   "Scheduled (2 active job(s))", "ok  next: soon", "Open surfaces (1)"):
+                   "Scheduled (1 active job(s))", "ok  next: soon", "Open surfaces (1)"):
         assert needle in text, needle
     assert "Not read" not in text
 
@@ -92,3 +92,19 @@ def test_state_db_without_delegation_table_degrades(hermes_home):
     data = report.build_inbox()
     assert data["sources"]["delegations"].startswith("unreadable")
     assert "Needs attention (0)" in report.render_inbox(data)
+
+
+def test_scheduled_header_matches_the_jobs_listed(hermes_home):
+    """Enabled jobs without an upcoming run must not inflate the header; with none of
+    them scheduled the section must not print a count and then list nothing."""
+    write_cron(hermes_home, [
+        {"id": "j1", "name": "ok", "enabled": True, "next_run_at": "soon"},
+        {"id": "j2", "name": "one-shot done", "enabled": True},
+    ])
+    text = report.render_inbox(report.build_inbox())
+    assert "Scheduled (1 active job(s))" in text
+    assert "one-shot done" not in text
+
+    write_cron(hermes_home, [{"id": "j2", "name": "one-shot done", "enabled": True}])
+    text = report.render_inbox(report.build_inbox())
+    assert "Scheduled" not in text
