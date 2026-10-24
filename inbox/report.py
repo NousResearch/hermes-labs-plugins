@@ -67,7 +67,9 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
 
 
 def fmt_age(seconds: Any) -> str:
-    if not isinstance(seconds, (int, float)):
+    # bool is an int: a JSON duration that is a flag (``true``) would otherwise print a
+    # plausible "1s" instead of the unknown marker used for real non-durations.
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
         return "?"
     s = int(max(0, seconds))
     if s < 60:
