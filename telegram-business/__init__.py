@@ -59,6 +59,20 @@ _DEFAULT_PERSONA = (
 
 
 def _hermes_home() -> Path:
+    """The active profile's home.
+
+    Core resolves it from a context-local override → ``HERMES_HOME`` → the platform
+    default, while this plugin used to re-implement only the env half: inside a core
+    subprocess whose home comes from the override (a profile switch), state.db and
+    config.yaml landed in the *default* profile's directory. Prefer the host resolver
+    and keep the env-only form as the bare-pytest fallback.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:  # pragma: no cover - core is always importable in Hermes
+        pass
+    else:
+        return get_hermes_home()
     home = os.environ.get("HERMES_HOME")
     if home:
         return Path(home)
