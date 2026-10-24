@@ -307,12 +307,20 @@ class BusinessStateDB:
         return [dict(r) for r in rows]
 
     def expire_telegram_business_drafts(self, *, now: Optional[float] = None) -> int:
+        """Settle pending drafts whose TTL has passed as ``expired``.
+
+        ``now`` is the comparison instant, but ``updated_at`` records when the
+        row was settled — a caller passing a future cut-off (a sweep run ahead
+        of the clock) used to stamp every row with that future instant, so
+        ``updated_at`` could sit past the wall clock and misorder against rows
+        resolved in the normal flow.
+        """
         cutoff = now if now is not None else time.time()
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE business_drafts SET status = 'expired', updated_at = ? "
                 "WHERE status = 'pending' AND expires_at < ?",
-                (cutoff, cutoff),
+                (time.time(), cutoff),
             )
             self._conn.commit()
             return int(cur.rowcount)

@@ -212,6 +212,21 @@ class TestBusinessDraftLifecycle:
         assert db.get_telegram_business_draft(d_old)["status"] == "expired"
         assert db.get_telegram_business_draft(d_new)["status"] == "pending"
 
+    def test_expire_stamps_updated_at_with_the_wall_clock(self, db):
+        """``now`` is the comparison instant; ``updated_at`` must still record
+        when the row was settled, not the (possibly future) cut-off."""
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m", customer_text="hi", draft_text="hello",
+            ttl_seconds=60.0,
+        )
+        before = time.time()
+        cut_off = before + 3600.0
+        assert db.expire_telegram_business_drafts(now=cut_off) == 1
+        row = db.get_telegram_business_draft(did)
+        assert row["status"] == "expired"
+        assert before <= row["updated_at"] < cut_off
+
     def test_get_pending_for_owner(self, db):
         did = db.create_telegram_business_draft(
             connection_id="c1", owner_chat_id="100", customer_chat_id="200",
