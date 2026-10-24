@@ -37,7 +37,13 @@ def pid_alive(pid: Any, expected_start: Any = None) -> bool:
         return False
     if pid <= 0:
         return False
-    import psutil
+    try:
+        import psutil
+    except ImportError:
+        # Optional dependency: an unprobeable host PID is reported alive rather than
+        # GONE, so a psutil-less environment shows the entries instead of flagging
+        # every one of them as an orphan.
+        return True
 
     if not psutil.pid_exists(pid):
         return False
