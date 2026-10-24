@@ -62,6 +62,12 @@ _SECRET_AUTOCOMPLETE_RE = re.compile(
 
 BINDING_NAME = "__hermesRecord"
 
+# The raw buffer is append-only until Ctrl-C and is only read at save time, so a long
+# demonstration on a busy page (or a page firing changes on scroll) grew it without bound.
+# Cap it and drop the OLDEST: the tail is what the user just did, and the earliest steps
+# are the ones worth losing.
+MAX_RAW_EVENTS = 10_000
+
 _SECRET_PLACEHOLDER_RE = re.compile(r"^\{SECRET:[^{}]*\}$")
 
 # Injected with Page.addScriptToEvaluateOnNewDocument (survives navigations) and
@@ -270,6 +276,13 @@ def build_recording(url: str, started_at: str, events: List[Dict[str, Any]]) -> 
     return {"version": RECORDING_VERSION, "started_at": started_at, "url": url, "steps": steps}
 
 
+def _buffer_event(events: List[Dict[str, Any]], event: Dict[str, Any]) -> None:
+    """Append keeping at most ``MAX_RAW_EVENTS`` (oldest dropped first)."""
+    events.append(event)
+    if len(events) > MAX_RAW_EVENTS:
+        del events[0]
+
+
 def handle_cdp_message(msg: Dict[str, Any], events: List[Dict[str, Any]]) -> None:
     """Route one CDP message into the raw event buffer.
 
@@ -284,14 +297,14 @@ def handle_cdp_message(msg: Dict[str, Any], events: List[Dict[str, Any]]) -> Non
         except (json.JSONDecodeError, TypeError):
             return
         if isinstance(payload, dict):
-            events.append(payload)
+            _buffer_event(events, payload)
     elif method == "Page.frameNavigated":
         frame = params.get("frame") or {}
         if frame.get("parentId"):
             return
         url = str(frame.get("url") or "").strip()
         if url and not url.startswith(("about:", "chrome://", "devtools://", "chrome-error://")):
-            events.append({"t": time.time() * 1000.0, "type": "navigate", "url": url})
+            _buffer_event(events, {"t": time.time() * 1000.0, "type": "navigate", "url": url})
 
 
 def recordings_dir() -> Path:
