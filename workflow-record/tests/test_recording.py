@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -91,6 +93,41 @@ class TestMaskValue:
         assert is_secret_placeholder("{SECRET:pw}")
         assert not is_secret_placeholder("hunter2")
         assert not is_secret_placeholder(None)
+
+
+class TestRecorderSelectorEscaping:
+    """Attribute-hook selectors must survive values containing quotes."""
+
+    @staticmethod
+    def _helper() -> str:
+        import re
+
+        from workflow_record_plugin.recording import RECORDER_JS
+
+        match = re.search(r"^  const cssAttr = .*;$", RECORDER_JS, re.M)
+        assert match, "cssAttr helper missing from the recorder JS"
+        return match.group(0)
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_quotes_and_backslashes_are_escaped(self):
+        script = (
+            self._helper()
+            + "\nconsole.log(JSON.stringify(cssAttr('He said \"hi\" \\\\ 100%')));\n"
+        )
+        out = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert json.loads(out) == 'He said \\"hi\\" \\\\ 100%'
+
+    def test_every_attribute_hook_goes_through_the_helper(self):
+        from workflow_record_plugin.recording import RECORDER_JS
+
+        # three uses (data-testid, name, aria-label), all through the helper
+        assert RECORDER_JS.count("cssAttr(") == 3
+        assert "const cssAttr =" in RECORDER_JS
+        assert '="${name}"' not in RECORDER_JS
+        assert '="${aria}"' not in RECORDER_JS
+        assert '="${testId}"' not in RECORDER_JS
 
 
 class TestSelectorFallback:
