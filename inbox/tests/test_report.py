@@ -92,3 +92,14 @@ def test_state_db_without_delegation_table_degrades(hermes_home):
     data = report.build_inbox()
     assert data["sources"]["delegations"].startswith("unreadable")
     assert "Needs attention (0)" in report.render_inbox(data)
+
+
+class TestFmtAge:
+    def test_bool_is_not_a_duration(self):
+        assert report.fmt_age(True) == "?"
+        assert report.fmt_age(False) == "?"
+
+    def test_numbers_still_format(self):
+        assert report.fmt_age(0) == "0s"
+        assert report.fmt_age(90.4) == "1m"
+        assert report.fmt_age(3600) == "1h00m"
