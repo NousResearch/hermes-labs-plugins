@@ -95,7 +95,7 @@ def collect_processes(home: Path) -> tuple[Items, Note]:
     return out, None
 
 
-def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
+def collect_delegations(home: Path, limit: int = 20, *, include_completed: bool = False) -> tuple[Items, Note]:
     """Async delegations from ``state.db``: running ones, finished ones whose result has not
     reached its conversation yet, and results dropped after failed deliveries in the last week."""
     db = home / "state.db"
@@ -104,6 +104,12 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
     # The live states are a fixed tuple, but they travel as bound parameters like
     # everything else: one interpolation bug never gets a chance to exist.
     live = ",".join("?" for _ in LIVE_DELEGATION_STATES)
+    completed_clause = " OR (delivery_state = 'delivered' AND COALESCE(completed_at, dispatched_at) >= ?)" if include_completed else ""
+    cutoff = time.time() - DROPPED_WINDOW_S
+    params = (*LIVE_DELEGATION_STATES, cutoff)
+    if include_completed:
+        params += (cutoff,)
+    params += (*LIVE_DELEGATION_STATES, limit)
     try:
         conn = _connect_ro(db)
         try:
@@ -114,11 +120,11 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
                     WHERE state IN ({live})
                        OR delivery_state = 'pending'
                        OR (delivery_state = 'dropped' AND COALESCE(completed_at, dispatched_at) >= ?)
+                       {completed_clause}
                     ORDER BY CASE WHEN state IN ({live}) THEN 0 ELSE 1 END,
                              COALESCE(completed_at, dispatched_at) DESC
                     LIMIT ?""",
-                (*LIVE_DELEGATION_STATES, time.time() - DROPPED_WINDOW_S,
-                 *LIVE_DELEGATION_STATES, limit),
+                params,
             ).fetchall()
         finally:
             conn.close()

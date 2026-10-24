@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import collectors as c
+from . import herald
+from .threads import build_threads
+from .lanes import build_lanes
 
 # Source name -> what the user sees in the "not read" footer.
 SOURCE_LABELS = {
@@ -16,20 +19,25 @@ SOURCE_LABELS = {
     "cron": "cron jobs (cron/jobs.json)",
     "sessions": "open sessions (runtime/active_sessions.json)",
     "kanban": "kanban board (kanban.db)",
+    "herald": "Herald edges (hermes-herald.db)",
 }
 
 _STALLED_DELEGATION_STATES = ("stalling", "stalled", "unknown")
 _RUNNING_DELEGATION_STATES = ("running", "finalizing")
 
 
-def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
+def build_inbox(home: Optional[Path] = None, fleet: bool = False) -> dict[str, Any]:
     """The full snapshot as JSON-serialisable data. ``home`` defaults to the active profile's."""
     if home is None:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
     processes, n_proc = c.collect_processes(home)
-    delegations, n_del = c.collect_delegations(home)
+    delegations, n_del = c.collect_delegations(home, limit=21, include_completed=True)
+    native_truncated = len(delegations) > 20
+    delegations = delegations[:20]
+    if native_truncated:
+        n_del = "truncated (20 returned)"
     cron_jobs, n_cron = c.collect_cron(home)
     sessions, n_sess = c.collect_sessions(home)
     kanban, n_kan = c.collect_kanban()
@@ -50,7 +58,21 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
     finished = [d for d in delegations
                 if d["state"] not in c.LIVE_DELEGATION_STATES and d["delivery_state"] == "pending"]
 
-    return {
+    sources = {
+        name: note or "read"
+        for name, note in (("processes", n_proc), ("delegations", n_del), ("cron", n_cron),
+                           ("sessions", n_sess), ("kanban", n_kan))
+    }
+
+    herald_edges: list[dict[str, Any]] = []
+    herald_meta: dict[str, Any] = {}
+    if fleet:
+        herald_data = herald.read_fleet(home)
+        sources["herald"] = herald_data["status"]
+        herald_edges = herald_data["edges"]
+        herald_meta = {k: v for k, v in herald_data.items() if k != "edges"}
+
+    snapshot = {
         "generated_at": time.time(),
         "home": str(home),
         "attention": attention,
@@ -58,12 +80,41 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
         "finished_undelivered": finished,
         "cron": cron_jobs,
         "sessions": sessions,
-        "sources": {
-            name: note or "read"
-            for name, note in (("processes", n_proc), ("delegations", n_del), ("cron", n_cron),
-                               ("sessions", n_sess), ("kanban", n_kan))
-        },
+        "native": processes + delegations + kanban,
+        "native_limits": {"delegations": {"limit": 20, "truncated": native_truncated,
+                                            "completed_window_seconds": c.DROPPED_WINDOW_S}},
+        "sources": sources,
+        "herald": herald_edges,
+        "herald_meta": herald_meta,
+        "threads": build_threads(herald_edges),
     }
+    _attach_attention(snapshot, home)
+    snapshot["lanes"] = build_lanes(snapshot)
+    local = snapshot["attention_state"]
+    snapshot["visible_attention"] = [item for item in attention
+        if local.get(f"{item.get('kind')}:{item.get('id')}", {}).get("visible") is not False]
+    return snapshot
+
+
+def _attach_attention(snapshot: dict, home: Path) -> None:
+    from .state import InboxState, InboxStateError
+    from .observations import records
+    from .config_yaml import YAMLError
+    snapshot["attention_state"] = {}
+    snapshot["profile"] = None
+    snapshot["attention_state_status"] = "unknown"
+    try:
+        profile = herald.profile_identity(home)
+        snapshot["profile"] = profile
+        if not profile:
+            return
+        from .attention import AttentionState
+        state = InboxState(home, profile)
+        snapshot["attention_state"] = AttentionState(state).states_for(records(snapshot))
+        snapshot["attention_state_status"] = "read" if state.db_path.exists() else "absent"
+    except (InboxStateError, OSError, ValueError, YAMLError, ImportError) as exc:
+        snapshot["attention_state_status"] = "unreadable"
+        snapshot["attention_state_error"] = type(exc).__name__
 
 
 def fmt_age(seconds: Any) -> str:
@@ -147,9 +198,19 @@ def _section(lines: list[str], title: str, items: list, mark: str, now: float, e
 def render_inbox(data: dict[str, Any]) -> str:
     now = data.get("generated_at") or time.time()
     lines: list[str] = [""]
-    _section(lines, "Needs attention", data.get("attention") or [], "⚠", now, "nothing — all clear")
-    _section(lines, "In progress", data.get("in_progress") or [], "◐", now,
-             "nothing running in the background")
+    meta = data.get("herald_meta") or {}
+    incomplete = (any(v != "read" for v in (data.get("sources") or {}).values())
+                  or meta.get("truncated")
+                  or any(s.get("status") != "read" for s in meta.get("sources", []))
+                  or data.get("attention_state_status") in ("unknown", "unreadable"))
+    empty_attention = "no recorded attention items — coverage incomplete" if incomplete else "no recorded native attention items"
+    empty_running = "no recorded running items — coverage incomplete" if incomplete else "nothing running in the background"
+    visible_attention = data.get("visible_attention", data.get("attention")) or []
+    _section(lines, "Needs attention", visible_attention, "⚠", now, empty_attention)
+    hidden_native = len(data.get("attention") or []) - len(visible_attention)
+    if hidden_native:
+        lines.append(f"  {hidden_native} native attention item(s) hidden locally; source state unchanged.\n")
+    _section(lines, "In progress", data.get("in_progress") or [], "◐", now, empty_running)
     _section(lines, "Finished, result not yet delivered", data.get("finished_undelivered") or [], "✔", now)
 
     active = [j for j in data.get("cron") or [] if j.get("enabled") and not j.get("paused")]
@@ -162,6 +223,48 @@ def render_inbox(data: dict[str, Any]) -> str:
 
     _section(lines, "Open surfaces", data.get("sessions") or [], "◎", now)
 
+    herald_meta = data.get("herald_meta") or {}
+    if herald_meta:
+        lines.append(f"  Herald coverage: {herald_meta.get('coverage', 'unknown')}; "
+                     f"{herald_meta.get('incoming_coverage', 'incoming coverage unknown')}")
+        if herald_meta.get("truncated"):
+            lines.append(f"  Herald results truncated at {herald_meta.get('limit')} edges.")
+
+    herald_edges = data.get("herald") or []
+    if herald_edges:
+        lines.append(f"  ◆ Herald edges ({len(herald_edges)})")
+        lines += [
+            f"    ➤ {e['edge_id']}  [{e.get('dispatch_type')}/{e.get('delivery')}] {e.get('status')}"
+            f"  hop={e.get('hop_count')} origin={e.get('origin_profile')} target={e.get('target_profile')}"
+            f"  dispatched={e.get('dispatched_at')}"
+            for e in herald_edges
+        ]
+        lines.append("")
+
+    work_threads = data.get("threads") or []
+    if work_threads:
+        lines.append(f"  ◆ Work threads ({len(work_threads)})")
+        for thread in work_threads:
+            lines.append(f"    · {thread['id']} execution={thread['execution']} "
+                         f"outcome={thread['outcome']} delivery={','.join(thread['delivery'])}")
+        lines.append("")
+
+    for name, items in (data.get("lanes") or {}).items():
+        visible = [item for item in items if item.get("attention_visible") is not False]
+        lines.append(f"  ◆ {name} ({len(visible)} visible / {len(items)} recorded)")
+        for item in visible:
+            # JSON escaping keeps source-controlled terminal sequences inert.
+            label = json.dumps(str(item["id"]), ensure_ascii=True)[1:-1]
+            owner = json.dumps(str(item.get("owner") or "unknown"), ensure_ascii=True)[1:-1]
+            state = json.dumps(str(item["execution"]), ensure_ascii=True)[1:-1]
+            occurrence = ",".join(str(v) for v in item.get("occurrences", [])) or "unobserved"
+            lines.append(f"    · {item['kind']} {label} owner={owner} execution={state} occurrence={occurrence}")
+        lines.append("")
+    if data.get("lanes"):
+        lines.append("  Recorded snapshots, not live heartbeats. Classification grants no execution permission.")
+        lines.append("  Completion is not accepted outcome; evidence references remain unverified.\n")
+    if data.get("attention_state_status") == "unreadable":
+        lines.append("  Local attention state unreadable; no items suppressed.\n")
     skipped = [f"{SOURCE_LABELS.get(name, name)}: {note}"
                for name, note in (data.get("sources") or {}).items() if note != "read"]
     if skipped:
