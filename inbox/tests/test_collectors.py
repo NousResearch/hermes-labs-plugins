@@ -40,6 +40,21 @@ class TestProcesses:
         # A PID inside a sandbox cannot be probed from the host: unknown, not dead.
         assert procs["sandboxed"]["alive"] is None
 
+    def test_recycled_pid_is_detected_through_the_start_time(self, hermes_home):
+        """A checkpointed PID the OS has since reused is not the old process. The start
+        time in the entry is what tells them apart — the guard sessions already use."""
+        write_processes(hermes_home, [
+            {"session_id": "recycled", "command": "old job", "pid": os.getpid(),
+             "pid_scope": "host", "process_start_time": own_start_time() - 5000.0},
+            {"session_id": "same", "command": "real job", "pid": os.getpid(),
+             "pid_scope": "host", "process_start_time": own_start_time()},
+        ])
+        items, note = c.collect_processes(hermes_home)
+        procs = {p["id"]: p for p in items}
+        assert note is None
+        assert procs["recycled"]["alive"] is False
+        assert procs["same"]["alive"] is True
+
 
 class TestDelegations:
     def test_missing_db_is_noted_absent(self, hermes_home):
