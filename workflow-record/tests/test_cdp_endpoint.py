@@ -29,6 +29,8 @@ from workflow_record_plugin.cdp import (
     ("http://h:1/json/version", "http://h:1/json/version"),
     ("ws://127.0.0.1:9222/devtools/browser/abc", None),
     ("ws://cloud.example/session/xyz", None),
+    ("ws://127.0.0.1:9222/?token=abc", "http://127.0.0.1:9222/json/version?token=abc"),
+    ("wss://relay.example:443?token=abc", "https://relay.example:443/json/version?token=abc"),
 ])
 def test_discovery_url(raw, expected):
     assert discovery_url(raw) == expected
