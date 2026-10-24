@@ -661,6 +661,13 @@ class BusinessModeManager:
 
         if sub in {"off", "on"} and len(args) >= 2:
             chat_arg = args[1].strip()
+            if not chat_arg.lstrip("-").isdigit():
+                return (
+                    f"'{chat_arg}' isn't a chat id. Telegram chat ids are numbers — "
+                    "reply to the customer's message and read the id, e.g. /biz off 123456789.\n"
+                    "  /biz off <id>    — mute drafting for one customer chat\n"
+                    "  /biz on  <id>    — re-enable it"
+                )
             if not active:
                 return "You don't have any active business connections."
             updated = 0

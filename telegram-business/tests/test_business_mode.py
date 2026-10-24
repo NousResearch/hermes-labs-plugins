@@ -750,6 +750,28 @@ class TestBizCommand:
         )
         assert "Usage" in reply
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arg", ["@acme", "carol", "12x"])
+    async def test_off_rejects_a_non_numeric_chat_id(self, db, arg):
+        """The id is echoed back as `muted`, so a word would confirm a mute with no
+        effect; reject it and point at the numeric id instead."""
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        reply = await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["off", arg],
+        )
+        assert "isn't a chat id" in reply
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == []
+
+    @pytest.mark.asyncio
+    async def test_off_accepts_a_negative_group_id(self, db):
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["off", "-100123"],
+        )
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == ["-100123"]
+
 
 class TestDraftTtlEnforcement:
     """The README's "stale buttons no-op" promise: the store's expire helper is not
