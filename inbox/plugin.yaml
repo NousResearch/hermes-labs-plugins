@@ -1,10 +1,10 @@
 name: inbox
-version: 0.1.0
+version: 0.2.0
 description: >
-  hermes inbox: one read-only view of everything in flight for the active
-  profile. Stalled or dropped delegations, failed cron runs, orphaned
-  background processes and blocked kanban tasks; running work; finished
-  delegation results not yet delivered; upcoming cron jobs; open chat
-  surfaces. --json for scripts.
+  Inbox: source-backed activity snapshots, same-host Herald work
+  threads, independent observation cursors, local acknowledgment/snooze and
+  evidence-aware attention lanes. Native stores remain read-only.
 author: "Nous Research"
 homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/inbox
+python_dependencies:
+  - ruamel.yaml==0.18.16

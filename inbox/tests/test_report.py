@@ -57,12 +57,14 @@ def test_render_lists_every_section(hermes_home):
     assert "Not read" not in text
 
 
-def test_empty_home_all_clear_and_sources_named(hermes_home):
+def test_empty_home_is_unknown_and_sources_named(hermes_home):
     data = report.build_inbox()
     assert data["attention"] == [] and data["in_progress"] == [] and data["finished_undelivered"] == []
-    assert data["sources"] == {name: "absent" for name in report.SOURCE_LABELS}
+    assert data["sources"] == {name: "absent" for name in report.SOURCE_LABELS if name != "herald"}
+    assert data["herald"] == []
     text = report.render_inbox(data)
-    assert "nothing — all clear" in text and "nothing running in the background" in text
+    assert "all clear" not in text and "nothing running in the background" not in text
+    assert "coverage incomplete" in text
     assert "async delegations (state.db): absent" in text
     json.dumps(data)
 
