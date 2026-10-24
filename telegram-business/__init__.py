@@ -79,10 +79,17 @@ def _plugin_config(ctx: Any) -> dict:
               owner_persona: "..."
     """
     try:
-        import yaml
+        # Core ships hermes_yaml (ruamel-based) and every plugin runs inside Hermes with
+        # core importable; PyYAML is only the fallback for a bare pytest checkout. A bare
+        # ``import yaml`` used to fail on any install without PyYAML, and the broad except
+        # below then turned every configured value into its default silently.
+        try:
+            import hermes_yaml as yaml
+        except ImportError:  # pragma: no cover - core always provides hermes_yaml
+            import yaml
         cfg_path = _hermes_home() / "config.yaml"
         if cfg_path.exists():
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
             entries = ((raw.get("plugins") or {}).get("entries") or {})
             block = entries.get("telegram-business") or {}
             if isinstance(block, dict):
@@ -92,11 +99,32 @@ def _plugin_config(ctx: Any) -> dict:
     return {}
 
 
+def _as_float(value: Any, default: float) -> float:
+    """``value`` as a float, or ``default`` when the YAML holds junk.
+
+    Config typos must not take the whole adapter down: ``register()`` coerces before
+    anything is wired, so a bare ``float("soon")`` would raise out of plugin loading
+    and no handler (not even the owner DM) would ever be registered.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    """``value`` as an int, or ``default`` (same reasoning as ``_as_float``)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def register(ctx: Any) -> None:
     cfg = _plugin_config(ctx)
-    debounce = float(cfg.get("debounce_seconds", 8.0))
-    ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
-    max_chars = int(cfg.get("max_customer_text_chars", 4000))
+    debounce = _as_float(cfg.get("debounce_seconds"), 8.0)
+    ttl_hours = _as_float(cfg.get("draft_ttl_hours"), 24.0)
+    max_chars = _as_int(cfg.get("max_customer_text_chars"), 4000)
     persona = str(cfg.get("owner_persona") or _DEFAULT_PERSONA)
 
     # Deferred singletons — constructed on first connect so import stays light.
