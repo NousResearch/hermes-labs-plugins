@@ -108,3 +108,14 @@ def test_scheduled_header_matches_the_jobs_listed(hermes_home):
     write_cron(hermes_home, [{"id": "j2", "name": "one-shot done", "enabled": True}])
     text = report.render_inbox(report.build_inbox())
     assert "Scheduled" not in text
+
+
+class TestFmtAge:
+    def test_bool_is_not_a_duration(self):
+        assert report.fmt_age(True) == "?"
+        assert report.fmt_age(False) == "?"
+
+    def test_numbers_still_format(self):
+        assert report.fmt_age(0) == "0s"
+        assert report.fmt_age(90.4) == "1m"
+        assert report.fmt_age(3600) == "1h00m"
