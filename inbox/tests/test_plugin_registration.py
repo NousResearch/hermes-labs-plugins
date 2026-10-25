@@ -47,7 +47,9 @@ def enabled_manager(hermes_home):
 
 def test_disabled_plugin_registers_nothing(hermes_home):
     _install(hermes_home, enabled=False)
-    assert "inbox" not in _manager()._cli_commands
+    manager = _manager()
+    assert "inbox" not in manager._cli_commands
+    assert "inbox" not in manager._plugin_commands
 
 
 def test_enabled_plugin_registers_the_command(enabled_manager):
@@ -71,3 +73,28 @@ def test_json_flag(enabled_manager, hermes_home, capsys):
     assert data["home"] == str(hermes_home)
     assert data["generated_at"] <= time.time()
     assert set(data) >= {"attention", "in_progress", "finished_undelivered", "cron", "sessions", "sources"}
+
+
+def test_enabled_plugin_registers_the_slash_command(enabled_manager):
+    assert enabled_manager._plugin_commands["inbox"]["plugin"] == "inbox"
+
+
+def test_slash_command_handler_returns_the_inbox(enabled_manager, hermes_home):
+    write_cron(hermes_home, [{"id": "j", "name": "nightly", "enabled": True, "last_status": "error",
+                              "last_error": "timeout", "next_run_at": "2026-10-22T03:00:00"}])
+    text = enabled_manager._plugin_commands["inbox"]["handler"]("")
+    assert isinstance(text, str)
+    assert "nightly" in text
+    assert len(text) < 4096
+
+
+def test_slash_command_handler_truncates_oversized_reports(enabled_manager, hermes_home):
+    write_cron(hermes_home, [
+        {"id": f"job-{i}", "name": f"nightly-{i}-" + "n" * 60, "enabled": True,
+         "last_status": "error", "last_error": "timeout-" + "e" * 80,
+         "next_run_at": "2026-10-22T03:00:00"}
+        for i in range(80)
+    ])
+    text = enabled_manager._plugin_commands["inbox"]["handler"]("")
+    assert len(text) < 4096
+    assert text.endswith("\n… (truncated)")
