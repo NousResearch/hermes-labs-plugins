@@ -28,7 +28,7 @@ class TestCopilotCatalogApiKeyResolution:
             "agent.credential_pool.read_credential_pool",
             return_value=[{"access_token": "gho_abc123"}],
         ), patch.object(copilot_credentials, "exchange_copilot_token",
-            return_value=("tid_exchanged_xyz", 1234567890.0),
+            return_value=("tid_exchanged_xyz", 1234567890.0, None),
         ):
             assert _resolve_copilot_catalog_api_key() == "tid_exchanged_xyz"
 
@@ -44,7 +44,7 @@ class TestCopilotCatalogApiKeyResolution:
             attempts.append(raw_token)
             if raw_token == "gho_unsupported_account":
                 raise ValueError("Copilot token exchange failed: HTTP 401")
-            return ("tid_from_second", 1234567890.0)
+            return ("tid_from_second", 1234567890.0, None)
 
         with patch.object(
             copilot_credentials, "resolve_copilot_token", return_value=("", ""),
