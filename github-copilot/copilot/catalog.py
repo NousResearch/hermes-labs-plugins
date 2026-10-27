@@ -78,32 +78,37 @@ def _first_exchangeable_copilot_token(raw_tokens) -> str:
     return ""
 
 
-def _resolve_copilot_catalog_api_key() -> str:
-    """Best-effort Copilot API token for the catalog: the exchanged env token (COPILOT_GITHUB_TOKEN,
-    GH_TOKEN, GITHUB_TOKEN), then ``auth.json`` ``credential_pool.copilot[]`` (a ``hermes auth add
-    copilot`` login). Without the pool, keyless users see the picker fall back to the stale curated
-    list on a silent 401."""
-    def _env_token() -> str:
+def _resolve_copilot_catalog_api_key_candidates() -> list[str]:
+    """Best-effort Copilot catalog credentials, in order: the exchanged env token (COPILOT_GITHUB_TOKEN,
+    GH_TOKEN, GITHUB_TOKEN), then the first exchangeable ``auth.json`` ``credential_pool.copilot[]``
+    entry (a ``hermes auth add copilot`` login). Only if no pool entry exchanges, the valid raw pool
+    tokens in order: ``/models`` may accept a credential whose ``/copilot_internal`` exchange fails
+    (#49). Without the pool, keyless users see the picker fall back to the stale curated list."""
+    try:
         from .credentials import get_copilot_api_token, resolve_copilot_token
 
         raw, _source = resolve_copilot_token()
-        return get_copilot_api_token(raw)[0] if raw else ""
-
-    def _pool_token() -> str:
+        if raw and (token := get_copilot_api_token(raw)[0]):
+            return [token]
+    except Exception:
+        pass
+    try:
         from agent.credential_pool import read_credential_pool
+        from .credentials import validate_copilot_token
 
-        return _first_exchangeable_copilot_token(
-            entry.get("access_token") for entry in read_credential_pool("copilot") if isinstance(entry, dict))
+        raw_tokens = [str(entry.get("access_token") or "").strip()
+                      for entry in read_credential_pool("copilot") if isinstance(entry, dict)]
+        if token := _first_exchangeable_copilot_token(raw_tokens):
+            return [token]
+        return list(dict.fromkeys(raw for raw in raw_tokens if raw and validate_copilot_token(raw)[0]))
+    except Exception:
+        return []
 
-    sources = (_env_token, _pool_token)
-    for source in sources:
-        try:
-            token = source()
-        except Exception:
-            continue
-        if token:
-            return token
-    return ""
+
+def _resolve_copilot_catalog_api_key() -> str:
+    """The first catalog credential, for single-key callers."""
+    candidates = _resolve_copilot_catalog_api_key_candidates()
+    return candidates[0] if candidates else ""
 
 
 # ─── live /models catalog ───
@@ -216,9 +221,10 @@ def copilot_picker_catalog(force_refresh: bool = False) -> Optional[list[str]]:
     try:
         # Provider listings (``hermes status``, pickers, Desktop) warm every listed provider's
         # catalog; a home that never chose Copilot keeps the curated list and GitHub is not called.
-        live = _fetch_github_models(_resolve_copilot_catalog_api_key()) if github_calls_allowed() else None
-        if live:
-            return live
+        # Raw fallbacks are sent only to COPILOT_MODELS_URL; the first account that lists models wins.
+        for api_key in (_resolve_copilot_catalog_api_key_candidates() or [""]) if github_calls_allowed() else ():
+            if live := _fetch_github_models(api_key):
+                return live
     except Exception:  # the picker degrades to the curated list on any catalog failure
         logger.debug("copilot live catalog fetch failed", exc_info=True)
     return None
