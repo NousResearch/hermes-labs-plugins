@@ -91,13 +91,15 @@ class TestTurnAttribution:
 ])
 def test_x_initiator_on_the_wire_of_a_user_turn(url, initiator):
     """What a real ``AIAgent.chat`` turn sends: ``user`` on api.githubcopilot.com, the client default
-    ``agent`` on a plan host, by design (as in Hermes core); see README § Premium requests."""
+    ``agent`` on a plan host, by design (as in Hermes core); see README § Premium requests. Every
+    request also carries the pinned Copilot API version header (#46)."""
     from conftest import offline_chat_turn
 
     requests = offline_chat_turn(url, model="gpt-4.1")
     assert requests, "the turn sent no chat request"
     assert requests[0].headers.get("x-initiator") == initiator
     assert requests[0].headers.get("copilot-integration-id") == "vscode-chat"
+    assert requests[0].headers.get("x-github-api-version") == "2026-08-01"
 
 
 @pytest.mark.parametrize("url, owned", [

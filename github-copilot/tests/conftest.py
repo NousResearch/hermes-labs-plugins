@@ -162,7 +162,8 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("USERPROFILE", str(user_home))
     for var in (*TOKEN_ENV_VARS, "COPILOT_API_BASE_URL", "COPILOT_ACP_BASE_URL", "HERMES_COPILOT_ACP_COMMAND",
-                "COPILOT_CLI_PATH", "HERMES_COPILOT_ACP_ARGS", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
+                "COPILOT_CLI_PATH", "HERMES_COPILOT_ACP_ARGS", "HERMES_COPILOT_API_VERSION",
+                "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
                 "HERMES_DELEGATED_CHILD_CONTEXT"):
         monkeypatch.delenv(var, raising=False)
     return home

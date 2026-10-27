@@ -47,7 +47,12 @@ Or set a token. The first supported one wins, in the Copilot CLI's order:
 
 Supported token types: OAuth `gho_*`, GitHub App `ghu_*`, fine-grained PAT `github_pat_*` with the
 Copilot Requests permission. Classic PATs (`ghp_*`) are rejected by the Copilot API.
-`COPILOT_API_BASE_URL` overrides the API base URL.
+`COPILOT_API_BASE_URL` overrides the API base URL. Requests pin the Copilot API version
+(`X-GitHub-Api-Version: 2026-08-01`) so `/models` reports the account's real long-context limits
+instead of legacy defaults; override the date with `HERMES_COPILOT_API_VERSION` if GitHub retires
+or advances it. The value must be a `YYYY-MM-DD` date: a malformed one is not silently ignored —
+every request fails loudly with `400 invalid apiVersion`, so check the value you set first when
+requests start failing.
 
 `GH_TOKEN` and `GITHUB_TOKEN` are shared with other GitHub tools, so on their own they never make Hermes
 contact GitHub. The plugin calls GitHub (token exchange, model list) only once you have chosen Copilot:
@@ -85,8 +90,9 @@ the GitHub Copilot CLI".
 
 - `copilot` talks to `github.com` (device-code login), `api.github.com` (`/copilot_internal/v2/token`,
   the GitHub → Copilot token exchange) and `api.githubcopilot.com` / your plan's Copilot host /
-  `models.github.ai` (model list and inference). Requests carry VS Code-style editor headers
-  (`Editor-Version`, `Copilot-Integration-Id: vscode-chat`), as Copilot requires.
+  `models.github.ai` (model list and inference). Requests to the `githubcopilot.com` hosts carry
+  VS Code-style editor headers (`Editor-Version`, `Copilot-Integration-Id: vscode-chat`) and the
+  Copilot API version header (`X-GitHub-Api-Version`), as Copilot requires.
 - Tokens are stored by Hermes: the pool in `$HERMES_HOME/auth.json` (`hermes auth add`), env tokens in
   `$HERMES_HOME/.env`, and the exchanged Copilot token (~30 min lifetime) in
   `$HERMES_HOME/.copilot_jwt.json` (mode 0600) so a restart during a network blip can reuse it.

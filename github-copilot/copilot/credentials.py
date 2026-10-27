@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.secret_scope import get_secret
+from agent.secret_scope import UnscopedSecretError, get_secret
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -421,10 +421,40 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
         return raw_token, None
 
 
+# X-GitHub-Api-Version pins the Copilot API generation: without it /models serves legacy
+# default-tier limits (claude-opus-5.5 as 200K, no billing tiers — issue #46), so long-context
+# models resolve ~5x too small. GitHub REST and the Copilot backend use SEPARATE version
+# namespaces that reject each other's dates — REST (api.github.com) 400s on this value, and the
+# Copilot backend 400s "invalid apiVersion" on REST-supported dates (both directions verified
+# live in hermes-agent#126897) — so never send it to the token exchange and never "fix" the date
+# to a REST-supported value. Copilot exposes no version/deprecation headers and no versions
+# endpoint, so the date cannot be discovered at runtime.
+_COPILOT_API_VERSION = "2026-08-01"
+
+
+def _copilot_api_version() -> str:
+    """Pinned Copilot API date, overridable via ``HERMES_COPILOT_API_VERSION`` (empty → the pin).
+
+    Fail-open: under the multiplex gateway get_secret raises by design when no profile scope is
+    installed, and a header builder must not crash a turn over a compatibility date — the pin
+    applies to every profile alike.
+    """
+    try:
+        return (get_secret("HERMES_COPILOT_API_VERSION") or "").strip() or _COPILOT_API_VERSION
+    except UnscopedSecretError:
+        # The one designed raise on this path (multiplex on, no scope installed). The pin applies
+        # to every profile alike, so fail open; anything else is an infrastructure fault the token
+        # read on the same path already lets propagate.
+        logger.debug("HERMES_COPILOT_API_VERSION: unscoped secret read; using pinned date",
+                     exc_info=True)
+        return _COPILOT_API_VERSION
+
+
 def copilot_request_headers(
     *, is_agent_turn: bool = True, is_vision: bool = False) -> dict[str, str]:
     """Build the standard headers for Copilot API requests."""
     headers: dict[str, str] = {"Editor-Version": _EDITOR_VERSION, "User-Agent": "HermesAgent/1.0",
+                               "X-GitHub-Api-Version": _copilot_api_version(),
                                "Copilot-Integration-Id": "vscode-chat",
                                "Openai-Intent": "conversation-edits",
                                "x-initiator": "agent" if is_agent_turn else "user"}

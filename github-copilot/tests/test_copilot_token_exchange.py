@@ -54,6 +54,19 @@ class TestExchangeCopilotToken:
         assert req.get_header("Authorization") == "token gho_test123"
         assert "GitHubCopilotChat" in req.get_header("User-agent")
 
+    @patch("urllib.request.urlopen")
+    def test_exchange_does_not_send_api_version(self, mock_urlopen, monkeypatch):
+        """The exchange hits api.github.com, whose REST version namespace 400s on the Copilot
+        date (hermes-agent#126897); X-GitHub-Api-Version must stay off it even when the env
+        override is set — the versioned behavior lives on the Copilot service API surface."""
+        from github_copilot_plugin.copilot.credentials import exchange_copilot_token
+
+        monkeypatch.setenv("HERMES_COPILOT_API_VERSION", "2026-09-01")
+        mock_urlopen.return_value = self._mock_urlopen(token="tid=abc;exp=999")
+        exchange_copilot_token("gho_test123")
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-github-api-version") is None
+
 
     @patch("urllib.request.urlopen")
     def test_raises_on_empty_token(self, mock_urlopen):
