@@ -88,6 +88,39 @@ class TestCallerIntegration:
         mock_exchange.assert_called_once_with("gho_raw")
 
 
+class TestFineGrainedPat:
+    """A fine-grained PAT is the bearer token itself: the exchange endpoint 404s for it, so the
+    exchange and its "degraded to RAW token" warning would be paid on every process for nothing."""
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_pat_is_never_exchanged(self, mock_urlopen, mock_sleep):
+        from github_copilot_plugin.copilot.credentials import get_copilot_api_token
+
+        assert get_copilot_api_token("github_pat_fine") == ("github_pat_fine", None)
+        mock_urlopen.assert_not_called()
+        mock_sleep.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_pool_entry_keeps_the_pat_and_does_not_warn(self, mock_urlopen):
+        from types import SimpleNamespace
+
+        entry = SimpleNamespace(access_token="", base_url=None)
+        assert copilot_credentials.CopilotCredentialsMixin().prepare_pool_entry(
+            entry, "github_pat_fine") == "github_pat_fine"
+        mock_urlopen.assert_not_called()
+        # The once-per-token raw-degradation warning is for failed exchanges only.
+        assert copilot_credentials._RAW_DEGRADATION_WARNED == set()
+
+    @patch("urllib.request.urlopen")
+    def test_401_refresh_keeps_the_pat(self, mock_urlopen, monkeypatch):
+        from github_copilot_plugin.copilot.credentials import _revalidate_in_memory_token
+
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_fine")
+        assert _revalidate_in_memory_token() == ("github_pat_fine", None)
+        mock_urlopen.assert_not_called()
+
+
 class TestDeriveBaseUrlFromProxyEp:
     """Tests for _derive_base_url_from_proxy_ep()."""
 

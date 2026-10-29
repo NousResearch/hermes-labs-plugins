@@ -82,6 +82,26 @@ class TestRequestHeaders:
         headers = copilot_request_headers()
         assert "Copilot-Vision-Request" not in headers
 
+    def test_exchanged_token_keeps_vscode_attribution(self):
+        from github_copilot_plugin.copilot.credentials import copilot_request_headers
+        headers = copilot_request_headers(token="tid=abc;exp=1")
+        assert headers["Copilot-Integration-Id"] == "vscode-chat"
+        assert headers["Editor-Version"].startswith("vscode/")
+
+    def test_fine_grained_pat_claims_the_cli_attribution(self):
+        """The VS Code ids answer a fine-grained PAT with 400 "Personal Access Tokens are not
+        supported for this endpoint"; the CLI identity is the one the API serves it under."""
+        from github_copilot_plugin.copilot.credentials import copilot_request_headers
+        headers = copilot_request_headers(token="github_pat_abc")
+        assert headers["Copilot-Integration-Id"] == "copilot-developer-cli"
+        assert headers["Editor-Version"].startswith("copilot/")
+        assert headers["x-initiator"] == "agent"
+
+    def test_env_token_selects_the_attribution_without_a_token_argument(self, monkeypatch):
+        from github_copilot_plugin.copilot.credentials import copilot_request_headers
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_env")
+        assert copilot_request_headers()["Copilot-Integration-Id"] == "copilot-developer-cli"
+
 
 class TestCopilotDefaultHeaders:
     """The catalog module's copilot_default_headers uses copilot_credentials."""
