@@ -33,6 +33,13 @@ _CLASSIC_PAT_PREFIX = "ghp_"  # rejected by the Copilot API
 # Token families the Copilot API exchanges. Anything else (a random string in GITHUB_TOKEN) used
 # to pass validation and then fail downstream with an opaque auth error (#12650).
 _SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
+# A fine-grained PAT is a usable bearer token for the API, but only under the Copilot CLI's own
+# attribution: the VS Code ids answer "Personal Access Tokens are not supported for this endpoint"
+# (400). The exchange endpoint 404s for it, so it is never exchanged. Exchanged (gho_/ghu_) tokens
+# keep the VS Code identity, which the exchange itself requires.
+_PAT_PREFIX = "github_pat_"
+_PAT_EDITOR_VERSION = "copilot/1.0.99"
+_PAT_INTEGRATION_ID = "copilot-developer-cli"
 COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
@@ -54,6 +61,19 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
             "Unsupported GitHub token format for the Copilot API. "
             f"Supported token prefixes: {', '.join(_SUPPORTED_PREFIXES)}.")
     return True, "OK"
+
+
+def _is_fine_grained_pat(token: str) -> bool:
+    return str(token or "").strip().startswith(_PAT_PREFIX)
+
+
+def _env_attribution_token() -> str:
+    """First non-empty Copilot env token, for callers that have no token at hand."""
+    for env_var in COPILOT_ENV_VARS:
+        val = (get_secret(env_var) or "").strip()
+        if val:
+            return val
+    return ""
 
 
 def resolve_copilot_token() -> tuple[str, str]:
@@ -470,8 +490,11 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
 
 def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     """``(api_token, base_url)`` from the exchange, or ``(raw_token, None)`` when it fails
-    (accounts that don't need exchange keep working)."""
+    (accounts that don't need exchange keep working). A fine-grained PAT is returned as-is: the
+    exchange endpoint 404s for it while the API takes it directly as the bearer token."""
     if not raw_token:
+        return raw_token, None
+    if _is_fine_grained_pat(raw_token):
         return raw_token, None
     try:
         api_token, _, base_url = exchange_copilot_token(raw_token)
@@ -482,15 +505,24 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
 
 
 def copilot_request_headers(
-    *, is_agent_turn: bool = True, is_vision: bool = False) -> dict[str, str]:
-    """Build the standard headers for Copilot API requests."""
-    headers: dict[str, str] = {"Editor-Version": _EDITOR_VERSION, "User-Agent": "HermesAgent/1.0",
-                               "Copilot-Integration-Id": "vscode-chat",
-                               "Openai-Intent": "conversation-edits",
-                               "x-initiator": "agent" if is_agent_turn else "user",
-                               # Without a dated API version /models caps Claude/GPT-6 at 200-272K
-                               # max_prompt_tokens; with it the real window (~936K-1M) is reported.
-                               "X-GitHub-Api-Version": _GITHUB_API_VERSION}
+    *, is_agent_turn: bool = True, is_vision: bool = False,
+    token: str = "") -> dict[str, str]:
+    """Build the standard headers for Copilot API requests.
+
+    ``token`` selects the caller attribution: a fine-grained PAT must present the Copilot CLI
+    identity, every other token keeps the VS Code one. Falls back to the Copilot env vars when
+    the caller has no token at hand.
+    """
+    is_pat = _is_fine_grained_pat(token or _env_attribution_token())
+    headers: dict[str, str] = {
+        "Editor-Version": _PAT_EDITOR_VERSION if is_pat else _EDITOR_VERSION,
+        "User-Agent": "HermesAgent/1.0",
+        "Copilot-Integration-Id": _PAT_INTEGRATION_ID if is_pat else "vscode-chat",
+        "Openai-Intent": "conversation-edits",
+        "x-initiator": "agent" if is_agent_turn else "user",
+        # Without a dated API version /models caps Claude/GPT-6 at 200-272K
+        # max_prompt_tokens; with it the real window (~936K-1M) is reported.
+        "X-GitHub-Api-Version": _GITHUB_API_VERSION}
     if is_vision:
         headers["Copilot-Vision-Request"] = "true"
     return headers
@@ -580,6 +612,8 @@ def _reexchange_stale_token() -> Optional[tuple[str, Optional[str]]]:
     if not isinstance(api_token, str) or not api_token.strip():
         return None
     if api_token == raw_token and not enterprise_base_url:
+        if _is_fine_grained_pat(raw_token):
+            return None  # never exchanged by design: nothing to redo
         logger.warning(
             "Copilot stale-credential recovery: exchange still degraded to raw token; skipping retry "
             "(network/exchange endpoint unavailable)."
@@ -595,6 +629,8 @@ def _revalidate_in_memory_token() -> Optional[tuple[str, Optional[str]]]:
     raw_token, _source = resolve_copilot_token()
     if not str(raw_token or "").strip():
         return None
+    if _is_fine_grained_pat(raw_token):
+        return raw_token, None  # never exchanged; the PAT itself is the long-lived bearer
     _jwt_cache.pop(_token_fingerprint(raw_token), None)
     api_token, _expires_at, base_url = exchange_copilot_token(raw_token)
     return api_token, base_url
@@ -669,7 +705,8 @@ class CopilotCredentialsMixin:
             return api_key  # already an exchanged API token
         api_token, enterprise_base_url = get_copilot_api_token(api_key)
         if api_token == api_key and not enterprise_base_url:
-            _warn_raw_degradation_once(api_key)
+            if not _is_fine_grained_pat(api_key):
+                _warn_raw_degradation_once(api_key)
             return api_key
         entry.access_token = api_token
         if enterprise_base_url:
@@ -704,8 +741,8 @@ class CopilotCredentialsMixin:
                 api_token, enterprise_base_url = get_copilot_api_token(token)
                 # A failed exchange falls back to the RAW token, which the Copilot API routes to the
                 # "copilot-language-server" integrator whose allowlist omits enterprise-only models
-                # -> HTTP 400 on every turn. Surface it once.
-                if api_token == token and not enterprise_base_url:
+                # -> HTTP 400 on every turn. Surface it once. A fine-grained PAT is raw by design.
+                if api_token == token and not enterprise_base_url and not _is_fine_grained_pat(token):
                     _warn_raw_degradation_once(token)
             return [{"source": source_name, "access_token": api_token, "base_url": enterprise_base_url,
                      "label": source}]
