@@ -176,9 +176,11 @@ def _model_flow_copilot(current_model):
 
 
 def _drop_saved_api_mode() -> None:
-    from hermes_cli.config import load_config, save_config
+    """Remove the ``model.api_mode`` the user's own config.yaml carries (read raw, so a value from the
+    managed overlay or the defaults is never popped and re-saved)."""
+    from hermes_cli.config import read_raw_config, save_config
 
-    cfg = load_config()
+    cfg = read_raw_config()
     model = cfg.get("model") if isinstance(cfg, dict) else None
     if isinstance(model, dict) and model.pop("api_mode", None) is not None:
         save_config(cfg)

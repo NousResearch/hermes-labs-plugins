@@ -1,8 +1,9 @@
 """GitHub Copilot wire quirks: per-model api_mode, editor/initiator/vision headers, max-tokens param.
 
-Fills the generic ProviderProfile wire seams (``providers/base.py`` L1 block). Every hook here is
-pure and answers from the arguments alone, except ``api_mode_for_model`` with an ``api_key``, which
-may read the account's cached live catalog to normalize the model id first.
+Fills the generic ProviderProfile wire seams (``providers/base.py`` L1 block). Every hook here answers
+from its arguments alone, except ``api_mode_for_model``, which reads ``COPILOT_API_BASE_URL`` and the
+cached config (``model.base_url`` / ``model.api_mode``) and, with an ``api_key``, the account's cached
+live catalog to normalize the model id first.
 """
 
 from __future__ import annotations
@@ -46,10 +47,21 @@ def core_serves_anthropic_bearer() -> bool:
 _MESSAGES_UNSUPPORTED_SUFFIXES = ("-fast",)
 
 
+def _copilot_model_config() -> dict:
+    """config.yaml's ``model`` section when its provider is a Copilot id, else ``{}`` (cached, read-only)."""
+    from hermes_cli.config import load_config_readonly
+
+    from .activation import COPILOT_PROVIDER_IDS
+
+    model = (load_config_readonly() or {}).get("model")
+    if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() in COPILOT_PROVIDER_IDS:
+        return model
+    return {}
+
+
 def _configured_base_url() -> str:
     """The Copilot API base URL the user pointed Hermes at: ``COPILOT_API_BASE_URL``, else a Copilot
     ``model.base_url`` in config.yaml, else the default (the token exchange only ever hands out Copilot hosts)."""
-    from .activation import COPILOT_PROVIDER_IDS
     from .catalog import COPILOT_BASE_URL
 
     try:
@@ -58,23 +70,39 @@ def _configured_base_url() -> str:
         env_url = (get_secret("COPILOT_API_BASE_URL") or "").strip()
         if env_url:
             return env_url
-        from hermes_cli.config import load_config
-
-        model = (load_config() or {}).get("model")
-        if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() in COPILOT_PROVIDER_IDS:
-            return str(model.get("base_url") or "").strip() or COPILOT_BASE_URL
+        return str(_copilot_model_config().get("base_url") or "").strip() or COPILOT_BASE_URL
     except Exception:  # an unreadable config/secret store keeps the default host
         pass
     return COPILOT_BASE_URL
 
 
+# Wires earlier versions of this plugin's setup saved as ``model.api_mode`` (``model_api_mode`` of the model
+# picked then). Core honors a saved mode over the profile, except that it rescues ``codex_responses`` to
+# ``chat_completions`` only when the profile answers ``chat_completions`` for the target model.
+_LEGACY_SAVED_API_MODES = frozenset({"chat_completions", "codex_responses"})
+
+
+def _legacy_api_mode_saved() -> bool:
+    """Whether the user's config still pins a Copilot ``model.api_mode`` an earlier setup saved. While it
+    does, Claude answers ``chat_completions`` (the wire before /v1/messages) on every path: startup honors
+    the saved mode (or rescues a saved ``codex_responses`` to ``chat_completions``), and ``/model`` derives
+    the same answer, so one session never mixes wires. ``hermes model`` or ``hermes config unset
+    model.api_mode`` removes it."""
+    try:
+        return str(_copilot_model_config().get("api_mode") or "").strip().lower() in _LEGACY_SAVED_API_MODES
+    except Exception:  # an unreadable config keeps the new route
+        return False
+
+
 def uses_messages_api(model_id: str) -> bool:
-    """Claude models go to Copilot's Anthropic ``/v1/messages`` endpoint when core can drive it and the
-    configured base URL is a Copilot host (a proxy would get core's generic ``x-api-key`` auth there): it
-    honors ``cache_control`` TTLs and reports cache writes, which ``/chat/completions`` does not."""
+    """Claude models go to Copilot's Anthropic ``/v1/messages`` endpoint when core can drive it, the
+    configured base URL is a Copilot host (a proxy would get core's generic ``x-api-key`` auth there) and
+    no legacy ``model.api_mode`` is saved: it honors ``cache_control`` TTLs and reports cache writes, which
+    ``/chat/completions`` does not."""
     bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]  # ``anthropic/claude-...`` too
     return (bare.startswith("claude-") and not bare.endswith(_MESSAGES_UNSUPPORTED_SUFFIXES)
-            and core_serves_anthropic_bearer() and is_copilot_host(_configured_base_url()))
+            and core_serves_anthropic_bearer() and is_copilot_host(_configured_base_url())
+            and not _legacy_api_mode_saved())
 
 
 def _api_mode_for_id(model_id: str) -> str:

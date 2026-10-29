@@ -76,12 +76,17 @@ Copilot's Anthropic-format `/v1/messages` endpoint (`api_mode: anthropic_message
 There Copilot honors prompt-cache TTLs (`prompt_caching.cache_ttl`, e.g. `1h`) and reports cache writes, so a
 cached prompt survives idle gaps longer than a few minutes and Hermes can account for writes. On an older core,
 or when `COPILOT_API_BASE_URL` / `model.base_url` points at a non-Copilot host (a proxy), Claude stays on
-`/chat/completions`. `claude-opus-4.8-fast` also stays there: Copilot's `/v1/messages` rejects the hyphenated
-id Hermes core sends for it.
+`/chat/completions`. A proxy base URL set only for one session (a `/model` switch or a gateway / Desktop
+override that is in neither `config.yaml` nor the environment) is not seen when the wire is chosen: set it in
+`model.base_url` or `COPILOT_API_BASE_URL` (or set `model.api_mode: chat_completions`) so Claude keeps using
+`/chat/completions` there. `-fast` variants (e.g. `claude-opus-4.8-fast`) also stay on `/chat/completions`:
+Copilot's `/v1/messages` rejects the hyphenated id Hermes core sends for them.
 
-If you ran `hermes model` → GitHub Copilot before this version, your `config.yaml` may pin
-`model.api_mode: chat_completions`, which overrides the per-model choice. Re-run `hermes model` (it no longer
-saves an `api_mode` and removes an old one), or run `hermes config unset model.api_mode`.
+If you ran `hermes model` → GitHub Copilot before this version, your `config.yaml` may pin `model.api_mode`
+(`chat_completions` for Claude, `codex_responses` for GPT-5+), which overrides the per-model choice. While
+either value is saved, Claude stays on `/chat/completions` as before (a saved `codex_responses` still sends
+GPT-5+ to Responses). Re-run `hermes model` (it no longer saves an `api_mode` and removes an old one), or run
+`hermes config unset model.api_mode`.
 
 ## What changed from the core version: no gh or Copilot CLI token files
 
