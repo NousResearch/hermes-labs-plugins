@@ -31,20 +31,40 @@ def requires_responses_api(model_id: str) -> bool:
     return bool(match) and int(match.group(1)) >= 5 and not model_id.startswith("gpt-5-mini")
 
 
+def core_serves_anthropic_bearer() -> bool:
+    """Whether the running core asks profiles for the Anthropic client's auth style
+    (``ProviderProfile.anthropic_auth_style``). Without that seam core would send the Copilot token
+    as ``x-api-key`` on /v1/messages and get a 401, so Claude stays on Chat Completions there."""
+    from providers.base import ProviderProfile
+
+    return hasattr(ProviderProfile, "anthropic_auth_style")
+
+
+def uses_messages_api(model_id: str) -> bool:
+    """Claude models go to Copilot's Anthropic ``/v1/messages`` endpoint when core can drive it: it
+    honors ``cache_control`` TTLs and reports cache writes, which ``/chat/completions`` does not."""
+    return model_id.startswith("claude-") and core_serves_anthropic_bearer()
+
+
+def _api_mode_for_id(model_id: str) -> str:
+    if requires_responses_api(model_id):
+        return "codex_responses"
+    if uses_messages_api(model_id):
+        return "anthropic_messages"
+    return "chat_completions"
+
+
 def model_api_mode(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> str:
-    """API mode for a Copilot model from the id pattern (opencode's approach). Copilot's Claude models
-    go through its OpenAI-compatible chat endpoint, not the native Anthropic adapter: the catalog may
-    advertise /v1/messages but the Copilot token/header scheme lives in the OpenAI client path."""
+    """API mode for a Copilot model from the id pattern (opencode's approach): GPT-5+ on Responses,
+    Claude on Anthropic Messages (when core has the auth seam), everything else on Chat Completions."""
     from .catalog import fetch_github_model_catalog, normalize_copilot_model_id
 
     if catalog is None and api_key:  # fetch once so normalize + endpoint check share it
         catalog = fetch_github_model_catalog(api_key=api_key)
     normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
-    if normalized and requires_responses_api(normalized):
-        return "codex_responses"
-    return "chat_completions"
+    return _api_mode_for_id(normalized) if normalized else "chat_completions"
 
 
 def editor_headers(*, is_vision: bool = False) -> dict[str, str]:
@@ -58,8 +78,12 @@ class CopilotWireMixin:
 
     def api_mode_for_model(self, model: str, *, api_key: str | None = None) -> str | None:
         if api_key is None:
-            return "codex_responses" if requires_responses_api(model) else "chat_completions"
+            return _api_mode_for_id(model)
         return model_api_mode(model, api_key=api_key)
+
+    def anthropic_auth_style(self, *, base_url: str) -> str | None:
+        # Copilot's /v1/messages takes the exchanged token as Authorization: Bearer, not x-api-key.
+        return "bearer" if is_copilot_host(base_url) else None
 
     def client_headers(
         self, *, base_url: str, api_key: str = "", has_images: bool = False,
