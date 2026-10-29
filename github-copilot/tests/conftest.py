@@ -118,6 +118,68 @@ def offline_chat_turn(base_url: str, *, model: str = "gpt-5.4", message: str = "
     return sent
 
 
+def _anthropic_sse(model: str) -> str:
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_offline", "type": "message", "role": "assistant", "model": model, "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "ok"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    import json
+
+    return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+
+
+class SentMessagesRequest(NamedTuple):
+    path: str
+    headers: dict[str, str]
+    body: dict
+
+
+def offline_messages_turn(base_url: str, *, model: str = "claude-sonnet-5.5", message: str = "hi",
+                          **agent_kwargs) -> list[SentMessagesRequest]:
+    """Run one real ``AIAgent.chat`` turn on ``anthropic_messages`` against *base_url*, with every httpx
+    transport replaced by an ``httpx.MockTransport`` that answers Anthropic Messages requests with "ok";
+    return those requests as they went on the wire (path, lower-cased headers, JSON body)."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    from run_agent import AIAgent
+
+    sent: list[SentMessagesRequest] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        if request.url.path.endswith("/messages"):
+            sent.append(SentMessagesRequest(request.url.path, {k.lower(): v for k, v in request.headers.items()},
+                                            body))
+            if body.get("stream"):
+                return httpx.Response(200, text=_anthropic_sse(body.get("model", model)),
+                                      headers={"content-type": "text/event-stream"})
+            return httpx.Response(200, json={
+                "id": "msg_offline", "type": "message", "role": "assistant", "model": body.get("model", model),
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1}})
+        return httpx.Response(404, json={"error": "offline"})
+
+    mock = httpx.MockTransport(answer)
+    options = {"api_key": "tid=offline", "provider": "copilot", "api_mode": "anthropic_messages",
+               "quiet_mode": True, "skip_context_files": True, "skip_memory": True, "enabled_toolsets": [],
+               **agent_kwargs}
+    with patch.object(httpx.HTTPTransport, "handle_request", lambda self, request: mock.handle_request(request)):
+        AIAgent(base_url=base_url, model=model, **options).chat(message)
+    return sent
+
+
 import providers  # noqa: E402
 
 providers.get_provider_profile("openrouter")  # run discovery first: later registrations stay put

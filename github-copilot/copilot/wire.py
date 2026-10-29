@@ -40,10 +40,41 @@ def core_serves_anthropic_bearer() -> bool:
     return hasattr(ProviderProfile, "anthropic_auth_style")
 
 
+# Claude variants whose hyphenated id (core's Anthropic wire spelling: ``claude-opus-4.8-fast`` ->
+# ``claude-opus-4-8-fast``) Copilot's /v1/messages rejects with ``model_not_supported``; they stay on Chat
+# Completions until core can keep a provider's dotted ids on the Anthropic wire.
+_MESSAGES_UNSUPPORTED_SUFFIXES = ("-fast",)
+
+
+def _configured_base_url() -> str:
+    """The Copilot API base URL the user pointed Hermes at: ``COPILOT_API_BASE_URL``, else a Copilot
+    ``model.base_url`` in config.yaml, else the default (the token exchange only ever hands out Copilot hosts)."""
+    from .activation import COPILOT_PROVIDER_IDS
+    from .catalog import COPILOT_BASE_URL
+
+    try:
+        from agent.secret_scope import get_secret
+
+        env_url = (get_secret("COPILOT_API_BASE_URL") or "").strip()
+        if env_url:
+            return env_url
+        from hermes_cli.config import load_config
+
+        model = (load_config() or {}).get("model")
+        if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() in COPILOT_PROVIDER_IDS:
+            return str(model.get("base_url") or "").strip() or COPILOT_BASE_URL
+    except Exception:  # an unreadable config/secret store keeps the default host
+        pass
+    return COPILOT_BASE_URL
+
+
 def uses_messages_api(model_id: str) -> bool:
-    """Claude models go to Copilot's Anthropic ``/v1/messages`` endpoint when core can drive it: it
+    """Claude models go to Copilot's Anthropic ``/v1/messages`` endpoint when core can drive it and the
+    configured base URL is a Copilot host (a proxy would get core's generic ``x-api-key`` auth there): it
     honors ``cache_control`` TTLs and reports cache writes, which ``/chat/completions`` does not."""
-    return model_id.startswith("claude-") and core_serves_anthropic_bearer()
+    bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]  # ``anthropic/claude-...`` too
+    return (bare.startswith("claude-") and not bare.endswith(_MESSAGES_UNSUPPORTED_SUFFIXES)
+            and core_serves_anthropic_bearer() and is_copilot_host(_configured_base_url()))
 
 
 def _api_mode_for_id(model_id: str) -> str:
@@ -82,10 +113,8 @@ class CopilotWireMixin:
         return model_api_mode(model, api_key=api_key)
 
     def anthropic_auth_style(self, *, base_url: str) -> str | None:
-        # Copilot's /v1/messages takes the exchanged token as an Authorization Bearer header, not x-api-key.
-        # No per-request Copilot-Vision-Request is needed there: live checks (Sonnet 5.5, 16px and
-        # 256px PNG image blocks, client built with has_images=False) answered correctly with HTTP 200.
-        # Only the OpenAI-wire request-scoped image client asks client_headers(has_images=True).
+        # Copilot's /v1/messages takes the exchanged token as Authorization: Bearer, not x-api-key; it
+        # needs no Copilot-Vision-Request (only the OpenAI-wire image client asks has_images=True).
         return "bearer" if is_copilot_host(base_url) else None
 
     def client_headers(

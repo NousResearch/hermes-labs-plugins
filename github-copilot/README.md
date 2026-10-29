@@ -68,6 +68,21 @@ user turn on the exact host `api.githubcopilot.com` (and GitHub Models, `models.
 `user`, as Hermes core did. Accounts whose token exchange hands out a plan host (`api.individual.`,
 `api.business.` or `api.enterprise.githubcopilot.com`) send `agent` on every request.
 
+## Claude on `/v1/messages`
+
+On a Hermes core with the Anthropic auth-style hook
+([hermes-agent#TBD](https://github.com/NousResearch/hermes-agent/pull/TBD)), `copilot` sends Claude models to
+Copilot's Anthropic-format `/v1/messages` endpoint (`api_mode: anthropic_messages`) instead of `/chat/completions`.
+There Copilot honors prompt-cache TTLs (`prompt_caching.cache_ttl`, e.g. `1h`) and reports cache writes, so a
+cached prompt survives idle gaps longer than a few minutes and Hermes can account for writes. On an older core,
+or when `COPILOT_API_BASE_URL` / `model.base_url` points at a non-Copilot host (a proxy), Claude stays on
+`/chat/completions`. `claude-opus-4.8-fast` also stays there: Copilot's `/v1/messages` rejects the hyphenated
+id Hermes core sends for it.
+
+If you ran `hermes model` → GitHub Copilot before this version, your `config.yaml` may pin
+`model.api_mode: chat_completions`, which overrides the per-model choice. Re-run `hermes model` (it no longer
+saves an `api_mode` and removes an old one), or run `hermes config unset model.api_mode`.
+
 ## What changed from the core version: no gh or Copilot CLI token files
 
 Hermes core's Copilot also picked up a token from `gh auth token` and from the gh / Copilot CLI token
