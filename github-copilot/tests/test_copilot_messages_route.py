@@ -82,3 +82,6 @@ def test_core_anthropic_client_sends_bearer_and_editor_headers(url):
     assert headers["copilot-integration-id"] == "vscode-chat"
     assert headers["x-initiator"] == "agent"
     assert "editor-version" in headers
+    # /v1/messages needs no Copilot-Vision-Request: live 16px/256px PNG checks returned 200 with correct
+    # colors on a client built this way.
+    assert "copilot-vision-request" not in headers

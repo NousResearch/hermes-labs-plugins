@@ -82,7 +82,10 @@ class CopilotWireMixin:
         return model_api_mode(model, api_key=api_key)
 
     def anthropic_auth_style(self, *, base_url: str) -> str | None:
-        # Copilot's /v1/messages takes the exchanged token as Authorization: Bearer, not x-api-key.
+        # Copilot's /v1/messages takes the exchanged token as an Authorization Bearer header, not x-api-key.
+        # No per-request Copilot-Vision-Request is needed there: live checks (Sonnet 5.5, 16px and
+        # 256px PNG image blocks, client built with has_images=False) answered correctly with HTTP 200.
+        # Only the OpenAI-wire request-scoped image client asks client_headers(has_images=True).
         return "bearer" if is_copilot_host(base_url) else None
 
     def client_headers(
