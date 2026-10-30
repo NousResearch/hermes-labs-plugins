@@ -27,10 +27,10 @@ def test_core_yaml_rejects_objects_and_duplicate_identity(hermes_home, document)
 
 
 def test_plugin_declares_and_imports_no_yaml_library():
-    manifest = hermes_yaml.safe_load((ROOT / 'plugin.yaml').read_text())
+    manifest = hermes_yaml.safe_load((ROOT / 'plugin.yaml').read_text(encoding='utf-8'))
     assert 'python_dependencies' not in manifest
     for source in ROOT.glob('*.py'):
-        for node in ast.walk(ast.parse(source.read_text(), filename=str(source))):
+        for node in ast.walk(ast.parse(source.read_text(encoding='utf-8'), filename=str(source))):
             names = ([a.name for a in node.names] if isinstance(node, ast.Import)
                      else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
             for name in names:
