@@ -80,7 +80,8 @@ def read_edges(home: Path, limit: int = 20, profile: str | None = None) -> dict:
             result.update(status="read", edges=[dict(r) for r in rows[:cap]], truncated=len(rows) > cap)
         finally:
             with_source.close()
-    except (sqlite3.Error, OSError, ValueError, yaml.YAMLError) as exc:
+    # RecursionError: a pathologically nested config.yaml is unreadable, not a crash.
+    except (sqlite3.Error, OSError, ValueError, yaml.YAMLError, RecursionError) as exc:
         result.update(status="unreadable", edges=[], error=type(exc).__name__)
     return result
 

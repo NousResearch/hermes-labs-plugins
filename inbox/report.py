@@ -133,9 +133,14 @@ def _attach_attention(snapshot: dict, home: Path) -> None:
         state = InboxState(home, profile)
         snapshot["attention_state"] = AttentionState(state).states_for(records(snapshot))
         snapshot["attention_state_status"] = "read" if state.db_path.exists() else "absent"
-    except (InboxStateError, OSError, ValueError, YAMLError, ImportError) as exc:
+    except (InboxStateError, OSError, ValueError, YAMLError, ImportError, RecursionError) as exc:
         snapshot["attention_state_status"] = "unreadable"
         snapshot["attention_state_error"] = type(exc).__name__
+
+
+def _inert(value: Any) -> str:
+    """JSON-escape a source-controlled value so terminal control sequences stay inert."""
+    return json.dumps(str(value), ensure_ascii=True)[1:-1]
 
 
 def fmt_age(seconds: Any) -> str:
@@ -262,10 +267,12 @@ def render_inbox(data: dict[str, Any]) -> str:
     herald_edges = data.get("herald") or []
     if herald_edges:
         lines.append(f"  ◆ Herald edges ({len(herald_edges)})")
+        # Ledger fields are source-controlled: escape them like the lane lines below.
         lines += [
-            f"    ➤ {e['edge_id']}  [{e.get('dispatch_type')}/{e.get('delivery')}] {e.get('status')}"
-            f"  hop={e.get('hop_count')} origin={e.get('origin_profile')} target={e.get('target_profile')}"
-            f"  dispatched={e.get('dispatched_at')}"
+            f"    ➤ {_inert(e['edge_id'])}  [{_inert(e.get('dispatch_type'))}/{_inert(e.get('delivery'))}]"
+            f" {_inert(e.get('status'))}  hop={_inert(e.get('hop_count'))}"
+            f" origin={_inert(e.get('origin_profile'))} target={_inert(e.get('target_profile'))}"
+            f"  dispatched={_inert(e.get('dispatched_at'))}"
             for e in herald_edges
         ]
         lines.append("")
@@ -274,8 +281,9 @@ def render_inbox(data: dict[str, Any]) -> str:
     if work_threads:
         lines.append(f"  ◆ Work threads ({len(work_threads)})")
         for thread in work_threads:
-            lines.append(f"    · {thread['id']} execution={thread['execution']} "
-                         f"outcome={thread['outcome']} delivery={','.join(thread['delivery'])}")
+            delivery = ",".join(_inert(d) for d in thread["delivery"])
+            lines.append(f"    · {_inert(thread['id'])} execution={_inert(thread['execution'])} "
+                         f"outcome={_inert(thread['outcome'])} delivery={delivery}")
         lines.append("")
 
     hidden_states = _hidden_states(data)
@@ -284,9 +292,9 @@ def render_inbox(data: dict[str, Any]) -> str:
         lines.append(f"  ◆ {name} ({len(visible)} visible / {len(items)} recorded)")
         for item in visible:
             # JSON escaping keeps source-controlled terminal sequences inert.
-            label = json.dumps(str(item["id"]), ensure_ascii=True)[1:-1]
-            owner = json.dumps(str(item.get("owner") or "unknown"), ensure_ascii=True)[1:-1]
-            state = json.dumps(str(item["execution"]), ensure_ascii=True)[1:-1]
+            label = _inert(item["id"])
+            owner = _inert(item.get("owner") or "unknown")
+            state = _inert(item["execution"])
             occurrence = ",".join(str(v) for v in item.get("occurrences", [])) or "unobserved"
             mark = f" local={item['local_state']}" if item.get("local_state") in ("acked", "snoozed") else ""
             lines.append(f"    · {item['kind']} {label} owner={owner} execution={state} occurrence={occurrence}{mark}")

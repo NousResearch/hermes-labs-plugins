@@ -71,7 +71,7 @@ def handle(args: argparse.Namespace) -> int:
                 raise ValueError("unknown action")
             print(json.dumps(result, indent=2))
             return 0
-        except (InboxStateError, ValueError, OSError, sqlite3.Error, YAMLError):
+        except (InboxStateError, ValueError, OSError, sqlite3.Error, YAMLError, RecursionError):
             print(json.dumps({"error": "Local Inbox state unavailable or invalid action input"}))
             return 2
     data = build_inbox(fleet=bool(getattr(args, "fleet", False)),
