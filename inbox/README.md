@@ -1,103 +1,123 @@
 # Inbox
 
-> **Labs plugin: works, but unsupported.** Nous Research built it and does not maintain it. See
-> [what "labs" means](../README.md#what-labs-means).
+A snapshot of work in flight, with optional same-host Herald work threads and
+explicit local observation, cursor, acknowledgment and snooze actions. Native
+task stores remain read-only; only explicit actions write Inbox-owned state.
 
-`hermes inbox` shows everything Hermes has in flight for the active profile in one read-only view:
-what needs your attention, what is running, which background results are waiting, what is
-scheduled and which chat surfaces are open. Inspired by Cursor's Inbox.
+This remains an experimental [Hermes Labs](../README.md) plugin, not a supported
+first-party product. The [MIT license](LICENSE) and original attribution remain.
 
-```
-$ hermes inbox
+## Installation
 
-  ◆ Needs attention (4)
-    ⚠ cron 'nightly-backup'  last run FAILED: Script exited with code 1 stderr: backup target /mnt/nas not mounted
-    ⚠ cron 'feed-watch'  paused (waiting on API key)
-    ⚠ process proc_9f2c44  [GONE (stale checkpoint), 3h13m]  pytest -x tests/ --watch
-    ⚠ kanban t_12200367  [blocked]  Get Stripe test keys from finance
+`hermes plugins install inbox` installs the existing reviewed catalog pin. New
+repository changes reach that command only after a separate catalog SHA-bump PR
+is reviewed and merged. The observation/attention commands below require the
+0.2.0 candidate; their presence in repository docs does not update an older pin.
+For source qualification, use the native installer with this repository, subdir
+`inbox`, and an explicitly reviewed full commit SHA. No second plugin ID or CLI
+command is introduced.
 
-  ◆ In progress (2)
-    ◐ process proc_7c1e02  [running, 22m]  npm run dev -- --port 5173
-    ◐ delegation dlg_41a7  [running, 5m ago]  Research venue pricing for 40 people in Austin
+## Implemented commands
 
-  ◆ Finished, result not yet delivered (1)
-    ✔ delegation dlg_3b90  [completed, 3m ago]  (result awaiting delivery)  List every caller of charge_customer()
-
-  ◆ Scheduled (2 active job(s))
-    ⏱ nightly-backup  next: 2026-10-21T06:08:46.190275-07:00
-    ⏱ morning-digest  next: 2026-10-21T08:00:00-07:00
-
-  ◆ Open surfaces (2)
-    ◎ session [cli] pid=1197440  Plan the offsite
-    ◎ session [tui] pid=1197519  Refactor the billing module
-```
-
-## Install
-
-```bash
-hermes plugins install inbox
+```text
+hermes inbox                  active-profile snapshot
+hermes inbox --json           structured snapshot
+hermes inbox --fleet           opt-in same-host Herald ledger view
+hermes inbox --fleet --json    structured fleet observations and coverage
+hermes -p work inbox           selected profile; plugin must be installed there
+hermes inbox observe --fleet   explicitly record a bounded snapshot
+hermes inbox changes --consumer owner --json
+hermes inbox mark-seen --consumer owner --through <observed-sequence>
+hermes inbox ack <observed-sequence>
+hermes inbox snooze <observed-sequence> --seconds 60
+hermes inbox --hide-acked     explicit filter: leave out acknowledged items
+hermes inbox --hide-snoozed   explicit filter: leave out currently snoozed items
 ```
 
-It adds one CLI command (`hermes inbox`). No model tools, no hooks, nothing runs during chats. No
-dependencies beyond Hermes itself. The agent can still use it: ask it to run `hermes inbox --json`
-in the terminal.
+The default snapshot includes processes, native asynchronous delegations, cron,
+open chat surfaces and the shared Kanban board. `--fleet` adds local Herald
+records; it does not create dispatches, contact remote peers, poll automatically
+or grant permission to act. There are no `--herald-fleet` or `--label` flags.
 
-## Usage
+## Herald configuration and coverage
 
-```bash
-hermes inbox            # the view above
-hermes inbox --json     # the same snapshot as JSON, for scripts and dashboards
-hermes -p work inbox    # another profile's inbox (install the plugin in that profile too)
-```
+The adapter reads `hermes_herald.origin_name` and `hermes_herald.ledger_file` from
+each supplied profile home's `config.yaml`. A falsy ledger path uses that home's
+`hermes-herald.db`. Tilde expands normally; `$HERMES_HOME` and `${HERMES_HOME}`
+expand to the **supplied profile home**, not another ambient profile. Unresolved
+other variables fail closed rather than querying a credential store. Relative
+paths retain Herald's current-working-directory semantics.
 
-Sections with nothing in them are left out, except "Needs attention" and "In progress", which
-always print so an empty inbox reads as all clear.
+`config.yaml` is read through Hermes core's `hermes_yaml` module (safe YAML 1.1,
+duplicate keys rejected); Inbox declares no YAML dependency of its own.
 
-| Section | What appears |
-|---|---|
-| Needs attention | Stalled or `unknown` delegations, delegation results dropped after failed deliveries (last 7 days), cron jobs whose last run failed or that were paused with a reason, background processes still in the checkpoint whose PID is gone, kanban tasks that are blocked or waiting for review. |
-| In progress | Live background processes, running async delegations, running kanban tasks. |
-| Finished, result not yet delivered | Delegations that completed but whose result has not reached its conversation yet. |
-| Scheduled | Enabled cron jobs and the next five runs. |
-| Open surfaces | Open CLI, TUI, Desktop and gateway chat sessions whose process is still alive, with the session title. |
+An explicit nonblank origin name takes precedence over the native profile ID.
+Unknown identities cannot trigger unrestricted ledger reads. Fleet discovery is
+limited to the native default home and identifiable same-host profiles; arbitrary
+supplied directories do not cause discovery of the real user's profiles. At most
+33 profile homes are considered, with explicit truncation disclosure.
 
-## What it reads
+`herald_meta` reports source availability, observation coverage and truncation.
+Each source and the combined result are bounded (20 edges by default, maximum
+500 for direct adapter calls). Shared-ledger observations are deduplicated and
+conflicting observations are marked. Unreadable origins and other hosts remain
+unknown; an empty local ledger does not prove the absence of incoming work.
 
-Everything is read-only: JSON files are read as files, SQLite databases are opened with
-`mode=ro`, and session titles come from Hermes' read-only `SessionDB` attach. It never writes,
-repairs or prunes a store (SQLite may create a database's `-wal`/`-shm` sidecar files, as it does
-for any reader), and works whether or not a gateway is running. Paths resolve against
-the active profile's home (`HERMES_HOME`, or `hermes -p <profile>`), except the kanban board,
-which Hermes shares across profiles.
+Only safe identity/status/linkage metadata is collected. Full prompts,
+instructions, reasoning and result previews are excluded. Work completion does
+not imply an accepted outcome, independently verified evidence or user delivery.
+Herald delivery modes (`callback`, `none`, `sync`) are not delivery receipts.
 
-| Source | Store | If it is missing or unreadable |
-|---|---|---|
-| Background processes | `<home>/processes.json` (the process registry checkpoint). Host PIDs are re-checked with `psutil`; PIDs inside a sandbox backend can't be probed and show as `sandboxed`. | Section empty; listed under "Not read". |
-| Async delegations | `async_delegations` table in `<home>/state.db` | Same. A locked database gives up after 2 seconds instead of hanging. |
-| Cron jobs | `<home>/cron/jobs.json` | Same. |
-| Open chat surfaces | `<home>/runtime/active_sessions.json` (active-session leases), titles from `state.db` via `SessionDB(read_only=True)`. A lease counts only while its PID is alive and, when recorded, its process start time still matches (a recycled PID is not counted). | Same; without `state.db` the session id shows instead of the title. |
-| Kanban | The current board's `kanban.db`, resolved the documented way: `HERMES_KANBAN_DB`, else `HERMES_KANBAN_BOARD`, else `<root>/kanban/current`, else `<root>/kanban.db`, with `<root>` = `HERMES_KANBAN_HOME` or the default Hermes root. | Same. |
+## Source boundary
 
-Every section that could not be read is named at the bottom of the text view ("Not read") and in
-the `sources` field of the JSON (`"read"`, `"absent"` or `"unreadable (...)"`).
+JSON stores are read as files and SQLite is opened with `mode=ro`; Inbox never
+repairs, prunes, migrates or rewrites native task stores. SQLite itself may create
+WAL/SHM reader sidecars. Missing or unreadable sources are disclosed in text and
+JSON, not treated as verified all-clear. Kanban remains a shared upstream store.
+In-memory approvals and clarify prompts have no durable cross-process source;
+answer them in the conversation that asked.
 
-**Not shown:** pending approvals and clarify prompts. They live in the memory of the process that
-asked (the gateway or an open CLI), with no store another process can read, so answer them in
-that chat.
+## Local observations and attention
 
-## Configuration
+Explicit `observe`, `mark-seen`, `ack` and `snooze` actions write only
+`<profile-home>/inbox/state.db`. Viewing and `changes` create no database and
+advance no cursor. Repeated identical snapshots create no duplicate events;
+an observed state change followed by a return to an old state is a new occurrence.
+Use the `seq` returned by `changes` for acknowledgments and `--through`.
+Without `--through`, `mark-seen` explicitly marks all currently observed events
+seen for that consumer; it is not limited to the first returned page.
 
-None.
+Acknowledgment and snooze affect one occurrence only, never source execution,
+outcome or delivery. They never hide work by default: every view still lists
+each waiting item, and acknowledged or snoozed ones are marked `local=acked` or
+`local=snoozed` (the `local_state` field in `--json`), in the same key=value form
+as work-thread lines. Only the explicit `--hide-acked` and `--hide-snoozed`
+filters leave them out of the rendered view and `visible_attention`; the view
+then states how many items the filter hid. The raw `attention` list is never
+filtered. A thread is marked only when every one of its edges is acknowledged
+or snoozed. Expiry is checked on the next view; no scheduler is started.
+Unknown occurrences and non-finite or excessive snooze durations are rejected.
+The snooze maximum is seven days. Each consumer and profile has independent state.
+
+Five lanes classify explicit known facts: Needs owner, Agent can act, Waiting,
+Done and Unknown. `Agent can act` grants no execution permission. `Done` requires
+an explicit accepted outcome, not merely a successful exit or completed dispatch.
+Current source readers may not provide approval/action/acceptance facts; these
+remain unknown. Source conflicts also remain unknown. Evidence references are
+reported as unverified; next steps appear only if explicitly supplied.
+
+Native delegation observations are capped at 20 with overflow disclosed; recent
+delivered completions are included within the seven-day completion window. This
+is not an unlimited task-history export. Unlinked native items remain distinct
+from Herald threads: similar names never establish a relationship.
+
+Proposed automatic refresh/result-retrieval hooks remain unactivated. These are
+recorded snapshots, not live task heartbeats. The native CLI reads current stores
+each time it runs; it does not continuously monitor or infer remote-host state.
 
 ## Development
 
-```bash
-cd inbox
-HERMES_AGENT_REPO=../../hermes-agent PYTHONPATH=../../hermes-agent python -m pytest -q
-```
-
-The tests seed a temp `HERMES_HOME` through Hermes' own writers (`SessionDB` for `state.db`,
-`kanban_db.init_db` for `kanban.db`), so the queries run against core's real schema, and they
-check that building the inbox writes nothing to the home it reads.
-
-Origin: hermes-agent PR #81507 (`hermes inbox`), moved out of core into this plugin.
+Tests run against Hermes core and isolated temporary stores, using native writer
+fixtures for its databases. The compatibility workflow validates the manifest and
+runs the Inbox suite on Linux, macOS and Windows. A passing source suite does not
+establish installed-artifact or fleet acceptance.
