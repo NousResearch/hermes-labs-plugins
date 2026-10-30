@@ -71,8 +71,8 @@ user turn on the exact host `api.githubcopilot.com` (and GitHub Models, `models.
 ## Claude on `/v1/messages`
 
 On a Hermes core with both the Anthropic auth-style hook
-([hermes-agent#TBD-seam](https://github.com/NousResearch/hermes-agent/pull/TBD-seam)) and saved-`api_mode` scoping
-([hermes-agent#TBD-fix](https://github.com/NousResearch/hermes-agent/pull/TBD-fix)), `copilot` sends Claude models to
+([hermes-agent#146877](https://github.com/NousResearch/hermes-agent/pull/146877)) and saved-`api_mode` scoping
+([hermes-agent#146876](https://github.com/NousResearch/hermes-agent/pull/146876)), `copilot` sends Claude models to
 Copilot's Anthropic-format `/v1/messages` endpoint (`api_mode: anthropic_messages`) instead of `/chat/completions`.
 Both are needed: without the first, core sends the Copilot token as `x-api-key` (a 401); without the second, a
 saved Claude wire would pin every other Copilot model.
