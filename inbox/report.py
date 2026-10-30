@@ -10,7 +10,7 @@ from typing import Any, Optional
 from . import collectors as c
 from . import herald
 from .threads import build_threads
-from .lanes import build_lanes
+from .lanes import build_lanes, local_mark
 
 # Source name -> what the user sees in the "not read" footer.
 SOURCE_LABELS = {
@@ -26,8 +26,14 @@ _STALLED_DELEGATION_STATES = ("stalling", "stalled", "unknown")
 _RUNNING_DELEGATION_STATES = ("running", "finalizing")
 
 
-def build_inbox(home: Optional[Path] = None, fleet: bool = False) -> dict[str, Any]:
-    """The full snapshot as JSON-serialisable data. ``home`` defaults to the active profile's."""
+def build_inbox(home: Optional[Path] = None, fleet: bool = False, *,
+                hide_acked: bool = False, hide_snoozed: bool = False) -> dict[str, Any]:
+    """The full snapshot as JSON-serialisable data. ``home`` defaults to the active profile's.
+
+    Acknowledged and snoozed items stay in every view, marked with ``local_state``. Only the
+    explicit ``hide_acked`` / ``hide_snoozed`` filters leave them out of ``visible_attention``
+    and the rendered lanes; the raw ``attention`` list is never filtered.
+    """
     if home is None:
         from hermes_constants import get_hermes_home
 
@@ -91,15 +97,30 @@ def build_inbox(home: Optional[Path] = None, fleet: bool = False) -> dict[str, A
     _attach_attention(snapshot, home)
     snapshot["lanes"] = build_lanes(snapshot)
     local = snapshot["attention_state"]
-    snapshot["visible_attention"] = [item for item in attention
-        if local.get(f"{item.get('kind')}:{item.get('id')}", {}).get("visible") is not False]
+    snapshot["attention_filter"] = {"hide_acked": bool(hide_acked), "hide_snoozed": bool(hide_snoozed)}
+    hidden = _hidden_states(snapshot)
+    marked = [{**item, "local_state": local_mark([local.get(f"{item.get('kind')}:{item.get('id')}")])}
+              for item in attention]
+    snapshot["visible_attention"] = [item for item in marked if item["local_state"] not in hidden]
     return snapshot
+
+
+def _hidden_states(data: dict[str, Any]) -> set[str]:
+    applied = data.get("attention_filter") or {}
+    return ({"acked"} if applied.get("hide_acked") else set()) | (
+        {"snoozed"} if applied.get("hide_snoozed") else set())
+
+
+def _filter_flags(data: dict[str, Any]) -> str:
+    applied = data.get("attention_filter") or {}
+    return " ".join(flag for flag, key in (("--hide-acked", "hide_acked"), ("--hide-snoozed", "hide_snoozed"))
+                    if applied.get(key))
 
 
 def _attach_attention(snapshot: dict, home: Path) -> None:
     from .state import InboxState, InboxStateError
     from .observations import records
-    from .config_yaml import YAMLError
+    from hermes_yaml import YAMLError
     snapshot["attention_state"] = {}
     snapshot["profile"] = None
     snapshot["attention_state_status"] = "unknown"
@@ -184,7 +205,11 @@ _DESCRIBERS = {
 
 def describe(item: dict[str, Any], now: float) -> str:
     fn = _DESCRIBERS.get(str(item.get("kind")))
-    return fn(item, now) if fn else json.dumps(item, default=str)
+    line = fn(item, now) if fn else json.dumps(item, default=str)
+    # Same key=value form as the work-thread lines; marked items are shown, not dropped.
+    if item.get("local_state") in ("acked", "snoozed"):
+        line += f"  local={item['local_state']}"
+    return line
 
 
 def _section(lines: list[str], title: str, items: list, mark: str, now: float, empty: str = "") -> None:
@@ -209,7 +234,11 @@ def render_inbox(data: dict[str, Any]) -> str:
     _section(lines, "Needs attention", visible_attention, "⚠", now, empty_attention)
     hidden_native = len(data.get("attention") or []) - len(visible_attention)
     if hidden_native:
-        lines.append(f"  {hidden_native} native attention item(s) hidden locally; source state unchanged.\n")
+        lines.append(f"  {hidden_native} native attention item(s) hidden by {_filter_flags(data) or 'a filter'}; "
+                     "source state unchanged.\n")
+    marked_native = sum(1 for i in visible_attention if i.get("local_state") in ("acked", "snoozed"))
+    if marked_native:
+        lines.append(f"  {marked_native} shown item(s) marked acked/snoozed locally; source state unchanged.\n")
     _section(lines, "In progress", data.get("in_progress") or [], "◐", now, empty_running)
     _section(lines, "Finished, result not yet delivered", data.get("finished_undelivered") or [], "✔", now)
 
@@ -249,8 +278,9 @@ def render_inbox(data: dict[str, Any]) -> str:
                          f"outcome={thread['outcome']} delivery={','.join(thread['delivery'])}")
         lines.append("")
 
+    hidden_states = _hidden_states(data)
     for name, items in (data.get("lanes") or {}).items():
-        visible = [item for item in items if item.get("attention_visible") is not False]
+        visible = [item for item in items if item.get("local_state") not in hidden_states]
         lines.append(f"  ◆ {name} ({len(visible)} visible / {len(items)} recorded)")
         for item in visible:
             # JSON escaping keeps source-controlled terminal sequences inert.
@@ -258,7 +288,8 @@ def render_inbox(data: dict[str, Any]) -> str:
             owner = json.dumps(str(item.get("owner") or "unknown"), ensure_ascii=True)[1:-1]
             state = json.dumps(str(item["execution"]), ensure_ascii=True)[1:-1]
             occurrence = ",".join(str(v) for v in item.get("occurrences", [])) or "unobserved"
-            lines.append(f"    · {item['kind']} {label} owner={owner} execution={state} occurrence={occurrence}")
+            mark = f" local={item['local_state']}" if item.get("local_state") in ("acked", "snoozed") else ""
+            lines.append(f"    · {item['kind']} {label} owner={owner} execution={state} occurrence={occurrence}{mark}")
         lines.append("")
     if data.get("lanes"):
         lines.append("  Recorded snapshots, not live heartbeats. Classification grants no execution permission.")

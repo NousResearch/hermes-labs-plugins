@@ -24,13 +24,22 @@ def _references(item):
     return refs
 
 
+def local_mark(states):
+    """``acked``/``snoozed`` only when every local state is handled; otherwise ``None``.
+
+    The mark labels an item; it never removes it. Only an explicit view filter hides marked items.
+    """
+    # Unknown/new edges prevent marking an entire thread behind an old acknowledgment.
+    if not states or not all(isinstance(s, dict) and s.get("visible") is False for s in states):
+        return None
+    return "acked" if all(s.get("acknowledged") is True for s in states) else "snoozed"
+
+
 def _local_attention(keys, state):
     states = [state.get(key) for key in keys]
     occurrences = sorted({s["occurrence"] for s in states if isinstance(s, dict)
                           and type(s.get("occurrence")) is int and s["occurrence"] > 0})
-    # Unknown/new edges prevent hiding an entire thread behind an old acknowledgment.
-    hidden = bool(states) and all(isinstance(s, dict) and s.get("visible") is False for s in states)
-    return not hidden, occurrences
+    return local_mark(states), occurrences
 
 
 def _project(raw, profile, state, *, thread=False):
@@ -54,11 +63,11 @@ def _project(raw, profile, state, *, thread=False):
     if raw.get("paused") is True:
         execution = "paused"
     outcome = _text(raw.get("outcome")) or "unknown"
-    visible, occurrences = _local_attention(keys, state)
+    mark, occurrences = _local_attention(keys, state)
     projected = {"id": raw["id"], "kind": kind, "owner": owner, "execution": execution,
                  "outcome": outcome, "delivery": raw.get("delivery", raw.get("delivery_state", "unknown")),
                  "next_step": _text(raw.get("next_step")), "evidence_refs": _references(raw),
-                 "provenance": provenance, "attention_visible": visible, "occurrences": occurrences,
+                 "provenance": provenance, "local_state": mark, "occurrences": occurrences,
                  "source_conflict": bool(raw.get("source_conflict")),
                  "execution_permission": "not_granted_by_inbox"}
     if projected["source_conflict"]:

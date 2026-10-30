@@ -5,7 +5,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from . import config_yaml as yaml
+import hermes_yaml as yaml
 
 # Deliberately omit prompts, instructions, reasoning, credentials and result previews.
 _COLUMNS = (

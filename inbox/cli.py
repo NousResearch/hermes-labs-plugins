@@ -11,7 +11,8 @@ DESCRIPTION = (
     "(stalled or dropped delegations, failed cron runs, orphaned background processes, blocked "
     "kanban tasks), what is in progress, finished delegation results not yet delivered, upcoming "
     "cron jobs and open chat surfaces. Explicit observe, mark-seen, ack and snooze actions "
-    "write only Inbox-owned local state. --fleet adds same-host Herald observations."
+    "write only Inbox-owned local state; acknowledged or snoozed items stay listed and marked "
+    "unless --hide-acked or --hide-snoozed is given. --fleet adds same-host Herald observations."
 )
 
 
@@ -24,6 +25,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--through", type=int, help="Explicit observed sequence to mark seen")
     parser.add_argument("--fleet", action="store_true",
                         help="Include same-host profile Herald ledgers (opt-in, disabled by default)")
+    # Acknowledged/snoozed items are shown and marked by default; only these explicit filters hide them.
+    parser.add_argument("--hide-acked", action="store_true",
+                        help="Hide items acknowledged locally (shown and marked local=acked by default)")
+    parser.add_argument("--hide-snoozed", action="store_true",
+                        help="Hide items snoozed locally (shown and marked local=snoozed by default)")
 
 
 def handle(args: argparse.Namespace) -> int:
@@ -36,7 +42,7 @@ def handle(args: argparse.Namespace) -> int:
         from .state import InboxState, InboxStateError
         from .observations import records
         import sqlite3
-        from .config_yaml import YAMLError
+        from hermes_yaml import YAMLError
         try:
             home = get_hermes_home()
             state = InboxState(home, profile_identity(home))
@@ -68,6 +74,8 @@ def handle(args: argparse.Namespace) -> int:
         except (InboxStateError, ValueError, OSError, sqlite3.Error, YAMLError):
             print(json.dumps({"error": "Local Inbox state unavailable or invalid action input"}))
             return 2
-    data = build_inbox(fleet=bool(getattr(args, "fleet", False)))
+    data = build_inbox(fleet=bool(getattr(args, "fleet", False)),
+                       hide_acked=bool(getattr(args, "hide_acked", False)),
+                       hide_snoozed=bool(getattr(args, "hide_snoozed", False)))
     print(json.dumps(data, indent=2, default=str) if args.json else render_inbox(data))
     return 0

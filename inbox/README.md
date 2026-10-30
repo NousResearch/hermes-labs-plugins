@@ -30,6 +30,8 @@ hermes inbox changes --consumer owner --json
 hermes inbox mark-seen --consumer owner --through <observed-sequence>
 hermes inbox ack <observed-sequence>
 hermes inbox snooze <observed-sequence> --seconds 60
+hermes inbox --hide-acked     explicit filter: leave out acknowledged items
+hermes inbox --hide-snoozed   explicit filter: leave out currently snoozed items
 ```
 
 The default snapshot includes processes, native asynchronous delegations, cron,
@@ -45,6 +47,9 @@ each supplied profile home's `config.yaml`. A falsy ledger path uses that home's
 expand to the **supplied profile home**, not another ambient profile. Unresolved
 other variables fail closed rather than querying a credential store. Relative
 paths retain Herald's current-working-directory semantics.
+
+`config.yaml` is read through Hermes core's `hermes_yaml` module (safe YAML 1.1,
+duplicate keys rejected); Inbox declares no YAML dependency of its own.
 
 An explicit nonblank origin name takes precedence over the native profile ID.
 Unknown identities cannot trigger unrestricted ledger reads. Fleet discovery is
@@ -83,7 +88,14 @@ Without `--through`, `mark-seen` explicitly marks all currently observed events
 seen for that consumer; it is not limited to the first returned page.
 
 Acknowledgment and snooze affect one occurrence only, never source execution,
-outcome or delivery. Expiry is checked on the next view; no scheduler is started.
+outcome or delivery. They never hide work by default: every view still lists
+each waiting item, and acknowledged or snoozed ones are marked `local=acked` or
+`local=snoozed` (the `local_state` field in `--json`), in the same key=value form
+as work-thread lines. Only the explicit `--hide-acked` and `--hide-snoozed`
+filters leave them out of the rendered view and `visible_attention`; the view
+then states how many items the filter hid. The raw `attention` list is never
+filtered. A thread is marked only when every one of its edges is acknowledged
+or snoozed. Expiry is checked on the next view; no scheduler is started.
 Unknown occurrences and non-finite or excessive snooze durations are rejected.
 The snooze maximum is seven days. Each consumer and profile has independent state.
 

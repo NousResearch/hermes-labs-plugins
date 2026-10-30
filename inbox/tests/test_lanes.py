@@ -78,7 +78,7 @@ def test_ack_and_snooze_are_local_and_leave_native_source_unchanged():
     original = deepcopy(snapshot)
     result = lanes.build_lanes(snapshot)
     observed = result["Unknown"][0]
-    assert observed["attention_visible"] is False
+    assert observed["local_state"] == "acked"
     assert observed["occurrences"] == [7]
     assert observed["execution"] == "failed"
     assert snapshot == original
@@ -92,20 +92,36 @@ def thread_snapshot():
             "attention_state": {"herald:operator:a": {"occurrence": 3, "visible": False}}}
 
 
-def test_one_unobserved_edge_prevents_suppressing_whole_thread():
+def test_one_unobserved_edge_prevents_marking_whole_thread():
     result = lanes.build_lanes(thread_snapshot())
     item = result["Waiting"][0]
-    assert item["attention_visible"] is True
+    assert item["local_state"] is None
     assert item["owner"] == "builder"
     assert item["occurrences"] == [3]
 
 
-def test_all_thread_edges_must_be_locally_hidden_to_suppress_thread():
+def test_all_thread_edges_must_be_locally_handled_to_mark_thread():
     snapshot = thread_snapshot()
     snapshot["attention_state"]["herald:builder:b"] = {"occurrence": 8, "visible": False}
     item = lanes.build_lanes(snapshot)["Waiting"][0]
-    assert item["attention_visible"] is False
+    assert item["local_state"] == "snoozed"
     assert item["occurrences"] == [3, 8]
+
+
+@pytest.mark.parametrize("acks,expected", [((True, True), "acked"), ((True, False), "snoozed")])
+def test_thread_is_acked_only_when_every_edge_is_acknowledged(acks, expected):
+    snapshot = thread_snapshot()
+    snapshot["attention_state"] = {
+        "herald:operator:a": {"occurrence": 3, "visible": False, "acknowledged": acks[0]},
+        "herald:builder:b": {"occurrence": 8, "visible": False, "acknowledged": acks[1]}}
+    assert lanes.build_lanes(snapshot)["Waiting"][0]["local_state"] == expected
+
+
+def test_expired_snooze_is_unmarked():
+    state = {"delegation:one": {"occurrence": 7, "visible": True, "acknowledged": False,
+                                "snooze_until": 1.0}}
+    item = project([{"kind": "delegation", "id": "one", "state": "failed"}], attention_state=state)
+    assert flatten(item)[0]["local_state"] is None
 
 
 def test_source_conflict_overrules_completed_and_accepted():

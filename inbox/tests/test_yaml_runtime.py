@@ -1,26 +1,45 @@
-"""Hermes' supported runtime no longer requires the independent PyYAML package."""
+"""Inbox reads YAML through Hermes core's ``hermes_yaml``; it ships no YAML dependency of its own."""
+import ast
 import builtins
 import importlib.util
 import sys
 from pathlib import Path
 
+import hermes_yaml
 import pytest
-from inbox_plugin import config_yaml
+from inbox_plugin import herald
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_herald_config_reads_through_core_hermes_yaml():
+    assert herald.yaml is hermes_yaml
 
 
 @pytest.mark.parametrize('document', [
-    'value: !!python/name:builtins.eval',
-    'origin_name: first\norigin_name: second\n',
+    'hermes_herald:\n  value: !!python/name:builtins.eval\n',
+    'hermes_herald:\n  origin_name: first\n  origin_name: second\n',
 ])
-def test_safe_yaml_rejects_objects_and_duplicate_identity(document):
-    with pytest.raises(config_yaml.YAMLError):
-        config_yaml.safe_load(document)
+def test_core_yaml_rejects_objects_and_duplicate_identity(hermes_home, document):
+    (hermes_home / 'config.yaml').write_text(document)
+    with pytest.raises(hermes_yaml.YAMLError):
+        herald._config(hermes_home)
+
+
+def test_plugin_declares_and_imports_no_yaml_library():
+    manifest = hermes_yaml.safe_load((ROOT / 'plugin.yaml').read_text())
+    assert 'python_dependencies' not in manifest
+    for source in ROOT.glob('*.py'):
+        for node in ast.walk(ast.parse(source.read_text(), filename=str(source))):
+            names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                     else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
+            for name in names:
+                assert name.split('.')[0] not in ('yaml', 'ruamel'), f'{source.name} imports {name}'
 
 
 def test_snapshot_import_and_read_work_when_bare_yaml_is_unavailable(hermes_home, monkeypatch):
-    root = Path(__file__).resolve().parents[1]
     name = 'inbox_without_pyyaml'
-    spec = importlib.util.spec_from_file_location(name, root / '__init__.py', submodule_search_locations=[str(root)])
+    spec = importlib.util.spec_from_file_location(name, ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)

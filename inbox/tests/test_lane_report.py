@@ -1,6 +1,8 @@
 """Native-schema integration gates for lanes and local-only suppression."""
 import time
 
+import pytest
+
 from inbox_plugin import report
 from inbox_plugin.observations import records
 from inbox_seed import add_delegations, write_cron
@@ -17,7 +19,7 @@ def test_delivered_completed_native_work_is_not_lost(hermes_home):
     assert not snapshot["lanes"]["Done"]
 
 
-def test_hidden_failure_still_has_raw_source_fact_and_never_all_clear(hermes_home, monkeypatch):
+def _handled_failure(hermes_home, monkeypatch, action):
     from inbox_plugin.attention import AttentionState
     from inbox_plugin.state import InboxState
     monkeypatch.setattr(report.herald, "profile_identity", lambda home: "operator")
@@ -27,12 +29,38 @@ def test_hidden_failure_still_has_raw_source_fact_and_never_all_clear(hermes_hom
     state = InboxState(hermes_home, "operator")
     state.observe(records(snapshot))
     event = next(i for i in state.changes()["events"] if i["item_id"] == "cron:failure")
-    AttentionState(state).ack(event["seq"])
+    attention = AttentionState(state)
+    attention.ack(event["seq"]) if action == "ack" else attention.snooze(event["seq"], 3600)
+
+
+@pytest.mark.parametrize("action,mark", [("ack", "acked"), ("snooze", "snoozed")])
+def test_default_view_keeps_handled_item_visible_and_marked(hermes_home, monkeypatch, action, mark):
+    _handled_failure(hermes_home, monkeypatch, action)
     after = report.build_inbox(home=hermes_home)
     assert after["attention"][0]["last_status"] == "error"
-    assert after["visible_attention"] == []
+    assert [i["id"] for i in after["visible_attention"]] == ["failure"]
+    assert after["visible_attention"][0]["local_state"] == mark
+    assert "local_state" not in after["attention"][0]
     text = report.render_inbox(after)
-    assert "hidden locally; source state unchanged" in text
+    assert f"cron 'Fixture failure'  last run FAILED: fixture only  local={mark}" in text
+    assert "marked acked/snoozed locally; source state unchanged" in text
+    assert "hidden" not in text
+    assert "Unknown (1 visible / 1 recorded)" in text
+    assert f"occurrence=1 local={mark}" in text
+
+
+@pytest.mark.parametrize("action,flag,other", [("ack", "hide_acked", "hide_snoozed"),
+                                               ("snooze", "hide_snoozed", "hide_acked")])
+def test_only_the_matching_explicit_filter_hides_handled_item(hermes_home, monkeypatch, action, flag, other):
+    _handled_failure(hermes_home, monkeypatch, action)
+    unaffected = report.build_inbox(home=hermes_home, **{other: True})
+    assert [i["id"] for i in unaffected["visible_attention"]] == ["failure"]
+    filtered = report.build_inbox(home=hermes_home, **{flag: True})
+    assert filtered["attention"][0]["last_status"] == "error"
+    assert filtered["visible_attention"] == []
+    assert filtered["attention_filter"][flag] is True
+    text = report.render_inbox(filtered)
+    assert f"1 native attention item(s) hidden by --{flag.replace('_', '-')}; source state unchanged" in text
     assert "all clear" not in text
     assert "Unknown (0 visible / 1 recorded)" in text
 

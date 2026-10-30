@@ -6,5 +6,3 @@ description: >
   evidence-aware attention lanes. Native stores remain read-only.
 author: "Nous Research"
 homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/inbox
-python_dependencies:
-  - ruamel.yaml==0.18.16
