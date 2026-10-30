@@ -2,9 +2,11 @@
 
 Copilot's ``/chat/completions`` ignores ``cache_control`` TTLs and reports no cache writes; ``/v1/messages``
 honors both. Claude models route there (``api_mode`` ``anthropic_messages``) only on a core whose Anthropic
-client asks the profile for its auth style (``ProviderProfile.anthropic_auth_style``) and only when the
-configured base URL is a Copilot host: without the seam core would send the Copilot token as ``x-api-key``
-and get a 401, and a proxy base URL would get core's generic auth, so Claude stays on Chat Completions there.
+client asks the profile for its auth style (``ProviderProfile.anthropic_auth_style``) and which applies a
+saved ``model.api_mode`` to the saved default only (``persisted_api_mode_applies``), and only when the
+configured and exchanged base URLs are Copilot hosts: without the seam core would send the Copilot token as
+``x-api-key`` and get a 401, without the fix a saved Claude wire would pin every other Copilot model, and a
+proxy base URL would get core's generic auth, so Claude stays on Chat Completions there.
 """
 
 from __future__ import annotations
@@ -17,6 +19,17 @@ _HAS_SEAM = hasattr(ProviderProfile, "anthropic_auth_style")
 needs_seam = pytest.mark.skipif(not _HAS_SEAM, reason="core lacks ProviderProfile.anthropic_auth_style")
 
 
+def _core_has_saved_api_mode_fix() -> bool:
+    from hermes_cli import runtime_provider
+
+    return callable(getattr(runtime_provider, "persisted_api_mode_applies", None))
+
+
+# Claude on /v1/messages needs both core changes; a seam-only core keeps Claude on Chat Completions.
+needs_route = pytest.mark.skipif(not (_HAS_SEAM and _core_has_saved_api_mode_fix()),
+                                 reason="core lacks the Anthropic auth seam or the saved-api_mode fix")
+
+
 @pytest.fixture
 def copilot_profile():
     import providers
@@ -26,7 +39,7 @@ def copilot_profile():
     return profile
 
 
-@needs_seam
+@needs_route
 @pytest.mark.parametrize("model, mode", [
     ("claude-sonnet-5.5", "anthropic_messages"),
     ("claude-opus-4.6-1m", "anthropic_messages"),
@@ -41,7 +54,7 @@ def test_api_mode_for_model(copilot_profile, model, mode):
     assert copilot_profile.api_mode_for_model(model) == mode
 
 
-@needs_seam
+@needs_route
 def test_catalog_path_routes_claude_to_messages():
     from github_copilot_plugin.copilot.wire import model_api_mode
 
@@ -56,7 +69,15 @@ def test_claude_stays_on_chat_completions_without_the_core_seam(copilot_profile,
     assert wire.model_api_mode("claude-sonnet-5.5", catalog=[]) == "chat_completions"
 
 
-@needs_seam
+def test_claude_stays_on_chat_completions_without_the_core_saved_api_mode_fix(copilot_profile, monkeypatch):
+    from github_copilot_plugin.copilot import wire
+
+    monkeypatch.setattr(wire, "core_scopes_saved_api_mode", lambda: False)
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+    assert wire.model_api_mode("claude-sonnet-5.5", catalog=[]) == "chat_completions"
+
+
+@needs_route
 @pytest.mark.parametrize("base_url, mode", [
     ("https://copilot-proxy.example.test", "chat_completions"),
     ("http://127.0.0.1:8080", "chat_completions"),
@@ -70,7 +91,7 @@ def test_claude_uses_messages_only_on_a_copilot_base_url(copilot_profile, monkey
     assert copilot_profile.api_mode_for_model("gpt-4.1") == "chat_completions"
 
 
-@needs_seam
+@needs_route
 def test_a_configured_proxy_base_url_keeps_claude_on_chat_completions(copilot_profile, hermes_home):
     from hermes_cli import config as cfg
 
@@ -79,6 +100,26 @@ def test_a_configured_proxy_base_url_keeps_claude_on_chat_completions(copilot_pr
     cfg._LOAD_CONFIG_CACHE.clear()
     cfg._RAW_CONFIG_CACHE.clear()
     assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+
+
+@needs_route
+@pytest.mark.parametrize("exchanged, mode", [
+    ("https://api.business.githubcopilot.com", "anthropic_messages"),
+    ("https://copilot-gateway.example.test", "chat_completions"),
+    (None, "anthropic_messages"),  # the exchange handed out no host: the configured one decides
+])
+def test_claude_uses_messages_only_when_the_exchanged_base_url_is_a_copilot_host(
+        copilot_profile, monkeypatch, exchanged, mode):
+    """``runtime_base_url`` prefers the exchange's ``endpoints.api``: a non-Copilot host there would get core's
+    generic ``x-api-key`` auth on /v1/messages, so Claude stays on Chat Completions."""
+    import time
+
+    from github_copilot_plugin.copilot import credentials
+
+    monkeypatch.setenv("GH_TOKEN", "ghu_raw_gh_token")
+    fp = credentials._token_fingerprint("ghu_raw_gh_token")
+    monkeypatch.setitem(credentials._jwt_cache, fp, ("tid=exchanged", time.time() + 1800, exchanged))
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == mode
 
 
 @pytest.mark.parametrize("url, style", [
@@ -114,6 +155,33 @@ def test_claude_turn_goes_to_v1_messages_with_bearer_auth_on_the_wire(url):
     # requests); the plan hosts keep the client default ``agent``.
     assert first.headers["x-initiator"] == ("user" if url == "https://api.githubcopilot.com" else "agent")
     assert "copilot-vision-request" not in first.headers  # /v1/messages needs no vision header (live-verified)
+
+
+@needs_seam
+def test_a_401_on_v1_messages_refreshes_the_token_and_retries_with_copilot_auth(monkeypatch):
+    """Offline end to end: the first /v1/messages call answers 401, core asks this profile's
+    ``refresh_runtime_credentials`` (stubbed to a fresh exchanged token), rebuilds the Anthropic client and
+    retries; the retry carries ``Bearer <fresh>`` and the Copilot headers, and the turn completes."""
+    from conftest import offline_messages_turn
+    from github_copilot_plugin.copilot import credentials
+
+    calls = []
+
+    def fresh_token():
+        calls.append("unauthorized")
+        return "tid=fresh;exp=2", None
+
+    monkeypatch.setitem(credentials._RUNTIME_REFRESHERS, "unauthorized", fresh_token)
+    sent = offline_messages_turn("https://api.githubcopilot.com", model="claude-sonnet-5.5", first_status=401)
+    assert calls == ["unauthorized"]
+    assert len(sent) >= 2, "the 401 was not retried"
+    assert sent[0].headers["authorization"] == "Bearer tid=offline"
+    retry = sent[1]
+    assert retry.path == "/v1/messages"
+    assert retry.headers["authorization"] == "Bearer tid=fresh;exp=2"
+    assert "x-api-key" not in retry.headers
+    assert retry.headers["copilot-integration-id"] == "vscode-chat"
+    assert "editor-version" in retry.headers
 
 
 def test_setup_saves_no_api_mode_and_drops_one_an_earlier_setup_saved(copilot_profile, hermes_home, monkeypatch):

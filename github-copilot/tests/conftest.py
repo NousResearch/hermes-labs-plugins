@@ -144,10 +144,11 @@ class SentMessagesRequest(NamedTuple):
 
 
 def offline_messages_turn(base_url: str, *, model: str = "claude-sonnet-5.5", message: str = "hi",
-                          **agent_kwargs) -> list[SentMessagesRequest]:
+                          first_status: int | None = None, **agent_kwargs) -> list[SentMessagesRequest]:
     """Run one real ``AIAgent.chat`` turn on ``anthropic_messages`` against *base_url*, with every httpx
     transport replaced by an ``httpx.MockTransport`` that answers Anthropic Messages requests with "ok";
-    return those requests as they went on the wire (path, lower-cased headers, JSON body)."""
+    return those requests as they went on the wire (path, lower-cased headers, JSON body). With
+    *first_status* (e.g. 401), the first ``/v1/messages`` request gets that error instead."""
     import json
     from unittest.mock import patch
 
@@ -162,6 +163,9 @@ def offline_messages_turn(base_url: str, *, model: str = "claude-sonnet-5.5", me
         if request.url.path.endswith("/messages"):
             sent.append(SentMessagesRequest(request.url.path, {k.lower(): v for k, v in request.headers.items()},
                                             body))
+            if first_status is not None and len(sent) == 1:
+                return httpx.Response(first_status, json={
+                    "type": "error", "error": {"type": "authentication_error", "message": "token expired"}})
             if body.get("stream"):
                 return httpx.Response(200, text=_anthropic_sse(body.get("model", model)),
                                       headers={"content-type": "text/event-stream"})

@@ -1,13 +1,18 @@
-"""A ``model.api_mode`` saved by an earlier setup must not strand Claude on a wrong wire or split one session
-across wires.
+"""Which wire Claude gets when ``config.yaml`` carries a saved ``model.api_mode``.
 
-Core honors a persisted ``model.api_mode`` over the profile's per-model wire, except that it rescues a stale
-``codex_responses`` (saved when a GPT-5+ model was picked) to ``chat_completions`` when the profile answers
-``chat_completions`` for the target model (hermes_cli/runtime_provider.py ``_profile_runtime_api_mode``,
-#46527). If Claude answered ``anthropic_messages`` there, the rescue would not fire and Claude would resolve
-to ``codex_responses`` (Copilot rejects Claude on Responses). So while a legacy saved mode is present, Claude
-answers ``chat_completions``, the behavior before the /v1/messages route, until the user removes it
-(``hermes model`` or ``hermes config unset model.api_mode``).
+Core with the saved-api_mode fix (``hermes_cli.runtime_provider.persisted_api_mode_applies``) honors a saved
+``model.api_mode`` for the saved ``model.default`` only; every other model of the provider gets the profile's
+per-model wire, and a ``/model --global`` / Desktop pick no longer saves one. On that core:
+
+- a value saved for another model never pins Claude (or GPT) to a wrong wire;
+- a legacy value saved for a Claude default (``chat_completions`` from an earlier setup, or ``codex_responses``
+  that core rescues to ``chat_completions``) keeps that one model on ``/chat/completions`` on every path, so a
+  session never mixes wires; other Claude models use ``/v1/messages``;
+- an ``anthropic_messages`` saved for a Claude default by an older build leaves GPT targets on their own wire.
+
+An older core honors a saved mode for every model and saves the picked model's wire, so a saved
+``anthropic_messages`` would send GPT targets (delegation, cron, auxiliary tasks) to ``/v1/messages``. There the
+plugin keeps Claude on ``/chat/completions`` and so never produces that value.
 """
 
 from __future__ import annotations
@@ -21,17 +26,21 @@ from hermes_cli import runtime_provider as rp
 from providers.base import ProviderProfile
 
 _providers.get_provider_profile("copilot")  # imports the copilot plugin package
+from github_copilot_plugin.copilot import catalog as copilot_catalog
 from github_copilot_plugin.copilot import credentials as copilot_credentials
 from github_copilot_plugin.copilot import wire as copilot_wire
 
-needs_seam = pytest.mark.skipif(not hasattr(ProviderProfile, "anthropic_auth_style"),
-                                reason="core lacks ProviderProfile.anthropic_auth_style")
+_HAS_SEAM = hasattr(ProviderProfile, "anthropic_auth_style")
+_HAS_FIX = callable(getattr(rp, "persisted_api_mode_applies", None))
+needs_seam = pytest.mark.skipif(not _HAS_SEAM, reason="core lacks ProviderProfile.anthropic_auth_style")
+needs_route = pytest.mark.skipif(not (_HAS_SEAM and _HAS_FIX),
+                                 reason="core lacks the Anthropic auth seam or the saved-api_mode fix")
 
 
-def _write_config(hermes_home, api_mode: str | None) -> None:
+def _write_config(hermes_home, api_mode: str | None, default: str = "gpt-5.4") -> None:
     from hermes_cli import config as cfg
 
-    lines = ["model:", "  provider: copilot", "  default: gpt-5.4", "  base_url: https://api.githubcopilot.com"]
+    lines = ["model:", "  provider: copilot", f"  default: {default}", "  base_url: https://api.githubcopilot.com"]
     if api_mode:
         lines.append(f"  api_mode: {api_mode}")
     (hermes_home / "config.yaml").write_text("\n".join(lines) + "\n")
@@ -45,41 +54,138 @@ def offline_copilot(monkeypatch):
     monkeypatch.setattr(copilot_credentials, "resolve_copilot_token", lambda: ("ghu_raw_gh_token", "GH_TOKEN"))
     monkeypatch.setattr(copilot_credentials, "get_copilot_api_token",
                         lambda tok: ("tid=exchanged;exp=1", "https://api.githubcopilot.com"))
+    monkeypatch.setattr(copilot_catalog, "fetch_github_model_catalog", lambda **k: [])
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "copilot")
 
 
-def _resolved_mode(target_model: str) -> str:
+def _resolved_mode(target_model: str | None = None) -> str:
     return rp.resolve_runtime_provider(requested="copilot", target_model=target_model)["api_mode"]
 
 
-@needs_seam
-def test_saved_codex_responses_does_not_strand_a_claude_target_on_responses(hermes_home, offline_copilot):
-    _write_config(hermes_home, "codex_responses")
-    assert _resolved_mode("claude-sonnet-5.5") == "chat_completions"  # core's rescue, as before this route
+def _derived_mode(model: str) -> str | None:
+    """What ``/model``, resume and (on an older core) a saved selection use."""
+    from hermes_cli.model_switch import model_derived_api_mode
+
+    return model_derived_api_mode("copilot", model)
+
+
+# ── core with the saved-api_mode fix ──
+
+
+@needs_route
+def test_without_a_saved_api_mode_claude_resolves_to_messages(hermes_home, offline_copilot):
+    _write_config(hermes_home, None)
+    assert _resolved_mode("claude-sonnet-5.5") == "anthropic_messages"
     assert _resolved_mode("gpt-5.4") == "codex_responses"
 
 
-@needs_seam
-def test_saved_codex_responses_keeps_claude_off_messages_on_every_path(hermes_home):
-    """``/model`` and resume re-derive the wire from the profile (``model_derived_api_mode``) and agree with
-    startup, so one session never flips between wires."""
-    from hermes_cli.model_switch import model_derived_api_mode
-
+@needs_route
+def test_a_value_saved_for_a_gpt_default_does_not_pin_claude(hermes_home, offline_copilot):
     _write_config(hermes_home, "codex_responses")
-    assert model_derived_api_mode("copilot", "claude-sonnet-5.5") == "chat_completions"
-    assert model_derived_api_mode("copilot", "gpt-5.4") == "codex_responses"
+    assert _resolved_mode() == _resolved_mode("gpt-5.4") == "codex_responses"
+    assert _resolved_mode("claude-sonnet-5.5") == _derived_mode("claude-sonnet-5.5") == "anthropic_messages"
 
 
-@needs_seam
-def test_removing_the_saved_api_mode_moves_claude_to_messages(hermes_home, offline_copilot, monkeypatch):
+@needs_route
+def test_saved_anthropic_messages_for_a_claude_default_does_not_break_gpt_targets(hermes_home, offline_copilot):
+    """What an older build saved on ``/model --global claude-...``: GPT targets keep their own wire."""
+    _write_config(hermes_home, "anthropic_messages", default="claude-opus-5.5")
+    assert _resolved_mode() == "anthropic_messages"
+    assert _resolved_mode("gpt-5.4") == "codex_responses"
+    assert _resolved_mode("gpt-4.1") == "chat_completions"
+    assert _resolved_mode("gemini-3-pro-preview") == "chat_completions"
+
+
+@needs_route
+@pytest.mark.parametrize("saved", ["chat_completions", "codex_responses"])
+def test_a_legacy_value_saved_for_a_claude_default_keeps_that_model_on_chat_completions(
+        hermes_home, offline_copilot, saved):
+    """Startup honors (or rescues) the saved value for the default, and ``/model`` / resume ask the profile:
+    both answer ``chat_completions`` for that model, so one session never mixes wires."""
+    _write_config(hermes_home, saved, default="claude-sonnet-5.5")
+    assert _resolved_mode() == _resolved_mode("claude-sonnet-5.5") == "chat_completions"
+    assert _derived_mode("claude-sonnet-5.5") == "chat_completions"
+    assert _resolved_mode("claude-opus-5.5") == _derived_mode("claude-opus-5.5") == "anthropic_messages"
+    assert _resolved_mode("gpt-5.4") == "codex_responses"
+
+
+@needs_route
+def test_removing_the_saved_api_mode_moves_the_claude_default_to_messages(hermes_home, offline_copilot):
     """What ``hermes config unset model.api_mode`` (or re-running ``hermes model``) does."""
-    from github_copilot_plugin.copilot import catalog
+    _write_config(hermes_home, "chat_completions", default="claude-sonnet-5.5")
+    assert _resolved_mode() == "chat_completions"
+    _write_config(hermes_home, None, default="claude-sonnet-5.5")
+    assert _resolved_mode() == "anthropic_messages"
 
-    monkeypatch.setattr(catalog, "fetch_github_model_catalog", lambda **k: [])
-    _write_config(hermes_home, "codex_responses")
+
+@needs_route
+def test_a_global_claude_pick_saves_no_api_mode(hermes_home, offline_copilot):
+    from hermes_cli.model_switch import ModelSwitchResult, model_selection_config_updates
+
+    result = ModelSwitchResult(success=True, new_model="claude-opus-5.5", target_provider="copilot",
+                               base_url="https://api.githubcopilot.com", api_mode="anthropic_messages",
+                               is_global=True)
+    assert model_selection_config_updates(result, {"provider": "copilot", "api_mode": "chat_completions"})[
+        "api_mode"] is None
+
+
+# ── a core without the saved-api_mode fix ──
+
+
+@needs_seam
+def test_without_the_core_fix_claude_never_answers_anthropic_messages(hermes_home, monkeypatch):
+    """An older core saves the derived wire on ``/model --global`` and honors it for every model: the plugin
+    keeps Claude on ``chat_completions`` there, so ``anthropic_messages`` is never saved and GPT targets keep
+    working."""
+    monkeypatch.setattr(copilot_wire, "core_scopes_saved_api_mode", lambda: False)
+    _write_config(hermes_home, None, default="claude-opus-5.5")
+    assert _derived_mode("claude-opus-5.5") == "chat_completions"
+    assert _derived_mode("gpt-5.4") == "codex_responses"
+    profile = _providers.get_provider_profile("copilot")
+    assert profile.api_mode_for_model("claude-opus-5.5") == "chat_completions"
+
+
+def test_core_fix_detection_follows_the_core_helper(monkeypatch):
+    assert copilot_wire.core_scopes_saved_api_mode() is _HAS_FIX
+    monkeypatch.delattr(rp, "persisted_api_mode_applies", raising=False)
+    assert copilot_wire.core_scopes_saved_api_mode() is False
+
+
+def test_without_the_core_fix_a_saved_anthropic_messages_is_reported_once(hermes_home, monkeypatch, caplog):
+    """An older core applies a saved ``anthropic_messages`` (written by an earlier build of this route) to every
+    Copilot model, which no profile answer can override: the plugin says once how to remove it."""
+    import logging
+
+    monkeypatch.setattr(copilot_wire, "core_scopes_saved_api_mode", lambda: False)
+    monkeypatch.setattr(copilot_wire, "_WARNED_SAVED_MESSAGES_WIRE", set())
+    _write_config(hermes_home, "anthropic_messages", default="claude-opus-5.5")
+    with caplog.at_level(logging.WARNING, logger=copilot_wire.logger.name):
+        assert copilot_wire._api_mode_for_id("gpt-4.1") == "chat_completions"
+        assert copilot_wire._api_mode_for_id("claude-opus-5.5") == "chat_completions"
+    warnings = [r for r in caplog.records if "hermes config unset model.api_mode" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@needs_route
+def test_with_the_core_fix_a_saved_anthropic_messages_is_not_reported(hermes_home, caplog):
+    import logging
+
+    _write_config(hermes_home, "anthropic_messages", default="claude-opus-5.5")
+    with caplog.at_level(logging.WARNING, logger=copilot_wire.logger.name):
+        copilot_wire._api_mode_for_id("gpt-4.1")
+    assert not [r for r in caplog.records if "model.api_mode" in r.getMessage()]
+
+
+def test_before_the_messages_route_a_saved_codex_responses_was_rescued_for_claude(
+        hermes_home, offline_copilot, monkeypatch):
+    """The baseline this route must keep: without the core seam Claude answers ``chat_completions`` and core
+    rescues a saved ``codex_responses`` to it."""
+    monkeypatch.setattr(copilot_wire, "core_serves_anthropic_bearer", lambda: False)
+    _write_config(hermes_home, "codex_responses", default="claude-sonnet-5.5")
     assert _resolved_mode("claude-sonnet-5.5") == "chat_completions"
-    _write_config(hermes_home, None)
-    assert _resolved_mode("claude-sonnet-5.5") == "anthropic_messages"
+
+
+# ── setup ──
 
 
 def test_a_managed_or_default_api_mode_is_never_popped_by_setup(copilot_profile_setup, hermes_home, monkeypatch):
@@ -104,28 +210,3 @@ def copilot_profile_setup():
 
     profile = _providers.get_provider_profile("copilot")
     return sys.modules[f"{type(profile).__module__}.setup"]
-
-
-@needs_seam
-def test_without_a_saved_api_mode_claude_resolves_to_messages(hermes_home, offline_copilot, monkeypatch):
-    from github_copilot_plugin.copilot import catalog
-
-    _write_config(hermes_home, None)
-    monkeypatch.setattr(catalog, "fetch_github_model_catalog", lambda **k: [])
-    assert _resolved_mode("claude-sonnet-5.5") == "anthropic_messages"
-    assert _resolved_mode("gpt-5.4") == "codex_responses"
-
-
-@needs_seam
-def test_saved_chat_completions_is_honored_as_before(hermes_home, offline_copilot):
-    _write_config(hermes_home, "chat_completions")
-    assert _resolved_mode("claude-sonnet-5.5") == "chat_completions"
-
-
-def test_before_the_messages_route_a_saved_codex_responses_was_rescued_for_claude(
-        hermes_home, offline_copilot, monkeypatch):
-    """The baseline this route must keep: without the core seam Claude answers ``chat_completions`` and core
-    rescues a saved ``codex_responses`` to it."""
-    monkeypatch.setattr(copilot_wire, "core_serves_anthropic_bearer", lambda: False)
-    _write_config(hermes_home, "codex_responses")
-    assert _resolved_mode("claude-sonnet-5.5") == "chat_completions"
