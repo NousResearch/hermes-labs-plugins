@@ -70,21 +70,25 @@ user turn on the exact host `api.githubcopilot.com` (and GitHub Models, `models.
 
 ## Claude on `/v1/messages`
 
-On a Hermes core with the Anthropic auth-style hook and saved-`api_mode` scoping
-([hermes-agent#TBD](https://github.com/NousResearch/hermes-agent/pull/TBD)), `copilot` sends Claude models to
+On a Hermes core with both the Anthropic auth-style hook
+([hermes-agent#TBD-seam](https://github.com/NousResearch/hermes-agent/pull/TBD-seam)) and saved-`api_mode` scoping
+([hermes-agent#TBD-fix](https://github.com/NousResearch/hermes-agent/pull/TBD-fix)), `copilot` sends Claude models to
 Copilot's Anthropic-format `/v1/messages` endpoint (`api_mode: anthropic_messages`) instead of `/chat/completions`.
+Both are needed: without the first, core sends the Copilot token as `x-api-key` (a 401); without the second, a
+saved Claude wire would pin every other Copilot model.
 There Copilot honors prompt-cache TTLs (`prompt_caching.cache_ttl`, e.g. `1h`) and reports cache writes, so a
 cached prompt survives idle gaps longer than a few minutes and Hermes can account for writes. On an older core,
-or when `COPILOT_API_BASE_URL` / `model.base_url` (or the API host your token exchange hands out) is a non-Copilot
+or when `COPILOT_API_BASE_URL` / `model.base_url` (or any API host a token exchange handed out) is a non-Copilot
 host (a proxy), Claude stays on `/chat/completions`. A proxy base URL set only for one session (a `/model` switch
 or a gateway / Desktop override that is in neither `config.yaml` nor the environment) is not seen when the wire is
 chosen: set it in `model.base_url` or `COPILOT_API_BASE_URL` so Claude keeps using `/chat/completions` there.
 `-fast` variants (e.g. `claude-opus-4.8-fast`) also stay on `/chat/completions`: Copilot's `/v1/messages` rejects
 the hyphenated id Hermes core sends for them.
 
-The wire is chosen per model from `COPILOT_API_BASE_URL` (read through Hermes' secret scope), the cached
-`config.yaml` (`model.base_url`, `model.default`, `model.api_mode`) and the in-memory token-exchange cache; no
-network call is made to choose it.
+The wire itself is chosen without a network call, from `COPILOT_API_BASE_URL` (read through Hermes' secret
+scope), the cached `config.yaml` (`model.base_url`, `model.default`, `model.api_mode`) and the token-exchange
+cache (in memory, or the saved exchange file read-only before the first exchange). Normalizing the model id first
+may read your account's cached live model catalog, which Hermes fetches when that cache is empty or stale.
 
 A saved `model.api_mode` applies only to your saved `model.default` on such a core, and `/model --global` or a
 Desktop pick no longer saves one for Copilot. If `hermes model` → GitHub Copilot saved one before this version

@@ -122,6 +122,69 @@ def test_claude_uses_messages_only_when_the_exchanged_base_url_is_a_copilot_host
     assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == mode
 
 
+@needs_route
+def test_a_pool_credential_exchange_on_a_proxy_host_keeps_claude_on_chat_completions(copilot_profile, monkeypatch):
+    """A pool row (``hermes auth add copilot``) is exchanged under its own fingerprint, not the env token's:
+    every in-memory exchange counts, so a proxy host from any of them keeps Claude on Chat Completions."""
+    import time
+
+    from github_copilot_plugin.copilot import credentials
+
+    now = time.time() + 1800
+    monkeypatch.setitem(credentials._jwt_cache, "env-token-fp", ("tid=a", now, "https://api.githubcopilot.com"))
+    monkeypatch.setitem(credentials._jwt_cache, "pool-row-fp", ("tid=b", now, "https://copilot-gateway.example.test"))
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+
+
+@needs_route
+@pytest.mark.parametrize("persisted, mode", [
+    ("https://copilot-gateway.example.test", "chat_completions"),
+    ("https://api.enterprise.githubcopilot.com", "anthropic_messages"),
+])
+def test_before_any_exchange_the_persisted_exchange_host_decides(copilot_profile, hermes_home, persisted, mode):
+    """With no exchange in this process yet, the saved exchange file (read-only) says which host the next
+    exchange is likely to hand out; nothing is exchanged or written to decide."""
+    import json
+    import time
+
+    from conftest import record_io
+
+    path = hermes_home / ".copilot_jwt.json"
+    path.write_text(json.dumps({"fp": {"api_token": "tid=disk", "expires_at": time.time() + 1800,
+                                       "base_url": persisted}}))
+    before = path.read_text()
+    with record_io() as events:
+        assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == mode
+    assert path.read_text() == before
+    assert not [e for e in events if e[0] == "spawn"]
+
+
+@needs_route
+def test_an_unreadable_exchange_cache_fails_closed(copilot_profile, monkeypatch):
+    from github_copilot_plugin.copilot import credentials
+
+    class _Broken(dict):
+        def values(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(credentials, "_jwt_cache", _Broken())
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+
+
+@needs_route
+def test_the_exchanged_host_check_validates_no_token(copilot_profile, monkeypatch):
+    """No token lookup or validation per decision: an unsupported ``GITHUB_TOKEN`` is never re-checked (and
+    re-logged) each time Claude's wire is chosen."""
+    from github_copilot_plugin.copilot import credentials
+
+    def unexpected(*a, **k):
+        raise AssertionError("token lookup on a wire decision")
+
+    monkeypatch.setattr(credentials, "resolve_copilot_token", unexpected)
+    monkeypatch.setattr(credentials, "validate_copilot_token", unexpected)
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "anthropic_messages"
+
+
 @pytest.mark.parametrize("url, style", [
     ("https://api.githubcopilot.com", "bearer"),
     ("https://api.individual.githubcopilot.com", "bearer"),

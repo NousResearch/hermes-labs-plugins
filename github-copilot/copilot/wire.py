@@ -3,8 +3,9 @@
 Fills the generic ProviderProfile wire seams (``providers/base.py`` L1 block). Every hook here answers
 from its arguments alone, except ``api_mode_for_model``, which reads ``COPILOT_API_BASE_URL`` (through
 ``get_secret``), the cached config (``model.base_url`` / ``model.default`` / ``model.api_mode``, through
-``load_config_readonly``) and the in-memory token-exchange cache (never the network or disk) and, with an
-``api_key``, the account's cached live catalog to normalize the model id first.
+``load_config_readonly``) and the token-exchange cache (in memory, or the persisted store read-only before
+any exchange in this process; never the network) and, with an ``api_key``, the account's cached live
+catalog to normalize the model id first.
 """
 
 from __future__ import annotations
@@ -71,6 +72,16 @@ def core_serves_messages_route() -> bool:
 _MESSAGES_UNSUPPORTED_SUFFIXES = ("-fast",)
 
 
+def _saved_default(model: dict) -> tuple[str, str]:
+    """``(model id, provider)`` of the saved default the way core reads it (``_get_model_config``): ``model``
+    is an alias for ``default``, and a dict default carries its own provider."""
+    raw = model.get("default") or model.get("model")
+    if isinstance(raw, dict):
+        return (str(raw.get("model") or raw.get("default") or "").strip(),
+                str(raw.get("provider") or "").strip())
+    return str(raw or "").strip(), ""
+
+
 def _copilot_model_config() -> dict:
     """config.yaml's ``model`` section when its provider is a Copilot id, else ``{}`` (cached, read-only)."""
     from hermes_cli.config import load_config_readonly
@@ -78,9 +89,10 @@ def _copilot_model_config() -> dict:
     from .activation import COPILOT_PROVIDER_IDS
 
     model = (load_config_readonly() or {}).get("model")
-    if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() in COPILOT_PROVIDER_IDS:
-        return model
-    return {}
+    if not isinstance(model, dict):
+        return {}
+    provider = str(model.get("provider") or "").strip() or _saved_default(model)[1]
+    return model if provider.lower() in COPILOT_PROVIDER_IDS else {}
 
 
 def _configured_base_url() -> str:
@@ -101,18 +113,33 @@ def _configured_base_url() -> str:
 
 
 def _exchanged_base_urls_are_copilot_hosts() -> bool:
-    """Whether the API base URL the token exchange handed out for the current GitHub token (``endpoints.api``
-    / ``proxy-ep``, which ``runtime_base_url`` prefers over the configured one) is a Copilot host. Reads only
-    the in-memory exchange cache; True when that token has not been exchanged in this process yet."""
+    """Whether every API base URL a token exchange handed out (``endpoints.api`` / ``proxy-ep``, which
+    ``runtime_base_url`` prefers over the configured one) is a Copilot host: all in-memory exchanges, whatever
+    credential they came from (env token or a pool row), or, before any exchange in this process, the
+    persisted ones (read-only). No token lookup or validation runs here. Fails closed: a read error answers
+    False, so Claude stays on Chat Completions."""
     try:
-        from .credentials import _jwt_cache, _token_fingerprint, resolve_copilot_token
+        from . import credentials
 
-        raw_token, _source = resolve_copilot_token()
-        entry = _jwt_cache.get(_token_fingerprint(raw_token)) if raw_token else None
-    except Exception as exc:  # an unreadable secret store: the configured-host check still applies
+        entries = list(credentials._jwt_cache.values())  # atomic copy; other threads may exchange meanwhile
+        if not entries:
+            entries = list(_persisted_jwt_entries())
+        return all(is_copilot_host(entry[2]) for entry in entries if entry and entry[2])
+    except Exception as exc:  # health: allow BLE001 -- fail closed: an unreadable cache keeps Chat Completions
         logger.debug("Copilot exchanged base URL lookup failed (%s)", type(exc).__name__)
-        return True
-    return not (entry and entry[2]) or is_copilot_host(entry[2])
+        return False
+
+
+def _persisted_jwt_entries():
+    """``(api_token, expires_at, base_url)``-shaped entries of every exchange the plugin persisted: one bounded,
+    read-only read of the JWT store (``_read_jwt_store``); nothing is written or exchanged."""
+    from . import credentials
+
+    path = credentials._jwt_disk_path()
+    store = credentials._read_jwt_store(path) if path else None
+    for entry in (store or {}).values():
+        if isinstance(entry, dict):
+            yield ("", 0.0, entry.get("base_url"))
 
 
 # Saved ``model.api_mode`` values that keep the saved default Claude model on Chat Completions: earlier
@@ -126,17 +153,30 @@ def _bare(model_id: object) -> str:
     return str(model_id or "").strip().lower().rsplit("/", 1)[-1]  # ``anthropic/claude-...`` too
 
 
+def _same_model(a: object, b: object) -> bool:
+    """Whether two Copilot ids name one model: alias and vendor-prefix normalization without the catalog (no
+    I/O), so a dashed ``claude-sonnet-4-6`` default matches the dotted id ``/model`` and resume normalize to."""
+    from .catalog import normalize_copilot_model_id
+
+    def norm(x: object) -> str:
+        return _bare(normalize_copilot_model_id(str(x or ""), catalog=[]))
+
+    left = norm(a)
+    return bool(left) and left == norm(b)
+
+
 def _legacy_api_mode_pins(model_id: str) -> bool:
     """Whether a saved Copilot ``model.api_mode`` still decides *model_id*'s wire: core applies a saved
-    value to the saved ``model.default`` only, so this is true when *model_id* is that default and the saved
-    value is a legacy one. Claude then answers ``chat_completions`` for it, so core's ``codex_responses``
+    value to the saved ``model.default`` only, so this is true when *model_id* is that default (compared after
+    the plugin's id normalization, and read the way core reads it: ``model.model`` alias, dict default) and the
+    saved value is a legacy one. Claude then answers ``chat_completions`` for it, so core's ``codex_responses``
     rescue fires and ``/model`` / resume (which ask the profile) agree with startup (which honors the saved
     value). Other Claude models use /v1/messages. ``hermes model`` or ``hermes config unset model.api_mode``
     removes the value; a ``/model --global`` pick on a core with the fix no longer saves one."""
     try:
         model = _copilot_model_config()
         saved = str(model.get("api_mode") or "").strip().lower()
-        return saved in _LEGACY_SAVED_API_MODES and _bare(model.get("default")) == _bare(model_id)
+        return saved in _LEGACY_SAVED_API_MODES and _same_model(_saved_default(model)[0], model_id)
     except Exception as exc:  # an unreadable config keeps the new route
         logger.debug("Copilot saved api_mode lookup failed (%s)", type(exc).__name__)
         return False

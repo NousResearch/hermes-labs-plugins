@@ -119,6 +119,36 @@ def test_removing_the_saved_api_mode_moves_the_claude_default_to_messages(hermes
 
 
 @needs_route
+@pytest.mark.parametrize("default, target", [
+    ("claude-sonnet-4-6", "claude-sonnet-4.6"),  # dashed alias vs the dotted id /model and resume normalize to
+    ("anthropic/claude-sonnet-4.6", "claude-sonnet-4.6"),
+    ("claude-sonnet-4.6", "anthropic/claude-sonnet-4-6"),
+])
+def test_a_legacy_pin_matches_the_default_across_id_spellings(hermes_home, default, target):
+    """Startup passes the saved id as written; ``/model`` and resume pass the normalized one. The pin compares
+    both after the plugin's own (catalog-free) normalization, so the wire never flips mid-session."""
+    _write_config(hermes_home, "chat_completions", default=default)
+    assert copilot_wire._legacy_api_mode_pins(default) is True
+    assert copilot_wire._legacy_api_mode_pins(target) is True
+    assert copilot_wire._legacy_api_mode_pins("claude-opus-5.5") is False
+
+
+@needs_route
+@pytest.mark.parametrize("model_block", [
+    "model:\n  provider: copilot\n  model: claude-sonnet-5.5\n  api_mode: chat_completions\n",  # legacy alias
+    "model:\n  default:\n    model: claude-sonnet-5.5\n    provider: copilot\n  api_mode: chat_completions\n",
+])
+def test_a_legacy_pin_reads_the_default_the_way_core_does(hermes_home, model_block):
+    from hermes_cli import config as cfg
+
+    (hermes_home / "config.yaml").write_text(model_block)
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert copilot_wire._legacy_api_mode_pins("claude-sonnet-5.5") is True
+    assert copilot_wire._legacy_api_mode_pins("claude-opus-5.5") is False
+
+
+@needs_route
 def test_a_global_claude_pick_saves_no_api_mode(hermes_home, offline_copilot):
     from hermes_cli.model_switch import ModelSwitchResult, model_selection_config_updates
 
