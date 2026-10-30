@@ -172,6 +172,35 @@ def test_an_unreadable_exchange_cache_fails_closed(copilot_profile, monkeypatch)
 
 
 @needs_route
+@pytest.mark.parametrize("store", ["corrupt", "oversized"])
+def test_an_unusable_persisted_exchange_store_fails_closed(copilot_profile, hermes_home, monkeypatch, store):
+    """A store file that exists but cannot be read (corrupt JSON, over the size cap) says nothing about the
+    exchanged host, so Claude stays on Chat Completions instead of reading it as 'no exchange yet'."""
+    from github_copilot_plugin.copilot import credentials
+
+    path = hermes_home / ".copilot_jwt.json"
+    if store == "corrupt":
+        path.write_text("{not json")
+    else:
+        path.write_text('{"fp": {"base_url": "https://api.githubcopilot.com"}}')
+        monkeypatch.setattr(credentials, "_JWT_DISK_MAX_BYTES", 8)
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+
+
+@needs_route
+def test_a_failing_base_url_lookup_fails_closed(copilot_profile, monkeypatch):
+    """If ``COPILOT_API_BASE_URL`` cannot be read, the configured host is unknown (it may be a proxy), so
+    Claude stays on Chat Completions."""
+    import agent.secret_scope
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("secret store unavailable")
+
+    monkeypatch.setattr(agent.secret_scope, "get_secret", _raise)
+    assert copilot_profile.api_mode_for_model("claude-sonnet-5.5") == "chat_completions"
+
+
+@needs_route
 def test_the_exchanged_host_check_validates_no_token(copilot_profile, monkeypatch):
     """No token lookup or validation per decision: an unsupported ``GITHUB_TOKEN`` is never re-checked (and
     re-logged) each time Claude's wire is chosen."""

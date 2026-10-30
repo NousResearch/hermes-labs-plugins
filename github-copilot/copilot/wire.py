@@ -97,7 +97,8 @@ def _copilot_model_config() -> dict:
 
 def _configured_base_url() -> str:
     """The Copilot API base URL the user pointed Hermes at: ``COPILOT_API_BASE_URL`` (through ``get_secret``),
-    else a Copilot ``model.base_url`` in config.yaml (``load_config_readonly``), else the default."""
+    else a Copilot ``model.base_url`` in config.yaml (``load_config_readonly``), else the default. A lookup error
+    answers ``""`` (not a Copilot host), so Claude stays on Chat Completions."""
     from .catalog import COPILOT_BASE_URL
 
     try:
@@ -107,9 +108,9 @@ def _configured_base_url() -> str:
         if env_url:
             return env_url
         return str(_copilot_model_config().get("base_url") or "").strip() or COPILOT_BASE_URL
-    except Exception as exc:  # an unreadable config/secret store keeps the default host
-        logger.debug("Copilot base URL lookup failed (%s); using the default host", type(exc).__name__)
-    return COPILOT_BASE_URL
+    except Exception as exc:  # an unreadable config/secret store is not a Copilot host: Chat Completions
+        logger.debug("Copilot base URL lookup failed (%s); treating it as a non-Copilot host", type(exc).__name__)
+    return ""
 
 
 def _exchanged_base_urls_are_copilot_hosts() -> bool:
@@ -132,11 +133,14 @@ def _exchanged_base_urls_are_copilot_hosts() -> bool:
 
 def _persisted_jwt_entries():
     """``(api_token, expires_at, base_url)``-shaped entries of every exchange the plugin persisted: one bounded,
-    read-only read of the JWT store (``_read_jwt_store``); nothing is written or exchanged."""
+    read-only read of the JWT store (``_read_jwt_store``); nothing is written or exchanged. A store that exists
+    but cannot be used (unreadable, corrupt, oversized or not a dict) raises, so the caller fails closed."""
     from . import credentials
 
     path = credentials._jwt_disk_path()
     store = credentials._read_jwt_store(path) if path else None
+    if store is None and path and path.exists():
+        raise ValueError("unreadable Copilot JWT store")
     for entry in (store or {}).values():
         if isinstance(entry, dict):
             yield ("", 0.0, entry.get("base_url"))
