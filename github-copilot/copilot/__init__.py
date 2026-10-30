@@ -41,11 +41,34 @@ class CopilotProfile(CopilotWireMixin, CopilotResponsesMixin, CopilotCatalogMixi
         except Exception:
             return {}, {}
 
+    def get_usage_cost(self, model: str, usage: Any, **context: Any) -> Any | None:
+        # The amount GitHub reports in ``copilot_usage`` when core carried it into ``usage.raw_usage``
+        # (``_usage_field_kwargs`` below), else an estimate at the vendor's list rate (copilot/pricing.py). This
+        # profile also answers the github-models aliases (models.github.ai), whose billing may differ. Today's
+        # hook receives only (model, usage), so the notes name no product; a core that also passes the request's
+        # ``base_url`` lets GitHub Models calls skip the Copilot-rate estimate (a reported amount still counts).
+        try:
+            from .catalog import _is_github_models_host
+            from .pricing import copilot_usage_cost
+        except Exception:  # a broken pricing module must never break a turn
+            return None
+        return copilot_usage_cost(model, usage, estimate=not _is_github_models_host(context.get("base_url")))
+
+
+def _usage_field_kwargs() -> dict[str, Any]:
+    """Ask core to carry ``copilot_usage`` into ``usage.raw_usage`` when it supports
+    ``ProviderProfile.usage_response_fields``; an older core gets nothing and keeps the estimate."""
+    import dataclasses
+
+    if any(f.name == "usage_response_fields" for f in dataclasses.fields(ProviderProfile)):
+        return {"usage_response_fields": ("copilot_usage",)}
+    return {}
+
 
 copilot = CopilotProfile(
     name="copilot", aliases=("github-copilot", "github-models", "github-model", "github"),
     env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"), base_url="https://api.githubcopilot.com",
     auth_type="copilot", ambient_credentials=True, **RESPONSES_PROFILE_FIELDS, **SETUP_FIELDS,
     hostnames=HOSTNAMES, metadata_hostnames=METADATA_HOSTNAMES, models_dev_id=MODELS_DEV_ID, **CATALOG_FIELDS,
-    **PICKER_FIELDS, **AUTH_ROW_FIELDS,
+    **PICKER_FIELDS, **AUTH_ROW_FIELDS, **_usage_field_kwargs(),
 )
