@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "patsnap": {
+      "type": "streamable-http",
+      "url": "https://connect.patsnap.com/2b0355/logic-mcp",
+      "headers": {
+        "apikey": "${PATSNAP_API_KEY}"
+      }
+    }
+  }
+}
