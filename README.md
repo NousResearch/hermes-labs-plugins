@@ -35,6 +35,7 @@ Supported first-party plugins live in [hermes-official-plugins](https://github.c
 | [Inbox](inbox/) | `hermes plugins install inbox` | `hermes inbox` shows everything in flight for the active profile in one read-only view: failed cron runs, stalled or dropped delegations, orphaned background processes and blocked kanban tasks, plus running work, undelivered results, upcoming jobs and open chat sessions. |
 | [Workflow Record](workflow-record/) | `hermes plugins install workflow-record` | `hermes record` captures a browser workflow you demonstrate once (clicks, field values, navigations; passwords masked inside the page), and its bundled skill lets `/learn` turn the recording into a skill that replays it. |
 | [GitHub Copilot](github-copilot/) | `hermes plugins install github-copilot` | Your GitHub Copilot subscription as a model provider, formerly bundled in Hermes core: `copilot` calls the Copilot API with your GitHub account (`hermes auth add copilot` device-code sign-in or a `GH_TOKEN`), `copilot-acp` drives your installed Copilot CLI over ACP. |
+| [Patsnap](patsnap/) | `hermes plugins install patsnap` | Patent and scientific-literature search through Patsnap's hosted MCP server (prior art, assignees, legal lifecycle, papers), with a workflow skill. Needs a `PATSNAP_API_KEY` from the Patsnap Open Platform; calls spend Patsnap credits. |
 
 ## Working on a plugin
 
