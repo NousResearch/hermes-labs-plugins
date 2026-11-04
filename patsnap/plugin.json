@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "patsnap",
+  "version": "0.1.0",
+  "description": "Search global patents and scientific literature through Patsnap's hosted MCP server (connect.patsnap.com), with a patsnap-search workflow skill bundled. Needs PATSNAP_API_KEY from the Patsnap Open Platform.",
+  "author": {
+    "name": "Nous Research",
+    "url": "https://github.com/NousResearch"
+  },
+  "homepage": "https://github.com/NousResearch/hermes-labs-plugins/tree/main/patsnap",
+  "repository": "https://github.com/NousResearch/hermes-labs-plugins/tree/main/patsnap",
+  "license": "MIT",
+  "keywords": [
+    "patsnap",
+    "patents",
+    "patent-search",
+    "literature",
+    "prior-art",
+    "research",
+    "mcp"
+  ],
+  "extensions": {
+    "com.nousresearch.hermes": {
+      "config_schema": {
+        "api_key": {
+          "type": "secret",
+          "env": "PATSNAP_API_KEY",
+          "label": "Patsnap API key",
+          "description": "Create one at open.patsnap.com (new accounts get free credits). Saving it restarts the Patsnap tools with the new key."
+        }
+      }
+    }
+  }
+}
