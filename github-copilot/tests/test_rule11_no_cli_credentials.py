@@ -68,7 +68,7 @@ def test_no_hermes_credential_means_no_token_despite_cli_stores(cli_credential_s
         token, secret, seeded, catalog_key, evidence, status = run()
 
     assert token == ("", "")
-    assert secret == ("", "")
+    assert secret is None  # no env token: defer to core's generic ladder (the credential pool)
     assert seeded == []
     assert catalog_key == ""
     assert evidence == (False, None)
