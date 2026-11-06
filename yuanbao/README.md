@@ -28,6 +28,11 @@ Needs a Hermes release in which Yuanbao has left core. On an older Hermes the pl
 logs one line (`the plugin stays inactive until core drops it`): that Hermes still ships its own Yuanbao
 support, which keeps working.
 
+The check is whether core's Yuanbao files are present (`plugins/platforms/yuanbao/` or
+`tools/yuanbao_tools.py`), not whether core's built-in Yuanbao is enabled. On such a Hermes the plugin stays
+inactive even if you disabled the built-in (`plugins.disabled: [yuanbao-platform]`), so neither runs:
+re-enable the built-in there, or update Hermes.
+
 ## Setup
 
 ### 1. Create a bot in Yuanbao
@@ -91,6 +96,8 @@ processing messages.
 - **Stickers**: native TIMFaceElem stickers through `yb_search_sticker` / `yb_send_sticker`
 - **Group queries**: group details and member lists (`yb_query_group_info` / `yb_query_group_members`)
 - **DMs from a group**: `yb_send_dm` looks a member up by name and messages them privately
+- **Skill**: `yuanbao:yuanbao` (formerly core's optional `yuanbao` skill) walks the model through
+  @mentions, DMs and member lookups with these tools
 - **WeChat forwarded chat history**: forwarded bundles (including nested forwards) are decoded and injected
   into the conversation
 - **Auto-sethome**: with no home channel set, the first eligible sender becomes the home channel
@@ -163,7 +170,7 @@ cd yuanbao
 HERMES_AGENT_REPO=../../hermes-agent PYTHONPATH=../../hermes-agent python -m pytest -q
 ```
 
-On a core that still bundles Yuanbao the plugin is inert, and the two tests that need the plugin's own
+On a core that still bundles Yuanbao the plugin is inert, and the tests that need the plugin's own
 registry entry are skipped.
 
 ## License
