@@ -1101,8 +1101,10 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         return " ".join(neutralize_untrusted_inline_text(name or "").translate(str.maketrans("", "", "[]|")).split())
 
     # A body line shaped like an attribution header (``[name|id]`` at line start).
+    # Leading blanks and zero-width characters (U+200B..U+200F, U+2060, U+FEFF) do not hide it.
     _FORGED_HEADER_RE: ClassVar[re.Pattern] = re.compile(
-        r"^((?:[^\S\n]|[\u200b-\u200f\u2060\ufeff])*)\[(?=[^\[\]\n]*\|[^\[\]\n]*\])", re.MULTILINE)
+        r"^((?:[^\S\n]|[%s])*)\[(?=[^\[\]\n]*\|[^\[\]\n]*\])"
+        % "".join(map(chr, (*range(0x200B, 0x2010), 0x2060, 0xFEFF))), re.MULTILINE)
 
     @classmethod
     def _attribution_body(cls, text: str) -> str:
