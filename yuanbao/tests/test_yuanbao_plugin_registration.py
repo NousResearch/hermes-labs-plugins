@@ -2,7 +2,7 @@
 
 import importlib
 
-from gateway.config import Platform
+import pytest
 
 
 class _Ctx:
@@ -38,11 +38,20 @@ def test_register_shape_and_core_wiring_removed(monkeypatch):
     assert kw["allow_update_command"] is False
     assert callable(kw["setup_fn"]) and callable(kw["is_connected"])
 
-    from gateway.run import _BUILTIN_ADAPTERS
-    from hermes_cli.gateway_setup_wizard import _PLATFORMS
-    from tools import send_message_tool as smt
-    assert Platform("yuanbao") not in _BUILTIN_ADAPTERS
-    assert all(p["key"] != "yuanbao" for p in _PLATFORMS)
-    assert "yuanbao" not in smt._CHUNKED_ROUTES
     # Media sends bypass the live adapter for the standalone sender (was a _PLUGIN_STANDALONE_MEDIA row).
     assert kw["standalone_send"].media is True
+
+
+@pytest.mark.parametrize("module, name", [
+    ("gateway.run", "_BUILTIN_ADAPTERS"),
+    ("hermes_cli.gateway_setup_wizard", "_PLATFORMS"),
+    ("tools.send_message_tool", "_CHUNKED_ROUTES"),
+])
+def test_no_core_wiring_left(module, name):
+    """Core's private per-platform tables no longer name Yuanbao (skipped once core renames one)."""
+    table = getattr(importlib.import_module(module), name, None)
+    if table is None:
+        pytest.skip(f"{module}.{name} is gone from this Hermes core")
+    # dict keyed by Platform / route name, or the wizard's list of {"key": ...} rows.
+    keys = {row["key"] if isinstance(row, dict) else getattr(row, "value", row) for row in table}
+    assert "yuanbao" not in keys
