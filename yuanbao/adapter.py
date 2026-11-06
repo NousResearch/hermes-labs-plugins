@@ -68,6 +68,7 @@ from .yuanbao_proto import (
 from .inbound_capacity import (
     BoundedDispatchMixin, GroupDispatchState, InboundAdmission,
 )
+from .send_ack import ack_from_response
 from .ws_proxy import _proxy_log_mode, _resolve_ws_proxy_override
 
 logger = logging.getLogger(__name__)
@@ -2513,7 +2514,7 @@ class MessageSender:
         """Send pre-encoded bytes via WS → ``{"success", "msg_key" | "error"}``."""
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
+            return ack_from_response(adapter.name, response)
         except TimeoutError:
             return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
@@ -2570,7 +2571,7 @@ class OutboundManager:
 
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
-    MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
+    MAX_TEXT_CHUNK: int = 1200  # per-message character target (Yuanbao openclaw DELIVER_TEXT_CHUNK_LIMIT)
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
     MEDIA_MAX_SIZE_MB: int = 50
     DM_MAX_CHARS = 10000
