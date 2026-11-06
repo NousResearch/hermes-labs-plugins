@@ -143,7 +143,8 @@ platforms:
 - **"Connection refused"**: the WebSocket URL is unreachable or wrong (it must start with `wss://`); check
   network access to the API domain.
 - **Media uploads fail**: check `YUANBAO_API_DOMAIN` and that media upload is enabled for your bot.
-- **Frequent disconnects**: run `hermes gateway run -vv` and look for the error pattern.
+- **Frequent disconnects**: run `hermes gateway run -vv` for verbose logs and look for the error pattern
+  (older Chinese docs said `HERMES_LOG_LEVEL=debug`; Hermes does not read that variable).
 
 ## Disclosure
 
