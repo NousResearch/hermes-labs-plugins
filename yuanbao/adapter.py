@@ -2678,6 +2678,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """Intake gating lives in ``AccessPolicy`` (composed, not inherited), so the flag stays here."""
         return True
 
+    def _pairing_owner_profile(self) -> Optional[str]:
+        """Owning multiplex profile name, ``None`` for the primary. ``_owner_transport_profile`` is a private
+        core helper, so a core without it falls back to the ``_owner_profile`` it reads."""
+        accessor = getattr(self, "_owner_transport_profile", None)
+        owner = accessor() if callable(accessor) else getattr(self, "_owner_profile", None)
+        return owner if isinstance(owner, str) and owner.strip() else None
+
     def _sender_may_designate_home(self, ctx: InboundContext) -> bool:
         """Sender may persist YUANBAO_HOME_CHANNEL: strict allowlist, open opt-in, or pairing-approved
         (intake-only pairing forwards are excluded)."""
@@ -2691,7 +2698,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if policy.dm_policy == "pairing":
                 from gateway.pairing import PairingStore
                 # A secondary multiplex profile keeps its own pairing whitelist: read the owner's store.
-                owner = self._owner_transport_profile()
+                owner = self._pairing_owner_profile()
                 store = PairingStore(profile=owner) if owner else PairingStore()
                 return store.is_approved(PLATFORM_NAME, sender)
             return False
