@@ -146,9 +146,6 @@ _OPTIONAL_ENTRY_KWARGS: dict[str, Any] = {
     "dashboard_required_env": (),
     "config_connected_fn": config_connected_extra("app_id", "app_secret"),
     "env_enable_credentials": gateway_env.ENV_ENABLE_CREDENTIALS,
-    # YUANBAO_* is also read by this plugin's yb_* tools: profile clones strip it only when the source
-    # profile runs the adapter.
-    "shared_env_prefixes": ("YUANBAO_",),
     **gateway_env.AUTHZ,
 }
 
