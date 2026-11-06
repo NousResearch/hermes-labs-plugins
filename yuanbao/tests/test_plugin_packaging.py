@@ -67,16 +67,16 @@ def test_tools_find_the_adapter_the_registry_created():
 
 
 def test_platform_hint_keeps_core_bytes():
-    """Cached-prompt prefix: core's adapter hint, then core's session "Platform notes" line for Yuanbao."""
+    """Cached-prompt bytes: core's adapter hint only. A session note there would reach cron prompts and be
+    dropped by a ``platform_hints`` replace, so the DM guidance rides on the yb_send_dm schema instead."""
     from yuanbao_plugin.register import _PLATFORM_HINT
+    from yuanbao_plugin.tools import _TOOLS
 
-    adapter_hint, _, notes = _PLATFORM_HINT.partition("\n\n")
-    assert adapter_hint.startswith("You are on Yuanbao (腾讯元宝), a Chinese AI assistant platform.")
-    assert adapter_hint.endswith("bare Unicode emoji is not a substitute.")
-    assert notes == (
-        "**Platform notes:** You are running inside Yuanbao. To send a private (DM) message to a "
-        "user in the current group, use the yb_send_dm tool (look up the recipient by name or pass "
-        "their user_id). Your normal reply is delivered to the group you are responding in.")
+    assert _PLATFORM_HINT.startswith("You are on Yuanbao (腾讯元宝), a Chinese AI assistant platform.")
+    assert _PLATFORM_HINT.endswith("bare Unicode emoji is not a substitute.")
+    assert len(_PLATFORM_HINT) == 715 and "running inside Yuanbao" not in _PLATFORM_HINT
+    dm = next(schema for schema, _, _ in _TOOLS if schema["name"] == "yb_send_dm")["description"]
+    assert "normal reply already goes to the group you are responding in" in dm
 
 
 def test_send_target_syntax():

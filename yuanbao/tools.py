@@ -352,7 +352,8 @@ _TOOLS = (
             "description": (
                 "Send a private message (DM / 私信) to a group member by name, with optional media. "
                 "It looks the user up in the group member list (or pass user_id if known). "
-                "Use it when someone asks to privately message a user. "
+                "Use it only when someone asks to privately message a user: your normal reply already "
+                "goes to the group you are responding in. "
                 "Supports text, images, and file attachments."
             ),
             "parameters": {

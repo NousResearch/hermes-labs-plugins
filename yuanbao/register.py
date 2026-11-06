@@ -96,9 +96,8 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         return send_error(f"Yuanbao send failed: {e}")
 
 
-# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable. The first
-# block is core's Yuanbao hint verbatim; the second is the "Platform notes" line core's session-context
-# prompt carried for Yuanbao (gateway/session.py), which core can no longer emit once Yuanbao is a plugin.
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable (core's
+# Yuanbao hint verbatim). The DM guidance core's session notes carried lives in the yb_send_dm schema.
 _PLATFORM_HINT = (
     "You are on Yuanbao (\u817e\u8baf\u5143\u5b9d), a Chinese AI assistant "
     "platform. Markdown renders (code blocks, tables, bold/italic). "
@@ -109,10 +108,6 @@ _PLATFORM_HINT = (
     "\u540d\u79f0]') or asks for one, use the sticker tools \u2014 yb_search_sticker with a Chinese "
     "keyword, then yb_send_sticker with the chosen id \u2014 which send a real native sticker. Never "
     "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
-    "\n\n"
-    "**Platform notes:** You are running inside Yuanbao. To send a private (DM) message to a "
-    "user in the current group, use the yb_send_dm tool (look up the recipient by name or pass "
-    "their user_id). Your normal reply is delivered to the group you are responding in."
 )
 _SEND_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 
