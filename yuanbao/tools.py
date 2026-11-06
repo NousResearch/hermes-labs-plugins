@@ -1,9 +1,14 @@
-"""yuanbao_tools.py - 元宝平台工具集 (the "hermes-yuanbao" toolset).
+"""Yuanbao tools - 元宝平台工具集 (the ``yuanbao`` toolset).
 
 get_group_info / query_group_members / search_sticker / send_sticker / send_dm. Sticker
 flow mirrors chatbot-web's sticker-search/sticker-send: the LLM should search_sticker for
 a sticker_id (or pass the Chinese name), then send_sticker — never bare Unicode emoji.
-The active adapter singleton lives in ``plugins.platforms.yuanbao.adapter.YuanbaoAdapter.get_active``.
+The active adapter singleton lives in ``.adapter.YuanbaoAdapter.get_active`` (this package's own module,
+so the tools see the instance the gateway registry created).
+
+Moved out of hermes-agent core (``tools/yuanbao_tools.py``) with identical names, schemas and
+behaviour. Registration goes through the public plugin API (``register_tools(ctx)`` ->
+``ctx.register_tool``) instead of ``tools.registry``.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Tuple
 
-from tools.registry import registry, tool_result
+from tools.registry import tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +59,9 @@ def _yb_tool(label: str):
 
 
 def _get_active_adapter():
-    """Lazy import to avoid ImportError when plugins.platforms.yuanbao is unavailable."""
-    with suppress(ImportError):
-        from plugins.platforms.yuanbao.adapter import YuanbaoAdapter
-        return YuanbaoAdapter.get_active()
-    return None
+    """Lazy import: the adapter module pulls in the gateway stack, which a CLI tool listing never needs."""
+    from .adapter import YuanbaoAdapter
+    return YuanbaoAdapter.get_active()
 
 
 def _adapter():
@@ -163,7 +166,7 @@ async def query_group_members(args) -> dict:
 @_yb_tool("search_sticker")
 async def search_sticker(args) -> dict:
     """在内置贴纸表中按关键词模糊搜索，返回 Top-N 候选（空 query 返回前 N 条）。"""
-    from plugins.platforms.yuanbao.yuanbao_sticker import search_stickers
+    from .yuanbao_sticker import search_stickers
 
     query, limit = args.get("query", ""), args.get("limit", 10)
     try:
@@ -183,7 +186,7 @@ async def send_sticker(args) -> dict:
     """向 chat_id（缺省取当前会话 HERMES_SESSION_CHAT_ID）发送一张内置贴纸（TIMFaceElem）。
     ``sticker``: 名称（如 "六六六"）或 sticker_id（如 "278"）；为空时随机发送。
     ``chat_id``: ``direct:{account_id}`` / ``group:{group_code}`` / 裸 account_id。"""
-    from plugins.platforms.yuanbao.yuanbao_sticker import get_sticker_by_id, get_sticker_by_name, get_random_sticker
+    from .yuanbao_sticker import get_sticker_by_id, get_sticker_by_name, get_random_sticker
 
     target = (args.get("chat_id", "") or "").strip() or _session_env("HERMES_SESSION_CHAT_ID")
     if not target:
@@ -486,8 +489,13 @@ _TOOLS = (
     ),
 )
 
-for _schema, _handler, _emoji in _TOOLS:
-    registry.register(
-        name=_schema["name"], toolset="hermes-yuanbao", schema=_schema, handler=_handler,
-        check_fn=_check_yuanbao, is_async=True, emoji=_emoji,
-    )
+TOOLSET = "yuanbao"
+
+
+def register_tools(ctx) -> None:
+    """Register the five yb_* tools in the ``yuanbao`` toolset via the plugin API."""
+    for schema, handler, emoji in _TOOLS:
+        ctx.register_tool(
+            name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler,
+            check_fn=_check_yuanbao, is_async=True, emoji=emoji,
+        )

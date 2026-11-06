@@ -11,7 +11,7 @@ import warnings
 
 import pytest
 
-from plugins.platforms.yuanbao.adapter import (
+from yuanbao_plugin.adapter import (
     ForwardedRecordsParseMiddleware,
     InboundContext,
     WS_HEARTBEAT_RUNNING,

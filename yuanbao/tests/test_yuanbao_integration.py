@@ -12,17 +12,12 @@ test_yuanbao_integration.py - Yuanbao 模块集成测试
 """
 
 import sys
-import os
 
-# 确保 hermes-agent 根目录在 sys.path 中
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 import pytest
 from unittest.mock import MagicMock, patch
 from gateway.config import Platform, PlatformConfig, GatewayConfig
-from plugins.platforms.yuanbao.adapter import YuanbaoAdapter
+from yuanbao_plugin.adapter import YuanbaoAdapter
 
 
 def make_config(**kwargs):
@@ -55,26 +50,26 @@ class TestYuanbaoConfig:
         # Only key, no secret → not in connected list
         gw_only_key = GatewayConfig(
             platforms={
-                Platform.YUANBAO: PlatformConfig(
+                Platform("yuanbao"): PlatformConfig(
                     enabled=True,
                     extra={"app_id": "key"},
                 )
             }
         )
         platforms = gw_only_key.get_connected_platforms()
-        assert Platform.YUANBAO not in platforms
+        assert Platform("yuanbao") not in platforms
 
         # key + secret both present → in connected list
         gw_full = GatewayConfig(
             platforms={
-                Platform.YUANBAO: PlatformConfig(
+                Platform("yuanbao"): PlatformConfig(
                     enabled=True,
                     extra={"app_id": "key", "app_secret": "secret"},
                 )
             }
         )
         platforms2 = gw_full.get_connected_platforms()
-        assert Platform.YUANBAO in platforms2
+        assert Platform("yuanbao") in platforms2
 
 
 # ===========================================================
@@ -85,7 +80,6 @@ class TestGatewayRunnerRegistration:
 
     def _make_minimal_runner(self, config):
         """通过 __new__ + 最小初始化绕过 run.py 的模块级 dotenv/ssl 副作用"""
-        import sys
 
         # Stub out heavy dependencies if not already present
         stubs = [
@@ -115,11 +109,12 @@ class TestGatewayRunnerRegistration:
         runner._session_model_overrides = {}
         return runner, GatewayRunner
 
+    @pytest.mark.plugin_registry
     def test_runner_creates_yuanbao_adapter(self):
         """GatewayRunner._create_adapter 能为 YUANBAO 返回 YuanbaoAdapter 实例"""
         from gateway.config import GatewayConfig
         config = make_config(enabled=True)
-        gw_config = GatewayConfig(platforms={Platform.YUANBAO: config})
+        gw_config = GatewayConfig(platforms={Platform("yuanbao"): config})
 
         try:
             runner, _ = self._make_minimal_runner(gw_config)
@@ -127,8 +122,8 @@ class TestGatewayRunnerRegistration:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
             # websockets 在测试环境可能未安装，mock 掉 WEBSOCKETS_AVAILABLE
-            with patch("plugins.platforms.yuanbao.adapter.WEBSOCKETS_AVAILABLE", True):
-                adapter = runner._create_adapter(Platform.YUANBAO, config)
+            with patch("yuanbao_plugin.adapter.WEBSOCKETS_AVAILABLE", True):
+                adapter = runner._create_adapter(Platform("yuanbao"), config)
         except ImportError as e:
             pytest.skip(f"run.py import unavailable in test env: {e}")
 
@@ -201,7 +196,7 @@ class TestP0ChatLockEviction:
     def test_eviction_skips_locked(self):
         """When eviction is needed, locked entries are skipped."""
         adapter = YuanbaoAdapter(make_config())
-        from plugins.platforms.yuanbao.adapter import MessageSender
+        from yuanbao_plugin.adapter import MessageSender
 
         # Fill to capacity with unlocked locks
         for i in range(MessageSender.CHAT_DICT_MAX_SIZE):

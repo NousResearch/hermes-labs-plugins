@@ -42,9 +42,8 @@ except ImportError:
     websockets = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from agent.i18n import t
 from gateway.platforms.base import (
-    BasePlatformAdapter, SendResult,
+    BasePlatformAdapter, SendResult, TranscriptReadError,
     cache_document_from_bytes_async, cache_image_from_bytes_async, cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType
@@ -52,11 +51,12 @@ from gateway.platforms import helpers as _mdchunk
 from gateway.platforms._shared import get_scoped_secret as _yb_secret, profile_scoped as _profile_scoped
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
-from plugins.platforms.yuanbao.yuanbao_media import (
+from ._i18n import t
+from .yuanbao_media import (
     download_url as media_download_url, get_cos_credentials, upload_to_cos,
     build_image_msg_body, build_file_msg_body, guess_mime_type, md5_hex,
 )
-from plugins.platforms.yuanbao.yuanbao_proto import (
+from .yuanbao_proto import (
     CMD_TYPE, WS_HEARTBEAT_RUNNING, WS_HEARTBEAT_FINISH, HERMES_INSTANCE_ID,
     _fields_to_dict, _get_string, _get_varint, _parse_fields,
     decode_conn_msg, decode_inbound_push, decode_forward_msg_data,
@@ -65,13 +65,15 @@ from plugins.platforms.yuanbao.yuanbao_proto import (
     encode_send_private_heartbeat, encode_send_group_heartbeat, encode_query_group_info,
     encode_get_group_member_list, next_seq_no,
 )
-from gateway.session_transcript import TranscriptReadError
 
 logger = logging.getLogger(__name__)
 
 # AUTH_BIND / sign-token header values
 from hermes_cli.version_info import get_version_info
 
+# The registry name. ``Platform(PLATFORM_NAME)`` resolves only once the plugin registered it (core has
+# no ``Platform.YUANBAO`` member any more), so it is looked up at call time, never at import.
+PLATFORM_NAME = "yuanbao"
 _YUANBAO_INSTANCE_ID = str(HERMES_INSTANCE_ID)
 _OPERATION_SYSTEM = sys.platform
 
@@ -775,7 +777,7 @@ class AutoSetHomeMiddleware(InboundMiddleware):
     def _persist_home(adapter, ctx: InboundContext) -> None:
         try:
             from gateway.config import HomeChannel, persist_home_channel
-            home = HomeChannel(platform=Platform.YUANBAO, chat_id=str(ctx.chat_id), name=str(ctx.chat_name or "Home"))
+            home = HomeChannel(platform=Platform(PLATFORM_NAME), chat_id=str(ctx.chat_id), name=str(ctx.chat_name or "Home"))
             # ``platforms.yuanbao.home_channel`` in the owning profile's config.yaml is the durable record
             # ``load_gateway_config`` reads back; the live PlatformConfig is updated so cron/home-channel
             # delivery in THIS process has a target without a restart.
@@ -2261,7 +2263,7 @@ class StickerHandler(MediaSendHandler):
         return b"", "sticker", "application/octet-stream"  # no file bytes needed
 
     def build_msg_body(self, upload_result, **kwargs):
-        from plugins.platforms.yuanbao.yuanbao_sticker import (
+        from .yuanbao_sticker import (
             get_sticker_by_name, get_random_sticker, build_face_msg_body, build_sticker_msg_body,
         )
         sticker_name = kwargs.get("sticker_name")
@@ -2593,7 +2595,6 @@ class OutboundManager:
 
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
-    PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
     MEDIA_MAX_SIZE_MB: int = 50
@@ -2626,7 +2627,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             cls._active_instances[hermes_home_key()] = adapter
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
-        super().__init__(config, Platform.YUANBAO)
+        super().__init__(config, Platform(PLATFORM_NAME))
         _extra = config.extra or {}
         self._app_key: str = (_extra.get("app_id") or "").strip()
         self._app_secret: str = (_extra.get("app_secret") or "").strip()
@@ -2688,7 +2689,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return True
             if policy.dm_policy == "pairing":
                 from gateway.pairing import PairingStore
-                return PairingStore().is_approved(Platform.YUANBAO.value, sender)
+                return PairingStore().is_approved(PLATFORM_NAME, sender)
             return False
         group_code = str(ctx.group_code or "").strip()
         if ctx.chat_type != "group" or not group_code:

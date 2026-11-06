@@ -1,13 +1,24 @@
-name: yuanbao-platform
+name: yuanbao
 label: Yuanbao
 kind: platform
-version: 1.0.0
+version: 2.0.0
 description: >
-  Tencent Yuanbao gateway adapter for Hermes Agent.
-  Connects to Yuanbao IM Bot over a persistent WebSocket (HMAC-signed sign token)
-  and relays DMs and group messages between Yuanbao and the Hermes agent.
-  Supports native media/stickers, DM/group access policies, and home-channel cron delivery.
+  Tencent Yuanbao gateway adapter for Hermes Agent (Hermes Labs plugin: built by
+  Nous Research, not supported). Connects to Yuanbao IM Bot over a persistent
+  WebSocket (HMAC-signed sign token) and relays DMs and group messages between
+  Yuanbao and the Hermes agent. Supports native media/stickers, DM/group access
+  policies, and home-channel cron delivery. The yuanbao toolset (yb_query_group_info,
+  yb_query_group_members, yb_send_dm, yb_search_sticker, yb_send_sticker) queries
+  groups, sends DMs and native stickers. Formerly built into Hermes core.
 author: NousResearch
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/yuanbao
+provides_tools:
+  - yb_query_group_info
+  - yb_query_group_members
+  - yb_send_dm
+  - yb_search_sticker
+  - yb_send_sticker
+provides_hooks: []
 requires_env:
   - name: YUANBAO_APP_ID
     description: "The App ID from your Yuanbao IM Bot credentials (legacy alias: YUANBAO_APP_KEY)"

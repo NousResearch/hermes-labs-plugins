@@ -17,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from gateway.platforms import helpers as _mdchunk
-from plugins.platforms.yuanbao.adapter import MarkdownProcessor
+from yuanbao_plugin.adapter import MarkdownProcessor
 
 
 # ============ has_unclosed_fence ============

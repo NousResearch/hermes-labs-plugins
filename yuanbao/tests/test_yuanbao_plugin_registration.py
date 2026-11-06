@@ -1,4 +1,6 @@
-"""Yuanbao ships as a bundled platform plugin: registry entry shape + no core wiring left."""
+"""Yuanbao ships as a catalog platform plugin: registry entry shape + no core wiring left."""
+
+import importlib
 
 from gateway.config import Platform
 
@@ -6,16 +8,23 @@ from gateway.config import Platform
 class _Ctx:
     def __init__(self):
         self.kwargs = None
+        self.tools = []
 
     def register_platform(self, **kwargs):
         self.kwargs = kwargs
 
+    def register_tool(self, **kwargs):
+        self.tools.append(kwargs)
 
-def test_register_shape_and_core_wiring_removed():
-    from plugins.platforms.yuanbao import register
-    from plugins.platforms.yuanbao.adapter import YuanbaoAdapter
-    from plugins.platforms.yuanbao.register import _standalone_send
 
+def test_register_shape_and_core_wiring_removed(monkeypatch):
+    register_mod = importlib.import_module("yuanbao_plugin.register")
+    from yuanbao_plugin import register
+    from yuanbao_plugin.adapter import YuanbaoAdapter
+    from yuanbao_plugin.register import _standalone_send
+
+    # The guard keeps the plugin inert on a core that still bundles Yuanbao; this pins the active shape.
+    monkeypatch.setattr(register_mod, "core_ships_yuanbao", lambda: False)
     ctx = _Ctx()
     register(ctx)
     kw = ctx.kwargs
@@ -32,7 +41,7 @@ def test_register_shape_and_core_wiring_removed():
     from gateway.run import _BUILTIN_ADAPTERS
     from hermes_cli.gateway_setup_wizard import _PLATFORMS
     from tools import send_message_tool as smt
-    assert Platform.YUANBAO not in _BUILTIN_ADAPTERS
+    assert Platform("yuanbao") not in _BUILTIN_ADAPTERS
     assert all(p["key"] != "yuanbao" for p in _PLATFORMS)
     assert "yuanbao" not in smt._CHUNKED_ROUTES
     # Media sends bypass the live adapter for the standalone sender (was a _PLUGIN_STANDALONE_MEDIA row).

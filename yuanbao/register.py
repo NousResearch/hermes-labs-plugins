@@ -1,15 +1,21 @@
 """Yuanbao plugin registration: setup row, configured check, standalone sender, ``register``."""
 
-import re
+import dataclasses
+import functools
+import importlib
+import importlib.machinery
 import logging
+import re
+from typing import Any
 
-from gateway.platforms._shared import send_error
-from gateway.platforms._shared import config_connected_extra
-from gateway.platforms.send_targets import NOT_EXPLICIT, StandaloneSendPolicy
+from gateway.platforms._shared import config_connected_extra, get_scoped_secret, send_error
 
-# Absolute import (see __init__.py): one ``YuanbaoAdapter`` class object for the registry,
-# tools/yuanbao_tools.py and the standalone sender.
-from plugins.platforms.yuanbao.adapter import WEBSOCKETS_AVAILABLE, YuanbaoAdapter
+# Relative import: the loader runs this package as ``hermes_plugins.<slug>``, so ``.adapter`` is the one
+# module (and the one ``YuanbaoAdapter`` class object) the registry, ``tools.py`` and the standalone
+# sender all share.
+from . import gateway_env
+from .adapter import PLATFORM_NAME, WEBSOCKETS_AVAILABLE, YuanbaoAdapter
+from .tools import register_tools
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +45,41 @@ def check_yuanbao_requirements() -> bool:
 
 
 def interactive_setup() -> None:
-    """``hermes gateway setup`` flow: the standard App ID / App Secret prompts."""
-    from hermes_cli import gateway as gateway_mod
-    gateway_mod._setup_standard_platform(dict(_SETUP_PLATFORM))
+    """``hermes gateway setup`` flow: the App ID / App Secret prompts core's standard platform form ran,
+    through the public setup helpers."""
+    from hermes_cli.cli_output import print_info, print_success, print_warning
+    from hermes_cli.gateway_setup_wizard import confirm_reconfigure, print_setup_header, save_env_values
+    from hermes_cli.setup import prompt
+
+    row = _SETUP_PLATFORM
+    print_setup_header(f"{row['emoji']} {row['label']}")
+    print()
+    for line in row["setup_instructions"]:
+        print_info(f"  {line}")
+    if not confirm_reconfigure(row["label"], row["token_var"]):
+        return
+    for var in row["vars"]:
+        print()
+        print_info(f"  {var['help']}")
+        value = prompt(f"  {var['prompt']}", password=var["password"])
+        if value:
+            save_env_values(**{var["name"]: value})
+            print_success(f"  Saved {var['name']}")
+        elif var["name"] == row["token_var"]:
+            print_warning(f"  Skipped — {row['label']} won't work without this.")
+            return
+        else:
+            print_info("  Skipped (can configure later)")
+    print()
+    print_success(f"{row['emoji']} {row['label']} configured!")
 
 
 def _is_connected(config) -> bool:
     """Configured = App ID (or legacy App Key) + App Secret, from config extras or env."""
     extra = getattr(config, "extra", {}) or {}
-    import hermes_cli.gateway as gateway_mod
-    app_id = (extra.get("app_id") or gateway_mod.get_env_value("YUANBAO_APP_ID")
-              or gateway_mod.get_env_value("YUANBAO_APP_KEY") or "")
-    secret = extra.get("app_secret") or gateway_mod.get_env_value("YUANBAO_APP_SECRET") or ""
+    app_id = (extra.get("app_id") or get_scoped_secret("YUANBAO_APP_ID", "")
+              or get_scoped_secret("YUANBAO_APP_KEY", "") or "")
+    secret = extra.get("app_secret") or get_scoped_secret("YUANBAO_APP_SECRET", "") or ""
     return bool(str(app_id).strip() and str(secret).strip())
 
 
@@ -67,7 +96,9 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         return send_error(f"Yuanbao send failed: {e}")
 
 
-# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable. The first
+# block is core's Yuanbao hint verbatim; the second is the "Platform notes" line core's session-context
+# prompt carried for Yuanbao (gateway/session.py), which core can no longer emit once Yuanbao is a plugin.
 _PLATFORM_HINT = (
     "You are on Yuanbao (\u817e\u8baf\u5143\u5b9d), a Chinese AI assistant "
     "platform. Markdown renders (code blocks, tables, bold/italic). "
@@ -78,34 +109,100 @@ _PLATFORM_HINT = (
     "\u540d\u79f0]') or asks for one, use the sticker tools \u2014 yb_search_sticker with a Chinese "
     "keyword, then yb_send_sticker with the chosen id \u2014 which send a real native sticker. Never "
     "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
+    "\n\n"
+    "**Platform notes:** You are running inside Yuanbao. To send a private (DM) message to a "
+    "user in the current group, use the yb_send_dm tool (look up the recipient by name or pass "
+    "their user_id). Your normal reply is delivered to the group you are responding in."
 )
 _SEND_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 
 
-def _parse_send_target(ref):
-    # "group:<code>" / "direct:<id>"; a bare number is a group code (never generic rules).
+def _parse_send_target(ref, not_explicit=None):
+    # "group:<code>" / "direct:<id>"; a bare number is a group code. Anything else is ``not_explicit``:
+    # core's ``NOT_EXPLICIT`` sentinel for ``target_ref_syntax_fn`` (never the generic id rules), None for
+    # the older ``parse_target_ref_fn`` seam (None = fall through).
     match = _SEND_TARGET_RE.fullmatch(ref)
     if match:
         return match.group(1), None
-    return (f"group:{ref.strip()}", None) if ref.strip().isdigit() else NOT_EXPLICIT
+    return (f"group:{ref.strip()}", None) if ref.strip().isdigit() else not_explicit
 
 
-def register(ctx) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
-    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
-    ctx.register_platform(
-        target_ref_syntax_fn=_parse_send_target,
-        standalone_send=StandaloneSendPolicy(label="Yuanbao", media=True, text_direct=True),
-        name="yuanbao", label="Yuanbao", adapter_factory=YuanbaoAdapter,
-        dashboard_label="Yuanbao (元宝)",
-        dashboard_description="Connect Hermes to Tencent Yuanbao.",
-        dashboard_required_env=(),
+def _send_target_kwargs(supported: set) -> dict[str, Any]:
+    """send_message wiring: the native target syntax and the standalone-send policy (media and text sends
+    use ``_standalone_send``, which needs the live signed WebSocket). ``gateway.platforms.send_targets`` is
+    core's send-contract module for platform plugins; a core without it gets the older parser seam."""
+    if "target_ref_syntax_fn" in supported and "standalone_send" in supported:
+        from gateway.platforms.send_targets import NOT_EXPLICIT, StandaloneSendPolicy
+        return {"target_ref_syntax_fn": functools.partial(_parse_send_target, not_explicit=NOT_EXPLICIT),
+                "standalone_send": StandaloneSendPolicy(label="Yuanbao", media=True, text_direct=True)}
+    return {"parse_target_ref_fn": _parse_send_target} if "parse_target_ref_fn" in supported else {}
+
+
+# PlatformEntry fields newer than some cores this plugin may load on (PlatformEntry raises TypeError on
+# unknown keys), so each is passed only when the running core has it.
+_OPTIONAL_ENTRY_KWARGS: dict[str, Any] = {
+    "dashboard_label": "Yuanbao (元宝)",
+    "dashboard_description": "Connect Hermes to Tencent Yuanbao.",
+    "dashboard_required_env": (),
+    "config_connected_fn": config_connected_extra("app_id", "app_secret"),
+    "env_enable_credentials": gateway_env.ENV_ENABLE_CREDENTIALS,
+    # YUANBAO_* is also read by this plugin's yb_* tools: profile clones strip it only when the source
+    # profile runs the adapter.
+    "shared_env_prefixes": ("YUANBAO_",),
+    **gateway_env.AUTHZ,
+}
+
+
+def _supported_entry_fields() -> set:
+    from gateway.platform_registry import PlatformEntry
+    return {f.name for f in dataclasses.fields(PlatformEntry)}
+
+
+def platform_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        name=PLATFORM_NAME, label="Yuanbao", adapter_factory=YuanbaoAdapter,
         check_fn=check_yuanbao_requirements, is_connected=_is_connected,
-        config_connected_fn=config_connected_extra("app_id", "app_secret"),
         required_env=["YUANBAO_APP_ID", "YUANBAO_APP_SECRET"], install_hint=_INSTALL_HINT,
         setup_fn=interactive_setup, cron_deliver_env_var="YUANBAO_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send, emoji="💎", allow_update_command=False,
-        platform_hint=_PLATFORM_HINT,
-        env_overrides=gateway_env.ENV_OVERRIDES,
-        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
+        platform_hint=_PLATFORM_HINT, env_enablement_fn=gateway_env.env_enablement,
     )
+    supported = _supported_entry_fields()
+    kwargs.update(_send_target_kwargs(supported))
+    for key, value in _OPTIONAL_ENTRY_KWARGS.items():
+        if key in supported:
+            kwargs[key] = value
+        else:
+            logger.debug("yuanbao: core PlatformEntry has no %r field; not passing it", key)
+    return kwargs
+
+
+def core_ships_yuanbao() -> bool:
+    """True on a Hermes core that still bundles Yuanbao (``plugins/platforms/yuanbao`` or
+    ``tools/yuanbao_tools.py``, removed together when core dropped it).
+
+    Looks only inside the imported packages' own ``__path__``: a plain ``find_spec`` also consults meta-path
+    finders (e.g. an editable install of a different checkout) and can report a module the running core
+    does not have."""
+    def _ships(package: str, module: str) -> bool:
+        try:
+            search = list(getattr(importlib.import_module(package), "__path__", None) or ())
+        except ImportError:
+            return False
+        spec = importlib.machinery.PathFinder.find_spec(module, search) if search else None
+        # ``origin`` is None for a namespace match: a directory left behind holding only ``__pycache__``
+        # after an update deleted the bundled files is not a core that ships Yuanbao.
+        return spec is not None and spec.origin is not None
+
+    return _ships("plugins.platforms", "plugins.platforms.yuanbao") or _ships("tools", "tools.yuanbao_tools")
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin loader."""
+    if core_ships_yuanbao():
+        # Registering on top of the built-in would shadow core's yb_* tools and replace its adapter.
+        logger.info("yuanbao: this Hermes core still ships Yuanbao built in; "
+                    "the plugin stays inactive until core drops it")
+        return
+    ctx.register_platform(**platform_kwargs())
+    register_tools(ctx)
