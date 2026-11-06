@@ -1419,7 +1419,8 @@ class MediaResolveMiddleware(InboundMiddleware):
         if headers is None:
             raise RuntimeError("missing token or bot_id for resource download")
         api_url = f"{adapter._api_domain}/api/resource/v1/download"
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        # JSON API: a redirect is a failure, and must not carry X-Token to another host.
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
             for attempt in range(2):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
