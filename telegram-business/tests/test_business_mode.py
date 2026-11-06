@@ -866,7 +866,7 @@ class TestBizCommand:
         assert "Usage" in reply
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("arg", ["@acme", "carol", "12x"])
+    @pytest.mark.parametrize("arg", ["@acme", "carol", "12x", "--5", "\u0661\u0662\u0663"])
     async def test_off_rejects_a_non_numeric_chat_id(self, db, arg):
         """The id is echoed back as `muted`, so a word would confirm a mute with no
         effect; reject it and point at the numeric id instead."""
@@ -876,6 +876,17 @@ class TestBizCommand:
             owner_user_id="42", owner_chat_id="100", args=["off", arg],
         )
         assert "isn't a chat id" in reply
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == []
+
+    @pytest.mark.asyncio
+    async def test_on_still_removes_a_word_muted_before_validation(self, db):
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        db.set_telegram_business_paused_chats("conn1", ["@acme"])
+        reply = await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["on", "@acme"],
+        )
+        assert "re-enabled" in reply
         assert db.get_telegram_business_connection("conn1")["paused_chats"] == []
 
     @pytest.mark.asyncio

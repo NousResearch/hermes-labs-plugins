@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -687,7 +688,11 @@ class BusinessModeManager:
 
         if sub in {"off", "on"} and len(args) >= 2:
             chat_arg = args[1].strip()
-            if not chat_arg.lstrip("-").isdigit():
+            # ASCII digits only (``str.isdigit`` takes ``²``/Arabic-Indic digits and
+            # ``lstrip`` took ``--5``). ``on`` still removes an entry stored before this
+            # check existed, or a muted word could never be un-muted.
+            stored = any(chat_arg in (c.get("paused_chats") or []) for c in active)
+            if not re.fullmatch(r"-?[0-9]+", chat_arg) and not (sub == "on" and stored):
                 return (
                     f"'{chat_arg}' isn't a chat id. Telegram chat ids are numbers — "
                     "reply to the customer's message and read the id, e.g. /biz off 123456789.\n"
