@@ -14,12 +14,16 @@ class _Ctx:
     def __init__(self):
         self.kwargs = None
         self.tools = []
+        self.skills = []
 
     def register_platform(self, **kwargs):
         self.kwargs = kwargs
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
+
+    def register_skill(self, name, path, description=""):
+        self.skills.append((name, path, description))
 
 
 def _fake_core(monkeypatch, root):
@@ -64,6 +68,22 @@ def test_tools_find_the_adapter_the_registry_created():
         assert tools_mod._get_active_adapter() is sentinel
     finally:
         YuanbaoAdapter.set_active(None)
+
+
+def test_registers_the_yuanbao_skill(monkeypatch):
+    """Core's former optional ``yuanbao`` skill ships with the plugin (``yuanbao:yuanbao``) and documents the
+    plugin's own tools."""
+    register_mod = importlib.import_module("yuanbao_plugin.register")
+
+    monkeypatch.setattr(register_mod, "core_ships_yuanbao", lambda: False)
+    ctx = _Ctx()
+    register_mod.register(ctx)
+    [(name, path, description)] = ctx.skills
+    text = path.read_text(encoding="utf-8")
+    assert name == "yuanbao" and text.startswith("---\nname: yuanbao\n")
+    assert f'description: "{description}"' in text
+    assert {"yb_query_group_info", "yb_query_group_members", "yb_send_dm"} <= {
+        tool for tool in YB_TOOLS if f"`{tool}`" in text}
 
 
 def test_platform_hint_keeps_core_bytes():
@@ -145,7 +165,7 @@ def test_inert_when_core_still_ships_yuanbao(monkeypatch, caplog):
     ctx = _Ctx()
     with caplog.at_level(logging.INFO, logger=register_mod.logger.name):
         register_mod.register(ctx)
-    assert ctx.kwargs is None and ctx.tools == []
+    assert ctx.kwargs is None and ctx.tools == [] and ctx.skills == []
     assert [r.getMessage() for r in caplog.records if "stays inactive" in r.getMessage()] == [
         "yuanbao: this Hermes core still ships Yuanbao built in; the plugin stays inactive until core drops it"]
 

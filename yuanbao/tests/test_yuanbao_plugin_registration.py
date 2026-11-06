@@ -9,12 +9,16 @@ class _Ctx:
     def __init__(self):
         self.kwargs = None
         self.tools = []
+        self.skills = []
 
     def register_platform(self, **kwargs):
         self.kwargs = kwargs
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
+
+    def register_skill(self, name, path, description=""):
+        self.skills.append((name, path, description))
 
 
 def test_register_shape_and_core_wiring_removed(monkeypatch):

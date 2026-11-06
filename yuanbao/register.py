@@ -6,6 +6,7 @@ import importlib
 import importlib.machinery
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from gateway.platforms._shared import config_connected_extra, get_scoped_secret, send_error
@@ -109,6 +110,8 @@ _PLATFORM_HINT = (
     "keyword, then yb_send_sticker with the chosen id \u2014 which send a real native sticker. Never "
     "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
 )
+SKILL_NAME = "yuanbao"
+SKILL_DESCRIPTION = "Yuanbao (元宝) groups: @mention users, query info/members."
 _SEND_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 
 
@@ -198,3 +201,6 @@ def register(ctx) -> None:
         return
     ctx.register_platform(**platform_kwargs())
     register_tools(ctx)
+    # Formerly core's optional ``yuanbao`` skill (@mention, DM and member-lookup workflows for the yb_* tools).
+    ctx.register_skill(SKILL_NAME, Path(__file__).resolve().parent / "skills" / SKILL_NAME / "SKILL.md",
+                       description=SKILL_DESCRIPTION)
