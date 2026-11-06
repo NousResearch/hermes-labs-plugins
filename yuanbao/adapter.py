@@ -1100,6 +1100,16 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         from gateway.session import neutralize_untrusted_inline_text
         return " ".join(neutralize_untrusted_inline_text(name or "").translate(str.maketrans("", "", "[]|")).split())
 
+    # A body line shaped like an attribution header (``[name|id]`` at line start).
+    _FORGED_HEADER_RE: ClassVar[re.Pattern] = re.compile(
+        r"^((?:[^\S\n]|[\u200b-\u200f\u2060\ufeff])*)\[(?=[^\[\]\n]*\|[^\[\]\n]*\])", re.MULTILINE)
+
+    @classmethod
+    def _attribution_body(cls, text: str) -> str:
+        """Message text is member-chosen too: a body line that opens with ``[name|id]`` would read as another
+        member's header. Escape that ``[`` (``\\[name|id]``); every other line is left as sent."""
+        return cls._FORGED_HEADER_RE.sub(r"\1\\[", text or "")
+
     @classmethod
     def _attribution_header(cls, nickname: str, user_id: Optional[str]) -> str:
         uid = user_id or "unknown"
@@ -1121,7 +1131,8 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 if summary:
                     body_text = f"{text}\n{summary}" if text else summary
             entry: dict = {
-                "role": "user", "content": f"{cls._attribution_header(sender_display, source.user_id)}\n{body_text}",
+                "role": "user",
+                "content": f"{cls._attribution_header(sender_display, source.user_id)}\n{cls._attribution_body(body_text)}",
                 "timestamp": time.time(), "observed": True,
             }
             if msg_id:
@@ -1152,7 +1163,7 @@ class GroupAttributionMiddleware(InboundMiddleware):
         if ctx.chat_type == "group" and not ctx.owner_command:
             ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(ctx.msg_body, ctx.adapter._bot_id)
             header = GroupAtGuardMiddleware._attribution_header(ctx.sender_nickname or ctx.from_account, ctx.from_account)
-            ctx.raw_text = f"{header}\n{ctx.raw_text}"
+            ctx.raw_text = f"{header}\n{GroupAtGuardMiddleware._attribution_body(ctx.raw_text)}"
             if ctx.source is not None:
                 ctx.source = dataclasses.replace(ctx.source, user_name=None)
         await next_fn()
@@ -1338,7 +1349,7 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
         text = "\n".join(lines)
         if is_dispatch and ctx.raw_text.strip():
             text += f"\n\n用户附言：{ctx.raw_text.strip()}"
-        return text
+        return GroupAtGuardMiddleware._attribution_body(text)
 
 
 class MediaResolveMiddleware(InboundMiddleware):
