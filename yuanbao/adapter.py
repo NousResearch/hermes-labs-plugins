@@ -13,6 +13,7 @@ import binascii
 import collections
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import hmac
 import json
@@ -66,7 +67,7 @@ from .yuanbao_proto import (
     encode_get_group_member_list, next_seq_no,
 )
 from .inbound_capacity import (
-    BoundedDispatchMixin, GroupDispatchState, InboundAdmission,
+    BoundedDispatchMixin, GroupDispatchState, InboundAdmission, PushHandoff,
 )
 from .send_ack import ack_from_response
 from .ws_proxy import _proxy_log_mode, _resolve_ws_proxy_override
@@ -1751,6 +1752,7 @@ class ConnectionManager:
             lambda frames: InboundContext(adapter=adapter, raw_frames=frames),
             lambda: self._DEBOUNCE_WINDOW,
         )
+        self._push_handoff = PushHandoff(adapter)
 
     @property
     def ws(self):
@@ -1860,6 +1862,7 @@ class ConnectionManager:
             if not fut.done():
                 fut.set_exception(disc_exc)
         self._pending_acks.clear()
+        await self._push_handoff.close()
         await self._inbound_admission.close()
         SignManager.clear_locks()  # avoid stale locks bound to a previous event loop
         await self._cleanup_ws()
@@ -1967,7 +1970,17 @@ class ConnectionManager:
         try:
             async for raw in source_ws:  # type: ignore[union-attr]
                 if isinstance(raw, (bytes, bytearray)):
-                    await self._handle_frame(bytes(raw), source_ws=source_ws)
+                    # Never await here: admission may wait for capacity, and this reader must keep
+                    # resolving PONGs and RPC responses meanwhile.
+                    push = self._route_frame(bytes(raw))
+                    if push is None:
+                        continue
+                    head, data = push
+                    if data:
+                        self._push_handoff.offer(len(data), functools.partial(self._admit_push, head, data, source_ws))
+                        await asyncio.sleep(0)  # let the admitter move it into free capacity before the next read
+                    else:
+                        await self._send_push_ack(head, source_ws)
         except asyncio.CancelledError:
             pass
         except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
@@ -1983,6 +1996,20 @@ class ConnectionManager:
             self.schedule_reconnect()
 
     async def _handle_frame(self, raw: bytes, *, source_ws=None) -> None:
+        """Handle one frame to completion, push admission and PushAck included."""
+        push = self._route_frame(raw)
+        if push is not None:
+            head, data = push
+            if data:
+                await self._admit_push(head, data, source_ws)
+            else:
+                await self._send_push_ack(head, source_ws)
+
+    def _route_frame(self, raw: bytes) -> Optional[tuple[dict, bytes]]:
+        """Resolve control frames (PONG, RPC and pending-push responses) at once, never waiting.
+
+        Returns ``(head, data)`` for a push the caller still has to ACK; non-empty ``data`` is an
+        inbound message to admit first."""
         adapter = self._adapter
         try:
             msg = decode_conn_msg(raw)
@@ -2022,18 +2049,29 @@ class ConnectionManager:
                         fut.set_result(decode_inbound_push(data) if data else {"head": head})
                     except Exception as exc:
                         fut.set_exception(exc)
-            elif data:  # genuine inbound message — admit before acknowledging it to the transport
+                data = b""
+            elif data:
                 logger.info("[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d", adapter.name, cmd, len(data))
-                if not await self._push_to_inbound(data):
-                    return
-            ack_ws = source_ws or self._ws
-            if head.get("need_ack", False) and ack_ws is not None and ack_ws is self._ws:
-                try:
-                    await ack_ws.send(encode_push_ack(head))
-                except Exception as ack_exc:
-                    logger.debug("[%s] Failed to send PushAck: %s", adapter.name, ack_exc, exc_info=True)
-            return
+            return head, data
         logger.debug("[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s", adapter.name, cmd_type, cmd, msg_id)
+        return None
+
+    async def _admit_push(self, head: dict, data: bytes, source_ws) -> None:
+        """Admit an inbound push (may wait for capacity), then ACK it to the transport."""
+        # A push still waiting in the handoff when its socket was replaced is dropped unACKed,
+        # as a reconnect cancelling the old reader did; the server redelivers it.
+        if source_ws is not None and source_ws is not self._ws:
+            return
+        if await self._push_to_inbound(data):
+            await self._send_push_ack(head, source_ws)
+
+    async def _send_push_ack(self, head: dict, source_ws) -> None:
+        ack_ws = source_ws or self._ws
+        if head.get("need_ack", False) and ack_ws is not None and ack_ws is self._ws:
+            try:
+                await ack_ws.send(encode_push_ack(head))
+            except Exception as ack_exc:
+                logger.debug("[%s] Failed to send PushAck: %s", self._adapter.name, ack_exc, exc_info=True)
 
     def _extract_sender_key(self, raw_data: bytes) -> str:
         """Debounce key 'from_account:group_code' (JSON or protobuf), else a unique fallback."""
@@ -2113,6 +2151,7 @@ class ConnectionManager:
             if self._recv_task is not None:
                 await cancel_task(self._recv_task)
                 self._recv_task = None
+            await self._push_handoff.close()  # unACKed pushes of the old socket are redelivered
             await self._cleanup_ws()
             try:
                 token_data = await SignManager.force_refresh(

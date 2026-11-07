@@ -188,6 +188,62 @@ class InboundAdmission:
             queue.task_done()
 
 
+class PushHandoff:
+    """Finite FIFO between the WebSocket reader and raw admission.
+
+    The reader must keep reading PONGs and RPC responses while admission waits for capacity, so it
+    only offers a push here and never awaits. One admitter task runs the offered pushes in arrival
+    order (each admits, then sends its PushAck); a push offered while this FIFO is full is shed
+    unacknowledged (counted and logged), the same transport outcome as a withheld ACK.
+    """
+
+    def __init__(self, adapter) -> None:
+        self._adapter = adapter
+        self.entries: collections.deque[tuple[int, Callable[[], Any]]] = collections.deque()
+        self.entry_bytes = 0
+        self.shed = 0
+        self._wakeup = asyncio.Event()
+        self.task: asyncio.Task | None = None
+
+    def offer(self, size: int, run: Callable[[], Any]) -> bool:
+        if len(self.entries) >= INBOUND_MAX_RETAINED_FRAMES or (
+                self.entries and self.entry_bytes + size > INBOUND_MAX_RETAINED_BYTES):
+            self.shed += 1
+            logger.warning("[%s] Inbound push shed without ACK: handoff full (frames=%d bytes=%d shed_total=%d)",
+                           self._adapter.name, len(self.entries), self.entry_bytes, self.shed)
+            return False
+        self.entries.append((size, run))
+        self.entry_bytes += size
+        self._wakeup.set()
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._run(), name="yuanbao-inbound-admitter")
+        return True
+
+    async def _run(self) -> None:
+        while True:
+            if not self.entries:
+                self._wakeup.clear()
+                await self._wakeup.wait()
+                continue
+            entry = self.entries[0]
+            try:
+                await entry[1]()
+            except Exception:
+                logger.warning("[%s] Inbound push admission failed", self._adapter.name, exc_info=True)
+            finally:
+                if self.entries and self.entries[0] is entry:
+                    self.entries.popleft()
+                    self.entry_bytes = max(0, self.entry_bytes - entry[0])
+
+    async def close(self) -> None:
+        task, self.task = self.task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.entries.clear()
+        self.entry_bytes = 0
+
+
 class GroupDispatchState:
     """Bound post-authorization group work and rate-limit explicit overflow notices."""
 
