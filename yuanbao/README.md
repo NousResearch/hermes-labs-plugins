@@ -158,7 +158,12 @@ platforms:
 - The adapter talks to Tencent's Yuanbao bot endpoints: the sign-token API (`YUANBAO_API_DOMAIN`, default
   `https://bot.yuanbao.tencent.com`), the bot WebSocket (`YUANBAO_WS_URL`, default
   `wss://bot-wss.yuanbao.tencent.com/wss/connection`) and Tencent COS for media upload/download. Sign-token
-  requests carry the Hermes version and an instance id header.
+  requests carry the Hermes version, the OS name (`sys.platform`) and an instance id header; the instance
+  id is a fixed value (`17`), the same for every install, not a per-install identifier. The WebSocket AUTH_BIND frame carries the same version, OS and instance id.
+- It downloads public media URLs found in received messages and quoted replies (images, files) so the
+  agent can see them, and URLs the agent passes to the send tools. Those requests go to whatever host the
+  URL names, not only Tencent; private, loopback and link-local targets are refused, every redirect hop
+  is re-checked, and downloads are size-capped.
 - Received media is cached in the Hermes media cache of the profile; the home channel is written to the
   profile's `.env` / `config.yaml` when set by `/sethome` or auto-sethome.
 - No telemetry of its own.
