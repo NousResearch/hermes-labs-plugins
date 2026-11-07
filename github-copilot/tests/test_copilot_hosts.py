@@ -85,6 +85,32 @@ class TestTurnAttribution:
         assert client["x-initiator"] == "agent"
 
 
+class TestCallerAttribution:
+    """The caller identity follows the token family (profile ``client_headers``): a fine-grained PAT
+    is served only under the Copilot CLI's ids, every other token keeps the VS Code ones."""
+
+    @staticmethod
+    def _client_headers(api_key, **kwargs):
+        from agent.provider_route_hooks import route_answer
+
+        return route_answer("client_headers", provider="copilot",
+                            base_url="https://api.githubcopilot.com", api_key=api_key, **kwargs)
+
+    def test_fine_grained_pat_claims_the_cli_identity(self):
+        headers = self._client_headers("github_pat_abc")
+        assert headers["Copilot-Integration-Id"] == "copilot-developer-cli"
+        assert headers["Editor-Version"].startswith("copilot/")
+
+    def test_pat_identity_survives_an_image_turn(self):
+        headers = self._client_headers("github_pat_abc", has_images=True)
+        assert headers["Copilot-Integration-Id"] == "copilot-developer-cli"
+        assert headers["Copilot-Vision-Request"] == "true"
+
+    @pytest.mark.parametrize("api_key", ["", "tid=abc;exp=1"])
+    def test_other_tokens_keep_the_vscode_identity(self, api_key):
+        assert self._client_headers(api_key)["Copilot-Integration-Id"] == "vscode-chat"
+
+
 @pytest.mark.parametrize("url, initiator", [
     ("https://api.githubcopilot.com", "user"),
     ("https://api.individual.githubcopilot.com", "agent"),

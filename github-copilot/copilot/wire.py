@@ -47,10 +47,10 @@ def model_api_mode(
     return "chat_completions"
 
 
-def editor_headers(*, is_vision: bool = False) -> dict[str, str]:
+def editor_headers(*, is_vision: bool = False, token: str = "") -> dict[str, str]:
     from .credentials import copilot_request_headers
 
-    return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
+    return copilot_request_headers(is_agent_turn=True, is_vision=is_vision, token=token)
 
 
 class CopilotWireMixin:
@@ -64,7 +64,7 @@ class CopilotWireMixin:
     def client_headers(
         self, *, base_url: str, api_key: str = "", has_images: bool = False,
     ) -> dict[str, str] | None:
-        return editor_headers(is_vision=has_images) if is_copilot_host(base_url) else None
+        return editor_headers(is_vision=has_images, token=api_key) if is_copilot_host(base_url) else None
 
     def request_headers(self, *, base_url: str, model: str = "", user_initiated: bool = False) -> dict[str, str]:
         # First call of a user turn says ``user``; follow-ups keep the client default ``x-initiator: agent``.
