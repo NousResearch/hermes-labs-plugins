@@ -82,6 +82,12 @@ RECORDER_JS = r"""
     } catch (e) { /* the recorder must never break the page */ }
   };
 
+  // Attribute *values* need escaping too: a value containing `"` closes the selector string
+  // early and every click/input on that element records a selector that never matches on
+  // replay. The id branch is already safe through CSS.escape(); this covers the attribute
+  // hooks it falls back to.
+  const cssAttr = (v) => String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
   // CSS path: id, else a stable attribute hook, else nth-of-type up to the nearest id/body.
   const cssPath = (el) => {
     if (!(el instanceof Element)) return "";
@@ -95,9 +101,9 @@ RECORDER_JS = r"""
       const name = el.getAttribute("name");
       const testId = el.getAttribute("data-testid") || el.getAttribute("data-test-id");
       const aria = el.getAttribute("aria-label");
-      if (testId) part += `[data-testid="${testId}"]`;
-      else if (name) part += `[name="${name}"]`;
-      else if (aria) part += `[aria-label="${aria}"]`;
+      if (testId) part += `[data-testid="${cssAttr(testId)}"]`;
+      else if (name) part += `[name="${cssAttr(name)}"]`;
+      else if (aria) part += `[aria-label="${cssAttr(aria)}"]`;
       else {
         let sib = el, nth = 1;
         while ((sib = sib.previousElementSibling)) {
