@@ -571,10 +571,26 @@ class RecallGuardMiddleware(InboundMiddleware):
             matched_sk = self._find_processing_session(adapter, recalled_id)
             if matched_sk is not None:
                 self._interrupt_for_recall(adapter, matched_sk, recalled_id, group_code, from_account)
+            elif self._drop_queued(adapter, recalled_id):
+                continue
             else:
                 self._patch_transcript(adapter, recalled_id, group_code, from_account, adapter._msg_content_cache.get(recalled_id))
 
     # -- Branch C: interrupt currently-processing message ---------------
+
+    @staticmethod
+    def _drop_queued(adapter, recalled_id: str) -> bool:
+        """Drop a recalled follow-up still waiting behind the running turn. Only an unmerged one:
+        core merges rapid follow-ups into one pending event, and those other messages stand."""
+        cached = adapter._msg_content_cache.get(recalled_id)
+        for session_key, pending in list(adapter._pending_messages.items()):
+            if (getattr(pending, "message_id", None) == recalled_id and not getattr(pending, "internal", False)
+                    and cached is not None and pending.text == cached):
+                adapter._pending_messages.pop(session_key, None)
+                logger.info("[%s] Recall dropped queued follow-up: msg_id=%s session=%s",
+                            adapter.name, recalled_id, session_key[:30])
+                return True
+        return False
 
     @staticmethod
     def _find_processing_session(adapter, recalled_id: str) -> Optional[str]:
@@ -2797,6 +2813,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def _process_message_background(self, event, session_key: str) -> None:
         """Wrap base class processing with a slow-response notifier."""
         chat_id = event.source.chat_id
+        if session_key and event.message_id:
+            # RecallGuard tracks the message whose turn is RUNNING: set it where core starts the turn
+            # (first message or drained follow-up), never when a follow-up is merely offered.
+            self._processing_msg_ids[session_key] = event.message_id
+            self._processing_msg_texts[session_key] = getattr(event, "text", None) or ""
         await self._outbound.slow_notifier.start(chat_id)
         try:
             await super()._process_message_background(event, session_key)

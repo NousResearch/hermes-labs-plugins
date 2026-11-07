@@ -350,9 +350,8 @@ class BoundedDispatchMixin:
 
     @staticmethod
     async def _dispatch_event(adapter, session_key: str, event: MessageEvent) -> None:
-        if session_key and event.message_id:
-            adapter._processing_msg_ids[session_key] = event.message_id
-            adapter._processing_msg_texts[session_key] = event.text or ""
+        # Recall tracking is set when the turn starts (YuanbaoAdapter._process_message_background):
+        # this event may only be queued behind the active one.
         if event.message_id and event.text:
             cache = adapter._msg_content_cache
             cache[event.message_id] = event.text
