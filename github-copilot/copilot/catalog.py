@@ -349,12 +349,16 @@ def github_model_reasoning_efforts(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> list[str]:
     """Return supported reasoning-effort levels for a Copilot-visible model."""
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
-    if not normalized:
+    if not str(model_id or "").strip():
         return []
-
-    if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
+    if catalog is None:
+        try:
+            key = api_key or _resolve_copilot_catalog_api_key()
+            if key:
+                catalog = fetch_github_model_catalog(api_key=key)
+        except Exception:
+            logger.debug("copilot reasoning catalog lookup failed", exc_info=True)
+    normalized = normalize_copilot_model_id(model_id, catalog=catalog)
     catalog_entry = next((item for item in catalog if item.get("id") == normalized), None) if catalog else None
     if catalog_entry is not None:
         capabilities = catalog_entry.get("capabilities")
