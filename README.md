@@ -36,6 +36,7 @@ Supported first-party plugins live in [hermes-official-plugins](https://github.c
 | [Workflow Record](workflow-record/) | `hermes plugins install workflow-record` | `hermes record` captures a browser workflow you demonstrate once (clicks, field values, navigations; passwords masked inside the page), and its bundled skill lets `/learn` turn the recording into a skill that replays it. |
 | [GitHub Copilot](github-copilot/) | `hermes plugins install github-copilot` | Your GitHub Copilot subscription as a model provider, formerly bundled in Hermes core: `copilot` calls the Copilot API with your GitHub account (`hermes auth add copilot` device-code sign-in or a `GH_TOKEN`), `copilot-acp` drives your installed Copilot CLI over ACP. |
 | [Patsnap](patsnap/) | `hermes plugins install patsnap` | Patent and scientific-literature search through Patsnap's hosted MCP server (prior art, assignees, legal lifecycle, papers), with a workflow skill. Needs a `PATSNAP_API_KEY` from the Patsnap Open Platform; calls spend Patsnap credits. |
+| [Yuanbao](yuanbao/) | `hermes plugins install yuanbao` | Tencent Yuanbao (腾讯元宝) as a Hermes messaging platform, formerly built into Hermes core: DMs and group chats over Yuanbao's bot WebSocket, native media and stickers, DM/group access policies, cron delivery to a home channel, and the `yb_*` group/DM/sticker tools. Unsupported and likely not maintained going forward; community fixes welcome. |
 
 ## Working on a plugin
 

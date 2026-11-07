@@ -1,0 +1,15 @@
+[project]
+name = "hermes-yuanbao"
+version = "2.0.0"
+description = "Tencent Yuanbao gateway platform and yb_* tools for Hermes Agent (Hermes Labs plugin, unsupported)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nous Research" }]
+requires-python = ">=3.11"
+dependencies = [
+  # The adapter's persistent WebSocket client. Same pin Hermes core carried for it.
+  "websockets>=15.0.1,<16",
+]
+
+[project.urls]
+Homepage = "https://github.com/NousResearch/hermes-labs-plugins/tree/main/yuanbao"
