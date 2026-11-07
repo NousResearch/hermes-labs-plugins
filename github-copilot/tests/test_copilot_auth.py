@@ -77,6 +77,13 @@ class TestRequestHeaders:
         assert "Editor-Version" in headers
 
 
+    def test_request_headers_declare_api_version(self):
+        """Losing this header silently downgrades /models to legacy default-tier limits:
+        long-context models resolve ~5x too small and no billing tiers are advertised (#46)."""
+        from github_copilot_plugin.copilot.credentials import copilot_request_headers
+        assert copilot_request_headers()["X-GitHub-Api-Version"] == "2026-08-01"
+
+
     def test_no_vision_header_by_default(self):
         from github_copilot_plugin.copilot.credentials import copilot_request_headers
         headers = copilot_request_headers()
@@ -96,6 +103,39 @@ class TestCopilotDefaultHeaders:
                 f"is_agent_turn={is_agent} should produce x-initiator={expected!r}, "
                 f"got {headers['x-initiator']!r}"
             )
+
+
+    def test_default_headers_carry_api_version(self):
+        """The catalog path delegates to copilot_request_headers(), so the /models fetch
+        inherits the version header — and with it the account's real long-context limits."""
+        from github_copilot_plugin.copilot.catalog import copilot_default_headers
+        from github_copilot_plugin.copilot.credentials import _COPILOT_API_VERSION
+        assert copilot_default_headers()["X-GitHub-Api-Version"] == _COPILOT_API_VERSION
+
+
+class TestCopilotApiVersionOverride:
+    """``HERMES_COPILOT_API_VERSION`` overrides the pinned Copilot API date at call time — the
+    escape hatch if GitHub retires or advances the version (no plugin release needed). An
+    empty value falls back to the pin."""
+
+
+    def test_env_override_sets_header(self, monkeypatch):
+        from github_copilot_plugin.copilot.credentials import copilot_request_headers
+        monkeypatch.setenv("HERMES_COPILOT_API_VERSION", "2026-09-01")
+        assert copilot_request_headers()["X-GitHub-Api-Version"] == "2026-09-01"
+
+
+    def test_empty_override_falls_back_to_pin(self, monkeypatch):
+        from github_copilot_plugin.copilot.credentials import (
+            _COPILOT_API_VERSION, copilot_request_headers)
+        monkeypatch.setenv("HERMES_COPILOT_API_VERSION", "")
+        assert copilot_request_headers()["X-GitHub-Api-Version"] == _COPILOT_API_VERSION
+
+
+    def test_override_propagates_to_catalog_headers(self, monkeypatch):
+        from github_copilot_plugin.copilot.catalog import copilot_default_headers
+        monkeypatch.setenv("HERMES_COPILOT_API_VERSION", "2026-09-01")
+        assert copilot_default_headers()["X-GitHub-Api-Version"] == "2026-09-01"
 
 
 class TestEnvVarOrder:
