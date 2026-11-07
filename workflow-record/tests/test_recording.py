@@ -13,6 +13,7 @@ import pytest
 
 from workflow_record_plugin.recording import (
     BINDING_NAME,
+    MAX_RAW_EVENTS,
     RECORDING_VERSION,
     build_recording,
     handle_cdp_message,
@@ -222,6 +223,17 @@ class TestHandleCdpMessage:
         payload = {"t": 1, "type": "click", "selector": "#a"}
         handle_cdp_message(_binding(json.dumps(payload)), events)
         assert events == [payload]
+
+    def test_buffer_keeps_the_newest_events_only(self):
+        """The buffer was append-only until Ctrl-C; a long demo grew it without
+        bound. Over the cap the oldest steps go, the tail — what was just done —
+        stays."""
+        events = []
+        for i in range(MAX_RAW_EVENTS + 3):
+            handle_cdp_message(_binding(json.dumps({"type": "click", "selector": f"#e{i}"})), events)
+        assert len(events) == MAX_RAW_EVENTS
+        assert events[0]["selector"] == "#e3"
+        assert events[-1]["selector"] == f"#e{MAX_RAW_EVENTS + 2}"
 
     def test_other_bindings_are_ignored(self):
         events = []
