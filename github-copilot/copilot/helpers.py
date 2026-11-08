@@ -45,6 +45,25 @@ def is_astra_model(model: Optional[str]) -> bool:
     return (model or "").strip().lower().rsplit("/", 1)[-1] in _ASTRA_MODEL_IDS
 
 
+# ─── per-generation Responses ladders (core ``agent.reasoning_effort.codex_supported_efforts``) ───
+
+GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+# GPT-6 Sol/Luna: ``-pro``/``-900k``/dated snapshots share the prefix. GPT-6.1 Sol takes Astra's ladder, as
+# does GPT-6.1 Terra: core does not list it, Copilot's /models serves it with Sol's ``low``..``max``.
+_GPT6_TIER_PREFIXES = ("gpt-6-sol", "gpt-6-luna")
+_NO_DISABLE_TIER_PREFIXES = ("gpt-6.1-sol", "gpt-6.1-terra")
+
+
+def tier_efforts(model: Optional[str]) -> Optional[tuple[str, ...]]:
+    """The effort ladder of a GPT-5.6 / GPT-6 tier model, or None for an older model."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if is_astra_model(bare) or bare.startswith(_NO_DISABLE_TIER_PREFIXES):
+        return ASTRA_EFFORTS
+    if "gpt-5.6" in bare or bare.startswith(_GPT6_TIER_PREFIXES):
+        return GPT56_EFFORTS
+    return None
+
+
 def clamp_effort(effort: Optional[str], supported: Optional[Sequence[str]]) -> Optional[str]:
     """Clamp a requested effort onto *supported*: unchanged when supported, when the set is unknown, or
     when the request is not a ladder level; else the nearest WEAKER supported level (never "none"),
