@@ -349,12 +349,28 @@ def github_model_reasoning_efforts(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> list[str]:
     """Return supported reasoning-effort levels for a Copilot-visible model."""
+    # Resolve the plugin's own Copilot token when none is supplied, so the live
+    # catalog can be consulted (issue #65). Lookup failures fall back to static.
+    if catalog is None and not api_key:
+        try:
+            from .credentials import resolve_copilot_token, get_copilot_api_token
+            raw, _ = resolve_copilot_token()
+            if raw:
+                api_key = get_copilot_api_token(raw)[0] or raw
+        except Exception:
+            logger.debug("reasoning_efforts: token resolution failed", exc_info=True)
+
+    if catalog is None and api_key:
+        try:
+            catalog = fetch_github_model_catalog(api_key=api_key)
+        except Exception:
+            logger.debug("reasoning_efforts: catalog fetch failed", exc_info=True)
+            catalog = None
+
     normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
     if not normalized:
         return []
 
-    if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
     catalog_entry = next((item for item in catalog if item.get("id") == normalized), None) if catalog else None
     if catalog_entry is not None:
         capabilities = catalog_entry.get("capabilities")
