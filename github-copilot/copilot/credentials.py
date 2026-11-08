@@ -424,8 +424,12 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
 def copilot_request_headers(
     *, is_agent_turn: bool = True, is_vision: bool = False) -> dict[str, str]:
     """Build the standard headers for Copilot API requests."""
+    # Fine-grained PATs (github_pat_*) are rejected by GitHub when sent with the
+    # vscode-chat integration id; the developer-cli id is required (#63).
+    token, _ = resolve_copilot_token()
+    integration_id = "copilot-developer-cli" if token.startswith("github_pat_") else "vscode-chat"
     headers: dict[str, str] = {"Editor-Version": _EDITOR_VERSION, "User-Agent": "HermesAgent/1.0",
-                               "Copilot-Integration-Id": "vscode-chat",
+                               "Copilot-Integration-Id": integration_id,
                                "Openai-Intent": "conversation-edits",
                                "x-initiator": "agent" if is_agent_turn else "user"}
     if is_vision:
