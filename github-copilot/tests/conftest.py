@@ -186,6 +186,9 @@ def _reset_plugin_caches():
         catalog._copilot_context_cache = {}
         catalog._copilot_context_cache_time = 0.0
         catalog._copilot_context_cache_key = None
+        with contextlib.suppress(Exception):
+            from agent import provider_route_hooks
+            provider_route_hooks._PURE_MEMO.clear()
 
     reset()
     yield

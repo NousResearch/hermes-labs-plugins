@@ -33,11 +33,13 @@ class CopilotProfile(CopilotWireMixin, CopilotResponsesMixin, CopilotCatalogMixi
             supported = github_model_reasoning_efforts(model)
             if not supported:
                 return {}, {}
+            if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
+                return ({}, {"reasoning_effort": "none"}) if "none" in supported else ({}, {})
             if not reasoning_config:
-                return {"reasoning": {"effort": "medium"}}, {}
+                return {}, {"reasoning_effort": clamp_github_reasoning_effort("medium", supported)}
             # Never drop straight to medium, which inverted the ladder (ultra < high). See #74295.
             effort = clamp_github_reasoning_effort(reasoning_config.get("effort"), supported)
-            return {"reasoning": {"effort": effort}}, {}
+            return {}, {"reasoning_effort": effort}
         except Exception:
             return {}, {}
 

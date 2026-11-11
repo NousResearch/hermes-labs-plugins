@@ -29,6 +29,8 @@ COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 _CATALOG_HOSTS = HOSTNAMES + METADATA_HOSTNAMES
 REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
+REASONING_EFFORTS_GEMINI = ["low", "medium", "high"]
+REASONING_EFFORTS_CLAUDE5 = ["low", "medium", "high", "xhigh", "max"]
 
 # Curated list (core's static catalog row): served when the live catalog is unreachable.
 STATIC_MODELS = (
@@ -337,11 +339,15 @@ def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
     raw = (model_id or "").strip().lower()
     if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
         return list(REASONING_EFFORTS_O_SERIES)
-    normalized = normalize_copilot_model_id(model_id).lower()
+    normalized = normalize_copilot_model_id(model_id, catalog=[]).lower()
     if is_astra_model(normalized):
         return list(ASTRA_EFFORTS)
     if normalized.startswith("gpt-5"):
         return list(REASONING_EFFORTS_GPT5)
+    if normalized.startswith(("gemini-4", "gemini-3.8")):
+        return list(REASONING_EFFORTS_GEMINI)
+    if normalized.startswith(("claude-opus-5", "claude-sonnet-5", "claude-haiku-5")):
+        return list(REASONING_EFFORTS_CLAUDE5)
     return []
 
 
@@ -349,12 +355,24 @@ def github_model_reasoning_efforts(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> list[str]:
     """Return supported reasoning-effort levels for a Copilot-visible model."""
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    if not str(model_id or "").strip():
+        return []
+    if catalog is None:
+        try:
+            key = api_key
+            if not key:
+                from .activation import github_calls_allowed
+                if github_calls_allowed():
+                    key = _resolve_copilot_catalog_api_key()
+            if key:
+                catalog = fetch_github_model_catalog(api_key=key)
+        except Exception:
+            logger.debug("copilot reasoning catalog lookup failed", exc_info=True)
+
+    normalized = normalize_copilot_model_id(model_id, catalog=catalog)
     if not normalized:
         return []
 
-    if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
     catalog_entry = next((item for item in catalog if item.get("id") == normalized), None) if catalog else None
     if catalog_entry is not None:
         capabilities = catalog_entry.get("capabilities")
