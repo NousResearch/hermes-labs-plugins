@@ -20,9 +20,11 @@ hermes plugins install github-copilot
 ```
 
 Needs a Hermes release in which Copilot has left core
-([hermes-agent#144788](https://github.com/NousResearch/hermes-agent/pull/144788)). On an older Hermes the
-plugin stays inactive and logs one warning: that Hermes still ships its own Copilot support, which keeps
-working.
+([hermes-agent#144788](https://github.com/NousResearch/hermes-agent/pull/144788)) and the generic
+credential-pool runtime SDK: `providers.base.PoolRuntimeCredential`,
+`ProviderProfile.prepare_pool_entry`, `refresh_pool_runtime_credentials`, and
+`credential_pool_base_urls`. On a core missing these seams the plugin stays inactive and logs one
+warning; upgrade core before using this plugin revision.
 
 ## Sign in
 
@@ -59,6 +61,21 @@ Copilot list.
 **`copilot-acp`:** install the CLI (`npm install -g @github/copilot`) and run `copilot login`. Hermes
 starts `copilot --acp --stdio` per request; point it elsewhere with `HERMES_COPILOT_ACP_COMMAND` (or
 `COPILOT_CLI_PATH`) and `HERMES_COPILOT_ACP_ARGS`.
+
+## Credential-pool recovery
+
+Pool rows retain the durable GitHub grant. After a row is selected, its exchanged Copilot bearer
+and account endpoint are transient runtime credentials, never replacements in `auth.json`.
+On a 401 or stale-integrator 400, Hermes renews only the row that supplied the failed request:
+its memory, disk and failure-cache entries are evicted before a fresh exchange of that same grant.
+Failed forced renewal returns no replacement; it never substitutes an ambient account or raw token.
+Normal initial resolution still permits the existing same-account raw-token fallback.
+
+Runtime endpoint changes are restricted to these exact HTTPS origins:
+`https://api.githubcopilot.com`, `https://api.individual.githubcopilot.com`,
+`https://api.business.githubcopilot.com`, and `https://api.enterprise.githubcopilot.com`.
+Custom relays, alternate ports, path-prefixed URLs and lookalike domains are not authorized account
+endpoint transitions. Catalog source ordering and fallback policy are unchanged.
 
 ## Premium requests
 

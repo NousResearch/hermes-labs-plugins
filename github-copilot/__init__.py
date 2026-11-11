@@ -21,6 +21,7 @@ _REQUIRED_SEAMS = (
     "api_mode_for_model", "client_headers", "request_headers", "max_tokens_param",
     "seed_pool_credentials", "refresh_runtime_credentials", "external_auth_evidence",
     "live_context_length", "replay_message_carriers", "start_device_login", "picker_catalog",
+    "prepare_pool_entry", "refresh_pool_runtime_credentials", "credential_pool_base_urls",
 )
 
 
@@ -37,11 +38,13 @@ def _bundled_copilot_dirs() -> list[Path]:
 
 def inert_reason() -> str | None:
     """Why this core must not get these profiles, or None when it should."""
-    from providers.base import ProviderProfile
+    from providers import base
 
     if bundled := _bundled_copilot_dirs():
         return f"this Hermes core still bundles GitHub Copilot ({bundled[0]})"
-    if missing := [name for name in _REQUIRED_SEAMS if not hasattr(ProviderProfile, name)]:
+    if not hasattr(base, "PoolRuntimeCredential"):
+        return "this Hermes core lacks the PoolRuntimeCredential provider SDK"
+    if missing := [name for name in _REQUIRED_SEAMS if not hasattr(base.ProviderProfile, name)]:
         return f"this Hermes core lacks the provider seams the plugin needs ({', '.join(missing)})"
     return None
 
@@ -49,8 +52,8 @@ def inert_reason() -> str | None:
 def _register() -> bool:
     reason = inert_reason()
     if reason:
-        logger.warning("github-copilot plugin is inactive: %s. Update Hermes; until then the core's "
-                       "own Copilot support is used.", reason)
+        logger.warning("github-copilot plugin is inactive: %s. Update Hermes before using this "
+                       "plugin revision.", reason)
         return False
     from providers import register_provider
 
