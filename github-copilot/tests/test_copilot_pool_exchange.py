@@ -28,7 +28,7 @@ def test_runtime_selected_copilot_exchanges_ambient_pool_token(tmp_path, monkeyp
     _cfg._RAW_CONFIG_CACHE.clear()
     monkeypatch.setattr(copilot_credentials, "resolve_copilot_token", lambda: ("ghu_raw_gh_token", "GH_TOKEN"))
     monkeypatch.setattr(copilot_credentials, "get_copilot_api_token",
-                        lambda tok: ("tid=exchanged;exp=1", "https://api.enterprise.ghe.example"))
+                        lambda tok: ("tid=exchanged;exp=1", "https://api.enterprise.githubcopilot.com"))
     monkeypatch.setattr(copilot_wire, "model_api_mode", lambda *a, **k: "chat_completions")
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "copilot")
 
@@ -36,4 +36,7 @@ def test_runtime_selected_copilot_exchanges_ambient_pool_token(tmp_path, monkeyp
 
     assert resolved["provider"] == "copilot"
     assert resolved["api_key"] == "tid=exchanged;exp=1"
-    assert resolved["base_url"].startswith("https://api.enterprise.ghe.example")
+    assert resolved["base_url"] == "https://api.enterprise.githubcopilot.com"
+    row = resolved["credential_pool"].entries()[0]
+    assert row.access_token == "ghu_raw_gh_token"
+    assert row.runtime_api_key == "tid=exchanged;exp=1"

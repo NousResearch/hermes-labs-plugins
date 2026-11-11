@@ -65,14 +65,16 @@ def test_core_that_bundles_copilot_gets_no_registration(tmp_path, monkeypatch, c
     assert len(warnings) == 1 and "still bundles GitHub Copilot" in warnings[0]
 
 
-def test_core_without_the_provider_seams_gets_no_registration(monkeypatch, caplog):
-    monkeypatch.delattr(ProviderProfile, "api_mode_for_model")
+@pytest.mark.parametrize("seam", ["api_mode_for_model", "prepare_pool_entry",
+                                 "refresh_pool_runtime_credentials", "credential_pool_base_urls"])
+def test_core_without_the_provider_seams_gets_no_registration(monkeypatch, caplog, seam):
+    monkeypatch.delattr(ProviderProfile, seam)
 
     with caplog.at_level(logging.WARNING):
         module, calls = _fresh_load(monkeypatch)
 
     assert module.ACTIVE is False and calls == []
-    assert "api_mode_for_model" in caplog.text
+    assert seam in caplog.text
 
 
 def test_leftover_bytecode_dir_does_not_count_as_bundled(tmp_path, monkeypatch):
@@ -86,3 +88,13 @@ def test_leftover_bytecode_dir_does_not_count_as_bundled(tmp_path, monkeypatch):
 
     assert module.ACTIVE is True
     assert calls == ["copilot", "copilot-acp"]
+
+
+def test_core_without_runtime_pair_type_stays_inactive(monkeypatch, caplog):
+    import providers.base as base
+
+    monkeypatch.delattr(base, "PoolRuntimeCredential")
+    with caplog.at_level(logging.WARNING):
+        module, calls = _fresh_load(monkeypatch)
+    assert module.ACTIVE is False and calls == []
+    assert "PoolRuntimeCredential" in caplog.text

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent.secret_scope import get_secret
+from providers.base import PoolRuntimeCredential
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -324,7 +325,7 @@ def _fetch_exchange_with_retry(req, timeout: float, fp: str) -> dict:
             if attempt < _EXCHANGE_MAX_ATTEMPTS:
                 sleep_s = _EXCHANGE_BACKOFF_BASE_SECONDS * attempt
                 logger.debug("Copilot token exchange attempt %d/%d failed (%s); retrying in %.1fs",
-                             attempt, _EXCHANGE_MAX_ATTEMPTS, exc, sleep_s)
+                             attempt, _EXCHANGE_MAX_ATTEMPTS, type(exc).__name__, sleep_s)
                 time.sleep(sleep_s)
     _exchange_failure_cache[fp] = time.time() + (
         _EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS if permanent_failure
@@ -551,6 +552,8 @@ _RUNTIME_REFRESHERS = {
 class CopilotCredentialsMixin:
     """Fills the generic credential seams of ``providers.base.ProviderProfile`` for Copilot."""
 
+    base_url: str  # supplied by ProviderProfile in the concrete CopilotProfile
+
     def resolve_api_key_secret(self) -> tuple[str, str]:
         """The exchanged Copilot token. A home that never chose Copilot gets the raw env token (it
         still reads as present) and GitHub is not called: provider listings resolve this for every
@@ -584,21 +587,32 @@ class CopilotCredentialsMixin:
             logger.debug("Copilot base URL resolution fell back to default: %s", exc)
         return base_url
 
-    def prepare_pool_entry(self, entry: Any, api_key: str) -> str:
-        """A pool row may still carry the RAW GitHub token: the seeder skips the exchange while
-        copilot is merely discovered (ambient gh login, not in config). Here copilot IS the runtime
-        target, and a raw token routes to the language-server integrator whose allowlist omits
-        enterprise-only models (400 model_not_available_for_integrator)."""
+    def prepare_pool_entry(self, entry: Any, api_key: str) -> str | PoolRuntimeCredential:
+        """Exchange the selected GitHub grant without changing its durable pool row."""
         if not api_key or not validate_copilot_token(api_key)[0]:
             return api_key  # already an exchanged API token
         api_token, enterprise_base_url = get_copilot_api_token(api_key)
         if api_token == api_key and not enterprise_base_url:
             _warn_raw_degradation_once(api_key)
             return api_key
-        entry.access_token = api_token
-        if enterprise_base_url:
-            entry.base_url = enterprise_base_url
-        return api_token
+        return PoolRuntimeCredential(api_key=api_token, base_url=enterprise_base_url or self.base_url)
+
+    def refresh_pool_runtime_credentials(self, entry: Any, *, reason: str) -> Optional[PoolRuntimeCredential]:
+        """Force renewal for this failed row only; never consult ambient credentials or fall back."""
+        if reason not in _RUNTIME_REFRESHERS:
+            return None
+        raw_token = entry.access_token
+        if not isinstance(raw_token, str) or not validate_copilot_token(raw_token)[0]:
+            return None
+        try:
+            evict_cached_exchanged_token(raw_token)
+            api_token, _expires_at, base_url = exchange_copilot_token(raw_token)
+        except Exception as exc:
+            logger.debug("Copilot pool credential renewal failed (%s)", type(exc).__name__)
+            return None
+        if api_token == raw_token:
+            return None
+        return PoolRuntimeCredential(api_key=api_token, base_url=base_url or self.base_url)
 
     def seed_pool_credentials(self, *, suppressed_sources: frozenset,
                               explicitly_configured: bool) -> list[dict]:
@@ -614,24 +628,9 @@ class CopilotCredentialsMixin:
             source_name = f"env:{source}"
             if source_name in suppressed_sources:  # per-source gate BEFORE the network exchange
                 return []
-            from .activation import github_calls_allowed
-
-            # Core's ``explicitly_configured`` counts any profile env var, so a GH_TOKEN kept for
-            # other tools would pass it; the plugin's own check does not (``activation``).
-            del explicitly_configured
-            if not github_calls_allowed():
-                # Only discovered here (an ambient env token), not selected anywhere: no model is
-                # routed to it, so the exchange — and its degradation warning on every pool load —
-                # buys nothing (#114740). Seed the raw token; selecting copilot re-seeds and exchanges.
-                api_token, enterprise_base_url = token, None
-            else:
-                api_token, enterprise_base_url = get_copilot_api_token(token)
-                # A failed exchange falls back to the RAW token, which the Copilot API routes to the
-                # "copilot-language-server" integrator whose allowlist omits enterprise-only models
-                # -> HTTP 400 on every turn. Surface it once.
-                if api_token == token and not enterprise_base_url:
-                    _warn_raw_degradation_once(token)
-            return [{"source": source_name, "access_token": api_token, "base_url": enterprise_base_url,
+            # The durable pool row holds the GitHub grant. Exchange only after selection;
+            # an expiring bearer must never become the persisted account credential.
+            return [{"source": source_name, "access_token": token, "base_url": None,
                      "label": source}]
         except Exception as exc:  # health: allow BLE001 -- moved verbatim from core (hermes_cli/copilot_auth.py, credential_pool, client_lifecycle, auth.py)
             logger.debug("Copilot token seed failed: %s", exc)
