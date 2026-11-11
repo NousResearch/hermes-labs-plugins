@@ -141,6 +141,7 @@ _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 # Exchange endpoint and headers (matching VS Code / Copilot CLI)
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 _EDITOR_VERSION = "vscode/1.104.1"
+_GITHUB_API_VERSION = "2026-08-01"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
 
 # Transient-failure hardening: gateway startup races network readiness, and a single-shot
@@ -427,7 +428,10 @@ def copilot_request_headers(
     headers: dict[str, str] = {"Editor-Version": _EDITOR_VERSION, "User-Agent": "HermesAgent/1.0",
                                "Copilot-Integration-Id": "vscode-chat",
                                "Openai-Intent": "conversation-edits",
-                               "x-initiator": "agent" if is_agent_turn else "user"}
+                               "x-initiator": "agent" if is_agent_turn else "user",
+                               # Without a dated API version /models caps Claude/GPT-6 at 200-272K
+                               # max_prompt_tokens; with it the real window (~936K-1M) is reported.
+                               "X-GitHub-Api-Version": _GITHUB_API_VERSION}
     if is_vision:
         headers["Copilot-Vision-Request"] = "true"
     return headers
