@@ -94,7 +94,8 @@ def test_state_db_without_delegation_table_degrades(hermes_home):
     assert "Needs attention (0)" in report.render_inbox(data)
 
 
-def test_loops_and_refused_fire_reach_attention(hermes_home):
+def test_loops_and_refused_fire_reach_attention(hermes_home, monkeypatch):
+    monkeypatch.delenv("HERMES_INBOX_LOOP_GRACE_SECONDS", raising=False)
     now = time.time()
     add_loops(hermes_home, [
         ("overdue", {"prompt": "watch the deploy", "status": "active",
