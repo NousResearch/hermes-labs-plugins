@@ -1,6 +1,9 @@
 """Yuanbao send ACK decoding: a WS Response can carry ``head.status == 0`` and still reject the
 message in its business payload (protobuf field 1 ``code``, field 2 ``message``), e.g. code 999
-for an over-long reply. Treat either signal as a failed delivery instead of a success."""
+for an over-long reply. Treat either signal as a failed delivery instead of a success.
+
+Success ACKs carry only field 2 (``"succ"``) with no field-1 code (observed live 2026-11-12):
+a decodable payload without a code is a success, not a malformed response."""
 
 from __future__ import annotations
 
@@ -23,10 +26,12 @@ def _decode_varint_strict(data: bytes, pos: int) -> tuple[int, int]:
     return value, pos
 
 
-def decode_send_ack_payload(data: bytes) -> tuple[int, str]:
+def decode_send_ack_payload(data: bytes) -> tuple[Optional[int], str]:
     """Send-response protobuf: field 1 varint ``code``, field 2 string ``message``.
 
-    Raises if the payload is truncated/malformed or has no decodable field-1 code.
+    A missing field-1 code returns ``(None, message)`` — success ACKs carry only field 2
+    (``"succ"``), so no code means no rejection signal. Raises only when the payload is
+    truncated or uses an unknown wire type.
     """
     pos = 0
     code: Optional[int] = None
@@ -53,8 +58,6 @@ def decode_send_ack_payload(data: bytes) -> tuple[int, str]:
             pos += n
         else:
             raise ValueError(f"unknown wire type {wt}")
-    if code is None:
-        raise ValueError("missing business code")
     return code, message
 
 
@@ -67,8 +70,9 @@ def ack_from_response(adapter_name: str, response) -> dict:
     """Map a WS Response ``{head, data?}`` to ``{success, msg_key|error}``.
 
     Fail closed on a non-dict response, nonzero ``head.status``, nonzero business ``code`` or
-    nonempty malformed ``data``. Fail open (success) when status is missing/0 and ``data`` is
-    absent or empty: there is no rejection signal.
+    a truncated/garbled ``data`` payload. Fail open (success) when status is missing/0 and
+    ``data`` is absent, empty, or decodes without a rejection code (success ACKs carry only
+    field 2 ``"succ"``).
     """
     if not isinstance(response, dict):
         logger.warning("[%s] send rejected: non-dict response type=%s", adapter_name, type(response).__name__)

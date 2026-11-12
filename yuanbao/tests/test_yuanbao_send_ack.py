@@ -80,6 +80,16 @@ def test_malformed_nonempty_truncated_varint_is_not_success():
     assert result["success"] is False
 
 
+def test_live_success_ack_field2_only_is_success():
+    """Live-observed success ACK (2026-11-12, production WS gateway): the business payload is
+    protobuf field 2 ``"succ"`` with no field-1 code — protobuf omits the default-zero code,
+    so a decodable payload without a code is a delivered message, not a malformed response."""
+    resp = {"head": {"status": 0, "msg_id": "c2c_live"}, "data": b"\x12\x04succ"}
+    result = _dispatch(resp, req_id="c2c_live")
+    assert result["success"] is True
+    assert result["msg_key"] == "c2c_live"
+
+
 def test_chunk_target_is_1200_and_splits_2491_chars():
     chunks = MessageSender.truncate_message("汉" * 2491, YuanbaoAdapter.MAX_TEXT_CHUNK)
     assert len(chunks) > 1
