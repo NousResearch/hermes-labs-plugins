@@ -50,6 +50,18 @@ def write_cron(home: Path, jobs: list[dict]) -> None:
     (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
 
 
+def add_loops(home: Path, rows: list[tuple[str, dict]]) -> None:
+    """rows: (session_id, LoopState field overrides), written as core's own ``/loop`` does."""
+    from hermes_cli.loops import LoopState
+
+    db = make_state_db(home)
+    try:
+        for session_id, fields in rows:
+            db.set_meta(f"loop:{session_id}", LoopState(**fields).to_json())
+    finally:
+        db.close()
+
+
 def write_leases(home: Path, leases: list[dict], *, legacy: bool = False) -> None:
     """Hand-written leases (for dead / recycled PIDs core's writer would refuse to record), in
     the registry's current {"entries": [...]} shape, or the older bare list."""

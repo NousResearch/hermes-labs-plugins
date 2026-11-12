@@ -9,8 +9,8 @@ import time
 
 from inbox_plugin import report
 from inbox_seed import (
-    DEAD_PID, add_delegations, add_kanban_tasks, make_state_db, tree, write_cron, write_leases,
-    write_processes,
+    DEAD_PID, add_delegations, add_kanban_tasks, add_loops, make_state_db, tree, write_cron,
+    write_leases, write_processes,
 )
 
 
@@ -92,6 +92,34 @@ def test_state_db_without_delegation_table_degrades(hermes_home):
     data = report.build_inbox()
     assert data["sources"]["delegations"].startswith("unreadable")
     assert "Needs attention (0)" in report.render_inbox(data)
+
+
+def test_loops_and_refused_fire_reach_attention(hermes_home):
+    now = time.time()
+    add_loops(hermes_home, [
+        ("overdue", {"prompt": "watch the deploy", "status": "active",
+                     "next_due_at": now - 3600, "ticks_fired": 7}),
+        ("paused", {"prompt": "poll the DB", "status": "paused",
+                    "paused_reason": "reached max_ticks (100)", "ticks_fired": 100}),
+        ("unknown", {"prompt": "no status writer", "status": "unknown"}),
+        ("waiting", {"prompt": "keep checking", "status": "active",
+                     "next_due_at": now + 300, "ticks_fired": 2}),
+    ])
+    write_cron(hermes_home, [
+        {"id": "backup", "name": "nightly-backup", "enabled": True, "last_status": "ok",
+         "next_run_at": "2026-11-13T03:00:00+08:00",
+         "last_fire_error": {"at": now, "detail": "the gateway is absent"}},
+    ])
+
+    data = report.build_inbox()
+    assert {i["id"] for i in data["attention"]} == {"overdue", "paused", "unknown", "backup"}
+    assert {i["id"] for i in data["in_progress"]} == {"waiting"}
+    text = report.render_inbox(data)
+    assert "overdue by 1h00m" in text
+    assert "paused: reached max_ticks (100)" in text
+    assert "unknown: no reason recorded" in text
+    assert "last fire REFUSED: the gateway is absent" in text
+    assert "next in " in text
 
 
 def test_scheduled_header_matches_the_jobs_listed(hermes_home):

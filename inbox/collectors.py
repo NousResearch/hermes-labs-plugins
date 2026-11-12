@@ -25,6 +25,11 @@ LIVE_DELEGATION_STATES = ("running", "finalizing", "stalling")
 # A dropped result older than this is history, not something to act on.
 DROPPED_WINDOW_S = 7 * 86400
 OK_CRON_STATUSES = (None, "", "success", "ok")
+# ``/loop`` state lives in ``state_meta`` under this prefix, one row per session.
+LOOP_META_PREFIX = "loop:"
+# A loop's driver ticks on a seconds cadence; a tick this late has no driver behind it.
+LOOP_OVERDUE_GRACE_S = 5 * 60
+LOOP_TERMINAL_STATES = ("done", "cleared")
 _BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 
@@ -144,6 +149,64 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
     return out, None
 
 
+def collect_loops(home: Path) -> tuple[Items, Note]:
+    """In-session ``/loop`` state from ``state_meta`` (key ``loop:<session id>``). A loop is work
+    in flight even though no process, delegation or cron job names it: its driver injects a
+    wakeup turn on a cadence. ``done``/``cleared`` loops are history. ``awaiting_response`` means
+    the last wakeup's turn is still running, so a past ``next_due_at`` is expected, not overdue."""
+    db = home / "state.db"
+    if not db.exists():
+        return [], "absent"
+    try:
+        conn = _connect_ro(db)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key LIKE ? ORDER BY key LIMIT 50",
+                (LOOP_META_PREFIX + "%",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return [], f"unreadable ({exc})"
+    now = time.time()
+    out: Items = []
+    for key, raw in rows:
+        try:
+            state = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if not isinstance(state, dict):
+            continue
+        status = str(state.get("status") or "active")
+        if status in LOOP_TERMINAL_STATES:
+            continue
+        next_due = state.get("next_due_at")
+        awaiting = bool(state.get("awaiting_response"))
+        overdue = (
+            status == "active"
+            and not awaiting
+            and isinstance(next_due, (int, float))
+            and not isinstance(next_due, bool)
+            and next_due > 0
+            and now - next_due >= LOOP_OVERDUE_GRACE_S
+        )
+        out.append({
+            "kind": "loop",
+            "id": str(key)[len(LOOP_META_PREFIX):],
+            "prompt": " ".join(str(state.get("prompt") or "").split())[:100],
+            "status": status,
+            "mode": state.get("mode") or "interval",
+            "interval_seconds": state.get("interval_seconds"),
+            "current_delay": state.get("current_delay"),
+            "ticks_fired": state.get("ticks_fired"),
+            "next_due_at": next_due,
+            "paused_reason": state.get("paused_reason"),
+            "awaiting_response": awaiting,
+            "overdue_seconds": max(0.0, now - next_due) if overdue else None,
+        })
+    return out, None
+
+
 def collect_cron(home: Path) -> tuple[Items, Note]:
     """Cron jobs from ``cron/jobs.json``: failed or paused jobs and the next runs."""
     data, note = _read_json(home / "cron" / "jobs.json")
@@ -158,6 +221,14 @@ def collect_cron(home: Path) -> tuple[Items, Note]:
             continue
         enabled = bool(job.get("enabled", True))
         last_error = job.get("last_error")
+        fire_error = job.get("last_fire_error")
+        if isinstance(fire_error, dict):
+            # A refused (never started) fire carries its own shape; older writers may leave a string.
+            fire_error = " ".join(str(fire_error.get("detail") or "").split())[:160] or "refused"
+        elif fire_error:
+            fire_error = " ".join(str(fire_error).split())[:160]
+        else:
+            fire_error = None
         out.append({
             "kind": "cron",
             "id": job.get("id", "?"),
@@ -168,9 +239,15 @@ def collect_cron(home: Path) -> tuple[Items, Note]:
             "last_status": job.get("last_status"),
             # Script failures carry multi-line stderr; one line keeps the view readable.
             "last_error": " ".join(str(last_error).split())[:160] if last_error else None,
+            # A due fire that was never handed to the runner: no execution row and no
+            # last_status exist for it, so this field is the only trace (core writes it).
+            "last_fire_error": fire_error,
             "last_run_at": job.get("last_run_at"),
             "next_run_at": job.get("next_run_at"),
-            "needs_attention": bool(last_error) or job.get("last_status") not in OK_CRON_STATUSES,
+            "needs_attention": (
+                bool(last_error) or bool(fire_error)
+                or job.get("last_status") not in OK_CRON_STATUSES
+            ),
         })
     return out, None
 
