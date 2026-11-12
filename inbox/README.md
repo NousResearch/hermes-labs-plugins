@@ -74,7 +74,7 @@ which Hermes shares across profiles.
 |---|---|---|
 | Background processes | `<home>/processes.json` (the process registry checkpoint). Host PIDs are re-checked with `psutil`; PIDs inside a sandbox backend can't be probed and show as `sandboxed`. | Section empty; listed under "Not read". |
 | Async delegations | `async_delegations` table in `<home>/state.db` | Same. A locked database gives up after 2 seconds instead of hanging. |
-| Loops | `state_meta` rows keyed `loop:<session id>` in `<home>/state.db`, the JSON `LoopState` that `/loop` persists. `done` and `cleared` loops are history and are not shown. | Same. A tick more than 5 minutes late counts as overdue unless the last wakeup's turn is still running (`awaiting_response`). |
+| Loops | `state_meta` rows keyed `loop:<session id>` in `<home>/state.db`, the JSON `LoopState` that `/loop` persists. `done` and `cleared` loops are history and are not shown. | Same. A tick later than `HERMES_INBOX_LOOP_GRACE_SECONDS` (default 5 minutes) counts as overdue unless the last wakeup's turn is still running (`awaiting_response`). |
 | Cron jobs | `<home>/cron/jobs.json` | Same. |
 | Open chat surfaces | `<home>/runtime/active_sessions.json` (active-session leases), titles from `state.db` via `SessionDB(read_only=True)`. A lease counts only while its PID is alive and, when recorded, its process start time still matches (a recycled PID is not counted). | Same; without `state.db` the session id shows instead of the title. |
 | Kanban | The current board's `kanban.db`, resolved the documented way: `HERMES_KANBAN_DB`, else `HERMES_KANBAN_BOARD`, else `<root>/kanban/current`, else `<root>/kanban.db`, with `<root>` = `HERMES_KANBAN_HOME` or the default Hermes root. | Same. |
@@ -88,7 +88,11 @@ that chat.
 
 ## Configuration
 
-None.
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERMES_INBOX_LOOP_GRACE_SECONDS` | `300` | How late an active `/loop` tick may be before the loop is reported as overdue. `0` reports any past-due tick; an unparseable or negative value falls back to the default. |
+
+Nothing else is configurable.
 
 ## Development
 

@@ -27,8 +27,10 @@ DROPPED_WINDOW_S = 7 * 86400
 OK_CRON_STATUSES = (None, "", "success", "ok")
 # ``/loop`` state lives in ``state_meta`` under this prefix, one row per session.
 LOOP_META_PREFIX = "loop:"
-# A loop's driver ticks on a seconds cadence; a tick this late has no driver behind it.
+# Default overdue grace: a loop's driver ticks on a seconds cadence, so a tick this late has no
+# driver behind it. ``HERMES_INBOX_LOOP_GRACE_SECONDS`` overrides it (0 = any past-due tick).
 LOOP_OVERDUE_GRACE_S = 5 * 60
+LOOP_OVERDUE_GRACE_ENV = "HERMES_INBOX_LOOP_GRACE_SECONDS"
 LOOP_TERMINAL_STATES = ("done", "cleared")
 _BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
@@ -149,6 +151,21 @@ def collect_delegations(home: Path, limit: int = 20) -> tuple[Items, Note]:
     return out, None
 
 
+def loop_overdue_grace_s() -> float:
+    """Seconds an active loop may run past ``next_due_at`` before it counts as overdue.
+    ``HERMES_INBOX_LOOP_GRACE_SECONDS`` overrides the 5-minute default; an unparseable or
+    negative value falls back to the default rather than failing the whole view."""
+    raw = os.environ.get(LOOP_OVERDUE_GRACE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return LOOP_OVERDUE_GRACE_S
+        if 0 <= value < float("inf"):
+            return value
+    return LOOP_OVERDUE_GRACE_S
+
+
 def collect_loops(home: Path) -> tuple[Items, Note]:
     """In-session ``/loop`` state from ``state_meta`` (key ``loop:<session id>``). A loop is work
     in flight even though no process, delegation or cron job names it: its driver injects a
@@ -169,6 +186,7 @@ def collect_loops(home: Path) -> tuple[Items, Note]:
     except sqlite3.Error as exc:
         return [], f"unreadable ({exc})"
     now = time.time()
+    grace = loop_overdue_grace_s()
     out: Items = []
     for key, raw in rows:
         try:
@@ -188,7 +206,7 @@ def collect_loops(home: Path) -> tuple[Items, Note]:
             and isinstance(next_due, (int, float))
             and not isinstance(next_due, bool)
             and next_due > 0
-            and now - next_due >= LOOP_OVERDUE_GRACE_S
+            and now - next_due >= grace
         )
         out.append({
             "kind": "loop",
