@@ -55,8 +55,8 @@ always print so an empty inbox reads as all clear.
 
 | Section | What appears |
 |---|---|
-| Needs attention | Stalled or `unknown` delegations, delegation results dropped after failed deliveries (last 7 days), cron jobs whose last run failed or that were paused with a reason, background processes still in the checkpoint whose PID is gone, kanban tasks that are blocked or waiting for review. |
-| In progress | Live background processes, running async delegations, running kanban tasks. |
+| Needs attention | Stalled or `unknown` delegations, delegation results dropped after failed deliveries (last 7 days), cron jobs whose last run failed or whose due fire was refused, cron jobs paused with a reason, `/loop`s that are paused or overdue, background processes still in the checkpoint whose PID is gone, kanban tasks that are blocked or waiting for review. |
+| In progress | Live background processes, running async delegations, active `/loop`s waiting for their next tick, running kanban tasks. |
 | Finished, result not yet delivered | Delegations that completed but whose result has not reached its conversation yet. |
 | Scheduled | Enabled cron jobs and the next five runs. |
 | Open surfaces | Open CLI, TUI, Desktop and gateway chat sessions whose process is still alive, with the session title. |
@@ -74,6 +74,7 @@ which Hermes shares across profiles.
 |---|---|---|
 | Background processes | `<home>/processes.json` (the process registry checkpoint). Host PIDs are re-checked with `psutil`; PIDs inside a sandbox backend can't be probed and show as `sandboxed`. | Section empty; listed under "Not read". |
 | Async delegations | `async_delegations` table in `<home>/state.db` | Same. A locked database gives up after 2 seconds instead of hanging. |
+| Loops | `state_meta` rows keyed `loop:<session id>` in `<home>/state.db`, the JSON `LoopState` that `/loop` persists. `done` and `cleared` loops are history and are not shown. | Same. A tick more than 5 minutes late counts as overdue unless the last wakeup's turn is still running (`awaiting_response`). |
 | Cron jobs | `<home>/cron/jobs.json` | Same. |
 | Open chat surfaces | `<home>/runtime/active_sessions.json` (active-session leases), titles from `state.db` via `SessionDB(read_only=True)`. A lease counts only while its PID is alive and, when recorded, its process start time still matches (a recycled PID is not counted). | Same; without `state.db` the session id shows instead of the title. |
 | Kanban | The current board's `kanban.db`, resolved the documented way: `HERMES_KANBAN_DB`, else `HERMES_KANBAN_BOARD`, else `<root>/kanban/current`, else `<root>/kanban.db`, with `<root>` = `HERMES_KANBAN_HOME` or the default Hermes root. | Same. |
