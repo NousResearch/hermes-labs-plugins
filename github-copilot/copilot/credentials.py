@@ -74,13 +74,26 @@ _DEVICE_CODE_TERMINAL_ERRORS = {"expired_token": "  ✗ Device code expired. Ple
                                 "access_denied": "  ✗ Authorization was denied."}
 
 
+_COPILOT_AUTH_MAX_RESPONSE_BYTES = 64 * 1024  # 64 KiB cap on Copilot/GitHub auth JSON responses
+
+
+def _read_copilot_auth_body(resp) -> dict:
+    """Read a bounded Copilot/GitHub auth JSON response; fail loudly if oversized."""
+    raw = resp.read(_COPILOT_AUTH_MAX_RESPONSE_BYTES + 1)
+    if len(raw) > _COPILOT_AUTH_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"Copilot auth response exceeds {_COPILOT_AUTH_MAX_RESPONSE_BYTES} bytes"
+        )
+    return json.loads(raw.decode())
+
+
 def _post_form(url: str, fields: dict, timeout: float) -> dict:
     req = urllib.request.Request(
         url, data=urllib.parse.urlencode(fields).encode(),
         headers={"Accept": "application/json", "User-Agent": "HermesAgent/1.0",
                  "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+        return _read_copilot_auth_body(resp)
 
 
 def copilot_device_code_login(
@@ -311,7 +324,7 @@ def _fetch_exchange_with_retry(req, timeout: float, fp: str) -> dict:
     for attempt in range(1, _EXCHANGE_MAX_ATTEMPTS + 1):
         try:
             with _urlopen_bounded(req, timeout) as resp:
-                data = json.loads(resp.read().decode())
+                data = _read_copilot_auth_body(resp)
             _exchange_failure_cache.pop(fp, None)
             return data
         except Exception as exc:
