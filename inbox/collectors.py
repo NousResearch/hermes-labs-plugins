@@ -87,7 +87,8 @@ def collect_processes(home: Path) -> tuple[Items, Note]:
             "id": entry.get("session_id", "?"),
             "command": str(entry.get("command", ""))[:120],
             "pid": entry.get("pid"),
-            "alive": pid_alive(entry.get("pid")) if scope == "host" else None,
+            "alive": (pid_alive(entry.get("pid"), entry.get("process_start_time"))
+                      if scope == "host" else None),
             "age_seconds": max(0.0, now - float(started)) if isinstance(started, (int, float)) else None,
             "notify_on_complete": bool(entry.get("notify_on_complete")),
             "cwd": entry.get("cwd"),
