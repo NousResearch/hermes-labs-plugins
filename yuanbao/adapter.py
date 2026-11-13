@@ -2010,6 +2010,13 @@ class ConnectionManager:
         except Exception as exc:
             logger.warning("[%s] receive_loop exited: %s", adapter.name, exc)
             self.schedule_reconnect()
+        else:
+            # websockets ends iteration normally on 1000/1001; cancellation and permanent
+            # closes must keep their separate paths above. Ignore a retired socket's reader.
+            if source_ws is self._ws and adapter._running:
+                logger.info("[%s] WebSocket connection closed: code=%s reason=%s", adapter.name,
+                            source_ws.close_code, source_ws.close_reason)
+                self.schedule_reconnect()
 
     async def _handle_frame(self, raw: bytes, *, source_ws=None) -> None:
         """Handle one frame to completion, push admission and PushAck included."""
@@ -2147,6 +2154,8 @@ class ConnectionManager:
             self._adapter._track_task(asyncio.create_task(self._reconnect_with_backoff(), name="yuanbao-reconnect"))
 
     async def _reconnect_with_backoff(self) -> bool:
+        if not self._adapter._running:
+            return False
         if self._reconnecting:
             logger.debug("[%s] Reconnect already in progress, skipping", self._adapter.name)
             return False
@@ -2160,22 +2169,34 @@ class ConnectionManager:
         """Reconnect loop (under the _reconnecting guard) with exponential backoff 1s, 2s, 4s, … capped at 60s."""
         adapter = self._adapter
         for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            if not adapter._running:
+                return False
             self._reconnect_attempts = attempt + 1
             wait = min(2 ** attempt, 60)
             logger.info("[%s] Reconnect attempt %d/%d in %ds", adapter.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait)
             await asyncio.sleep(wait)
+            # A disconnect or permanent close can stop the adapter while this task awaits.
+            if not adapter._running:
+                return False
             if self._recv_task is not None:
                 await cancel_task(self._recv_task)
                 self._recv_task = None
             await self._push_handoff.close()  # unACKed pushes of the old socket are redelivered
             await self._cleanup_ws()
+            if not adapter._running:
+                return False
             try:
                 token_data = await SignManager.force_refresh(
                     adapter._app_key, adapter._app_secret, adapter._api_domain, route_env=adapter._route_env,
                 )
+                if not adapter._running:
+                    return False
                 if not await self._dial(token_data):
                     logger.warning("[%s] Re-auth failed on attempt %d", adapter.name, attempt + 1)
                     continue
+                if not adapter._running:
+                    await self._cleanup_ws()
+                    return False
                 self._consecutive_hb_timeouts = 0
                 self._connected(cancel_existing=True)
                 logger.info("[%s] Reconnected on attempt %d. connectId=%s", adapter.name, attempt + 1, self._connect_id)
