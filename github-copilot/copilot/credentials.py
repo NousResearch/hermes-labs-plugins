@@ -551,19 +551,22 @@ _RUNTIME_REFRESHERS = {
 class CopilotCredentialsMixin:
     """Fills the generic credential seams of ``providers.base.ProviderProfile`` for Copilot."""
 
-    def resolve_api_key_secret(self) -> tuple[str, str]:
+    def resolve_api_key_secret(self) -> tuple[str, str] | None:
         """The exchanged Copilot token. A home that never chose Copilot gets the raw env token (it
         still reads as present) and GitHub is not called: provider listings resolve this for every
-        provider with a token in reach (``activation``)."""
+        provider with a token in reach (``activation``). With no env token this returns None, so
+        core's generic ladder reaches the credential pool (``hermes auth add copilot``) instead of
+        reading ("", "") as a final "no key"."""
         from .activation import github_calls_allowed
 
         try:
             token, source = resolve_copilot_token()
-            if token and not github_calls_allowed():
+            if not token:
+                return None
+            if not github_calls_allowed():
                 return token, source
-            if token:
-                api_token, _base_url = get_copilot_api_token(token)
-                return api_token, source
+            api_token, _base_url = get_copilot_api_token(token)
+            return api_token, source
         except Exception:  # health: allow BLE001 S110 -- moved verbatim from core (hermes_cli/copilot_auth.py, credential_pool, client_lifecycle, auth.py)
             pass
         return "", ""
