@@ -21,6 +21,7 @@ def _make_adapter(**kwargs):
     """Create a minimal YuanbaoAdapter mock."""
     adapter = MagicMock(spec=YuanbaoAdapter)
     adapter.name = "yuanbao"
+    adapter._running = True
     adapter._app_key = "test_key"
     adapter._app_secret = "test_secret"
     adapter._api_domain = "https://test.example.com"
