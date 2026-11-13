@@ -26,7 +26,8 @@ def _decode_varint_strict(data: bytes, pos: int) -> tuple[int, int]:
 def decode_send_ack_payload(data: bytes) -> tuple[int, str]:
     """Send-response protobuf: field 1 varint ``code``, field 2 string ``message``.
 
-    Raises if the payload is truncated/malformed or has no decodable field-1 code.
+    An omitted ``code`` defaults to zero, as in the proto3 send-response schema.
+    Raises if the payload is truncated/malformed.
     """
     pos = 0
     code: Optional[int] = None
@@ -53,9 +54,7 @@ def decode_send_ack_payload(data: bytes) -> tuple[int, str]:
             pos += n
         else:
             raise ValueError(f"unknown wire type {wt}")
-    if code is None:
-        raise ValueError("missing business code")
-    return code, message
+    return 0 if code is None else code, message
 
 
 def _format_send_nack(status: Optional[int], code: Optional[int], message: str) -> str:
