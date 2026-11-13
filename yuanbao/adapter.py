@@ -2621,16 +2621,33 @@ class MessageSender:
 
     @staticmethod
     def strip_cron_wrapper(content: str) -> str:
-        """Strip the scheduler's cron header/footer wrapper; unchanged when the shape doesn't match."""
-        if not content.startswith(CRON_WRAPPER_HEADER_PREFIX):
+        """Strip the scheduler's cron header/footer wrapper; unchanged when the shape doesn't match.
+
+        Handles both the legacy header-first shape (``Cronjob Response: …\\n…\\n-------------\\n\\n<payload>\\n\\nTo stop or manage…``)
+        and the footer-style shape (``<payload>\\n\\n-------------\\nCronjob Response: …``).
+        """
+        if not isinstance(content, str):
             return content
-        divider = CRON_WRAPPER_DIVIDER
-        footer_prefix = CRON_WRAPPER_FOOTER_PREFIX
-        divider_pos = content.find(divider)
-        footer_pos = content.rfind(footer_prefix)
-        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos or "\n(job_id: " not in content[:divider_pos]:
+        # Legacy header-first shape.
+        if content.startswith(CRON_WRAPPER_HEADER_PREFIX):
+            divider = CRON_WRAPPER_DIVIDER
+            footer_prefix = CRON_WRAPPER_FOOTER_PREFIX
+            divider_pos = content.find(divider)
+            footer_pos = content.rfind(footer_prefix)
+            if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos or "\n(job_id: " not in content[:divider_pos]:
+                return content
+            return content[divider_pos + len(divider):footer_pos].strip() or content
+        # Footer-style shape: payload leads, wrapper at the end.
+        footer_pos = content.rfind(CRON_WRAPPER_HEADER_PREFIX)
+        if footer_pos <= 0:
             return content
-        return content[divider_pos + len(divider):footer_pos].strip() or content
+        divider_pos = content.rfind("-------------", 0, footer_pos)
+        if divider_pos < 0 or "\n(job_id: " not in content[footer_pos:]:
+            return content
+        payload = content[:divider_pos].rstrip()
+        # trim a trailing blank line before the divider
+        payload = payload.rstrip("\n").rstrip()
+        return payload.strip() or content
 
     async def close(self) -> None:
         self._chat_locks.clear()
