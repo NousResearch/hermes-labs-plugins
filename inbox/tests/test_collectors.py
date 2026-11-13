@@ -8,8 +8,8 @@ import time
 
 from inbox_plugin import collectors as c
 from inbox_seed import (
-    DEAD_PID, acquire_lease, add_delegations, add_kanban_tasks, make_state_db, own_start_time,
-    write_cron, write_leases, write_processes,
+    DEAD_PID, acquire_lease, add_delegations, add_kanban_tasks, add_loops, make_state_db,
+    own_start_time, write_cron, write_leases, write_processes,
 )
 
 
@@ -74,6 +74,52 @@ class TestDelegations:
         assert items == [] and note.startswith("unreadable")
 
 
+class TestLoops:
+    def test_missing_db_is_noted_absent(self, hermes_home):
+        assert c.collect_loops(hermes_home) == ([], "absent")
+
+    def test_active_overdue_paused_and_terminal(self, hermes_home):
+        now = time.time()
+        add_loops(hermes_home, [
+            ("overdue", {"prompt": "watch deploy", "status": "active",
+                         "next_due_at": now - 3600, "ticks_fired": 7}),
+            ("scheduled", {"prompt": "poll", "status": "active",
+                           "next_due_at": now + 600, "ticks_fired": 2}),
+            ("paused", {"prompt": "old", "status": "paused",
+                        "paused_reason": "reached max_ticks (100)", "ticks_fired": 100}),
+            ("done", {"prompt": "finished", "status": "done"}),
+            ("cleared", {"prompt": "cleared", "status": "cleared"}),
+        ])
+        items, note = c.collect_loops(hermes_home)
+        loops = {i["id"]: i for i in items}
+        assert note is None
+        assert set(loops) == {"overdue", "scheduled", "paused"}
+        assert loops["overdue"]["overdue_seconds"] >= 3500
+        assert loops["scheduled"]["overdue_seconds"] is None
+        assert loops["paused"]["paused_reason"] == "reached max_ticks (100)"
+
+    def test_awaiting_response_is_not_overdue(self, hermes_home):
+        add_loops(hermes_home, [
+            ("busy", {"prompt": "long turn", "status": "active",
+                      "next_due_at": time.time() - 3600, "awaiting_response": True}),
+        ])
+        (item,), _ = c.collect_loops(hermes_home)
+        assert item["overdue_seconds"] is None
+
+    def test_tick_inside_the_grace_is_not_overdue(self, hermes_home):
+        add_loops(hermes_home, [
+            ("due", {"prompt": "p", "status": "active", "next_due_at": time.time() - 30}),
+        ])
+        (item,), _ = c.collect_loops(hermes_home)
+        assert item["overdue_seconds"] is None
+
+    def test_corrupt_row_is_skipped(self, hermes_home):
+        db = make_state_db(hermes_home)
+        db.set_meta("loop:bad", "{not json")
+        db.close()
+        assert c.collect_loops(hermes_home) == ([], None)
+
+
 class TestCron:
     def test_failed_paused_and_healthy_jobs(self, hermes_home):
         write_cron(hermes_home, [
@@ -100,6 +146,17 @@ class TestCron:
             '\ufeff{"jobs": [{"id": "a", "name": "bom"}]}', encoding="utf-8")
         items, note = c.collect_cron(hermes_home)
         assert note is None and items[0]["name"] == "bom"
+
+    def test_refused_fire_needs_attention_even_after_a_healthy_run(self, hermes_home):
+        write_cron(hermes_home, [
+            {"id": "j1", "name": "backup", "enabled": True, "state": "scheduled",
+             "last_status": "ok", "next_run_at": "2026-11-13T03:00:00+08:00",
+             "last_fire_error": {"at": "2026-11-12T03:00:03+08:00",
+                                 "detail": "the gateway is absent, so agent jobs cannot fire"}},
+        ])
+        (job,), _ = c.collect_cron(hermes_home)
+        assert job["last_fire_error"] == "the gateway is absent, so agent jobs cannot fire"
+        assert job["needs_attention"] is True
 
 
 class TestSessions:

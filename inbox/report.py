@@ -13,6 +13,7 @@ from . import collectors as c
 SOURCE_LABELS = {
     "processes": "background processes (processes.json)",
     "delegations": "async delegations (state.db)",
+    "loops": "loops (state.db)",
     "cron": "cron jobs (cron/jobs.json)",
     "sessions": "open sessions (runtime/active_sessions.json)",
     "kanban": "kanban board (kanban.db)",
@@ -30,6 +31,7 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
         home = get_hermes_home()
     processes, n_proc = c.collect_processes(home)
     delegations, n_del = c.collect_delegations(home)
+    loops, n_loop = c.collect_loops(home)
     cron_jobs, n_cron = c.collect_cron(home)
     sessions, n_sess = c.collect_sessions(home)
     kanban, n_kan = c.collect_kanban()
@@ -37,6 +39,10 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
     attention: list[dict[str, Any]] = []
     attention += [d for d in delegations
                   if d["state"] in _STALLED_DELEGATION_STATES or d["delivery_state"] == "dropped"]
+    # A paused loop stopped on its own (max ticks, failed turn) and an overdue one has no driver:
+    # both are in flight on paper only. Any other non-active status is unknown, not healthy.
+    attention += [loop for loop in loops
+                  if loop["status"] != "active" or loop.get("overdue_seconds") is not None]
     attention += [j for j in cron_jobs if j["needs_attention"] or (j["paused"] and j["paused_reason"])]
     # Checkpointed as running but the PID is gone: an orphaned entry from an owner that crashed.
     attention += [p for p in processes if p["alive"] is False]
@@ -45,6 +51,8 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
     in_progress: list[dict[str, Any]] = []
     in_progress += [p for p in processes if p["alive"] is not False]
     in_progress += [d for d in delegations if d["state"] in _RUNNING_DELEGATION_STATES]
+    in_progress += [loop for loop in loops
+                    if loop["status"] == "active" and loop.get("overdue_seconds") is None]
     in_progress += [t for t in kanban if t["status"] == "running"]
 
     finished = [d for d in delegations
@@ -60,8 +68,8 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
         "sessions": sessions,
         "sources": {
             name: note or "read"
-            for name, note in (("processes", n_proc), ("delegations", n_del), ("cron", n_cron),
-                               ("sessions", n_sess), ("kanban", n_kan))
+            for name, note in (("processes", n_proc), ("delegations", n_del), ("loops", n_loop),
+                               ("cron", n_cron), ("sessions", n_sess), ("kanban", n_kan))
         },
     }
 
@@ -103,13 +111,41 @@ def _describe_delegation(item: dict[str, Any], now: float) -> str:
     return line
 
 
+def _describe_loop(item: dict[str, Any], now: float) -> str:
+    bits: list[str] = []
+    status = item.get("status") or "active"
+    if status != "active":
+        bits.append(f"{status}: {item.get('paused_reason') or 'no reason recorded'}")
+    elif item.get("overdue_seconds") is not None:
+        bits.append(f"overdue by {fmt_age(item['overdue_seconds'])}")
+    else:
+        due = item.get("next_due_at")
+        bits.append(f"next in {fmt_age(due - now)}" if isinstance(due, (int, float)) and due else "active")
+    ticks = item.get("ticks_fired")
+    if isinstance(ticks, int) and not isinstance(ticks, bool):
+        bits.append(f"{ticks} tick(s)")
+    if item.get("mode") == "self_paced":
+        delay = item.get("current_delay")
+        bits.append(f"self-paced {fmt_age(delay)}" if isinstance(delay, (int, float)) and delay
+                    else "self-paced")
+    elif isinstance(item.get("interval_seconds"), (int, float)) and item["interval_seconds"]:
+        bits.append(f"every {fmt_age(item['interval_seconds'])}")
+    line = f"loop {item['id']}  [{', '.join(bits)}]"
+    if item.get("prompt"):
+        line += f"  {item['prompt']}"
+    return line
+
+
 def _describe_cron(item: dict[str, Any], now: float) -> str:
     line = f"cron '{item['name']}'"
+    if item.get("last_fire_error"):
+        # The run never started, so last_status still describes an older run.
+        line += f"  last fire REFUSED: {item['last_fire_error']}"
     if item.get("last_error"):
         line += f"  last run FAILED: {item['last_error']}"
-    elif item.get("last_status") not in c.OK_CRON_STATUSES:
+    elif item.get("last_status") not in c.OK_CRON_STATUSES and not item.get("last_fire_error"):
         line += f"  last status: {item['last_status']}"
-    elif item.get("paused"):
+    elif item.get("paused") and not item.get("last_fire_error"):
         line += f"  paused ({item.get('paused_reason') or 'manually'})"
     return line
 
@@ -127,6 +163,7 @@ def _describe_kanban(item: dict[str, Any], now: float) -> str:
 _DESCRIBERS = {
     "process": _describe_process,
     "delegation": _describe_delegation,
+    "loop": _describe_loop,
     "cron": _describe_cron,
     "session": _describe_session,
     "kanban": _describe_kanban,
