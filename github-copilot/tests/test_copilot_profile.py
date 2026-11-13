@@ -126,6 +126,29 @@ class TestCopilotOfflineAstraEfforts:
         assert github_model_reasoning_efforts("gpt-6-astra", catalog=catalog) == ["low", "high"]
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"])
+def test_offline_gpt56_and_gpt6_send_the_configured_effort(copilot_profile, model):
+    """With no live catalog, the offline table decides the effort that main turns (``reasoning_payload``)
+    and side tasks (``build_api_kwargs_extras``) send. A GPT-6 tier missing from it sends no ``reasoning``
+    field (Copilot then runs ``medium``); GPT-5.6 on the GPT-5 list caps at ``high``."""
+    configured = {"enabled": True, "effort": "xhigh"}
+    extra_body, _ = copilot_profile.build_api_kwargs_extras(
+        model=model, reasoning_config=configured, supports_reasoning=True)
+    assert extra_body == {"reasoning": {"effort": "xhigh"}}
+    assert copilot_profile.reasoning_payload(model, configured, base_url=copilot_profile.base_url) == {
+        "effort": "xhigh"}
+
+
+def test_main_turn_on_gpt61_sol_sends_the_configured_effort():
+    """The effort a real ``AIAgent.chat`` turn on Copilot's GPT-6.1 Sol puts on the wire."""
+    from conftest import offline_chat_turn
+
+    requests = offline_chat_turn("https://api.githubcopilot.com", model="gpt-6.1-sol",
+                                 reasoning_config={"enabled": True, "effort": "xhigh"})
+    assert requests, "the turn sent no chat request"
+    assert requests[0].body.get("reasoning") == {"effort": "xhigh"}
+
+
 @pytest.mark.parametrize("effort, expected", [
     ("xhigh", "high"), ("max", "high"), ("ultra", "high"), ("minimal", "minimal"),
     ("garbage", "medium"), (" HIGH ", "high"),

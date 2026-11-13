@@ -11,7 +11,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from .helpers import ASTRA_EFFORTS, base_url_host_matches, clamp_effort, get_json, is_astra_model
+from .helpers import base_url_host_matches, clamp_effort, get_json, tier_efforts
 
 logger = logging.getLogger(__name__)
 
@@ -338,8 +338,10 @@ def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
     if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
         return list(REASONING_EFFORTS_O_SERIES)
     normalized = normalize_copilot_model_id(model_id).lower()
-    if is_astra_model(normalized):
-        return list(ASTRA_EFFORTS)
+    # With no live catalog this table is what Copilot gets: a GPT-5.6/GPT-6 tier needs its own ladder, or
+    # the request carries no ``reasoning`` field (Copilot runs ``medium``) or caps at the GPT-5 ``high``.
+    if (efforts := tier_efforts(normalized)) is not None:
+        return list(efforts)
     if normalized.startswith("gpt-5"):
         return list(REASONING_EFFORTS_GPT5)
     return []
