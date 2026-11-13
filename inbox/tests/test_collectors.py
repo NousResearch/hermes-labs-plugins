@@ -40,6 +40,21 @@ class TestProcesses:
         # A PID inside a sandbox cannot be probed from the host: unknown, not dead.
         assert procs["sandboxed"]["alive"] is None
 
+    def test_missing_psutil_does_not_crash_the_command(self, hermes_home, monkeypatch):
+        """psutil is probed inside the collector, so an environment without it raised
+        ImportError out of ``hermes inbox`` for the whole snapshot, sessions included.
+        Unprobeable is reported alive, not as an orphan."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "psutil", None)  # import psutil now raises
+        write_processes(hermes_home, [
+            {"session_id": "p", "command": "sleep 5", "pid": os.getpid(), "pid_scope": "host"},
+        ])
+        items, note = c.collect_processes(hermes_home)
+        assert note is None
+        assert items[0]["alive"] is True
+        assert c.pid_alive(os.getpid()) is True
+
 
 class TestDelegations:
     def test_missing_db_is_noted_absent(self, hermes_home):
