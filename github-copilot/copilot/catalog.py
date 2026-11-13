@@ -236,6 +236,11 @@ def _is_github_models_base_url(base_url: Optional[str]) -> bool:
     return any(base_url_host_matches(str(base_url or "").strip(), host) for host in _CATALOG_HOSTS)
 
 
+def _is_github_models_host(base_url: Optional[str]) -> bool:
+    """True only for a known ``models.github.ai`` request URL (False when the URL is unknown)."""
+    return bool(base_url) and base_url_host_matches(str(base_url).strip(), "models.github.ai")
+
+
 # ─── context windows ───
 
 # Module-level cache: {model_id: max_prompt_tokens}
