@@ -2841,7 +2841,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 logger.warning("[%s] %s failed: status=%d", self.name, label, status)
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
-            return decode_rsp(biz_data) if biz_data and isinstance(biz_data, bytes) else empty
+            result = decode_rsp(biz_data) if biz_data and isinstance(biz_data, bytes) else empty
+            if result is not None and result.get("code", 0) != 0:
+                logger.warning("[%s] %s failed: code=%s message=%r", self.name, label,
+                               result["code"], result.get("message", ""))
+                return None
+            return result
         except TimeoutError:
             logger.warning("[%s] %s timeout: group=%s", self.name, label, group_code)
         except Exception as exc:
