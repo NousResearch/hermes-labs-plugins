@@ -41,8 +41,8 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
                   if d["state"] in _STALLED_DELEGATION_STATES or d["delivery_state"] == "dropped"]
     # A paused loop stopped on its own (max ticks, failed turn) and an overdue one has no driver:
     # both are in flight on paper only. Any other non-active status is unknown, not healthy.
-    attention += [l for l in loops
-                  if l["status"] != "active" or l.get("overdue_seconds") is not None]
+    attention += [loop for loop in loops
+                  if loop["status"] != "active" or loop.get("overdue_seconds") is not None]
     attention += [j for j in cron_jobs if j["needs_attention"] or (j["paused"] and j["paused_reason"])]
     # Checkpointed as running but the PID is gone: an orphaned entry from an owner that crashed.
     attention += [p for p in processes if p["alive"] is False]
@@ -51,7 +51,8 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
     in_progress: list[dict[str, Any]] = []
     in_progress += [p for p in processes if p["alive"] is not False]
     in_progress += [d for d in delegations if d["state"] in _RUNNING_DELEGATION_STATES]
-    in_progress += [l for l in loops if l["status"] == "active" and l.get("overdue_seconds") is None]
+    in_progress += [loop for loop in loops
+                    if loop["status"] == "active" and loop.get("overdue_seconds") is None]
     in_progress += [t for t in kanban if t["status"] == "running"]
 
     finished = [d for d in delegations

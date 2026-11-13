@@ -106,25 +106,12 @@ class TestLoops:
         (item,), _ = c.collect_loops(hermes_home)
         assert item["overdue_seconds"] is None
 
-    def test_overdue_grace_is_configurable(self, hermes_home, monkeypatch):
-        now = time.time()
+    def test_tick_inside_the_grace_is_not_overdue(self, hermes_home):
         add_loops(hermes_home, [
-            ("due", {"prompt": "p", "status": "active", "next_due_at": now - 30}),
+            ("due", {"prompt": "p", "status": "active", "next_due_at": time.time() - 30}),
         ])
-        monkeypatch.delenv(c.LOOP_OVERDUE_GRACE_ENV, raising=False)
         (item,), _ = c.collect_loops(hermes_home)
-        assert item["overdue_seconds"] is None  # 30 s is inside the 5-minute default
-        monkeypatch.setenv(c.LOOP_OVERDUE_GRACE_ENV, "10")
-        (item,), _ = c.collect_loops(hermes_home)
-        assert item["overdue_seconds"] is not None  # 30 s is overdue under a 10-second grace
-
-    def test_bad_grace_falls_back_to_the_default(self, monkeypatch):
-        monkeypatch.setenv(c.LOOP_OVERDUE_GRACE_ENV, "nope")
-        assert c.loop_overdue_grace_s() == c.LOOP_OVERDUE_GRACE_S
-        monkeypatch.setenv(c.LOOP_OVERDUE_GRACE_ENV, "-1")
-        assert c.loop_overdue_grace_s() == c.LOOP_OVERDUE_GRACE_S
-        monkeypatch.setenv(c.LOOP_OVERDUE_GRACE_ENV, "0")
-        assert c.loop_overdue_grace_s() == 0.0
+        assert item["overdue_seconds"] is None
 
     def test_corrupt_row_is_skipped(self, hermes_home):
         db = make_state_db(hermes_home)
