@@ -6,6 +6,8 @@ description: >
   providers: copilot (the Copilot API with your GitHub account, signed in with
   `hermes auth add copilot` or a COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN token) and
   copilot-acp (drives your installed GitHub Copilot CLI over ACP). Needs a Hermes core
-  without bundled Copilot; on older cores it stays inactive.
+  without bundled Copilot and with the generic credential-pool runtime SDK
+  (PoolRuntimeCredential, refresh_pool_runtime_credentials, credential_pool_base_urls);
+  on older cores it stays inactive.
 author: "Nous Research"
 homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/github-copilot
