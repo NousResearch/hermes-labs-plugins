@@ -41,6 +41,13 @@ class CopilotProfile(CopilotWireMixin, CopilotResponsesMixin, CopilotCatalogMixi
         except Exception:
             return {}, {}
 
+    def fetch_account_usage(
+        self, *, base_url: str | None = None, api_key: str | None = None,
+    ):
+        from .usage import fetch_copilot_account_usage
+
+        return fetch_copilot_account_usage(base_url=base_url, api_key=api_key)
+
 
 copilot = CopilotProfile(
     name="copilot", aliases=("github-copilot", "github-models", "github-model", "github"),
