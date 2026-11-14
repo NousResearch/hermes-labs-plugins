@@ -83,10 +83,11 @@ the GitHub Copilot CLI".
 
 ## Disclosure
 
-- `copilot` talks to `github.com` (device-code login), `api.github.com` (`/copilot_internal/v2/token`,
-  the GitHub → Copilot token exchange) and `api.githubcopilot.com` / your plan's Copilot host /
-  `models.github.ai` (model list and inference). Requests carry VS Code-style editor headers
-  (`Editor-Version`, `Copilot-Integration-Id: vscode-chat`), as Copilot requires.
+- `copilot` talks to `github.com` (device-code login), `api.github.com` (`/copilot_internal/v2/token`
+  for the GitHub → Copilot token exchange and `/copilot_internal/user` for `/usage` quota checks) and
+  `api.githubcopilot.com` / your plan's Copilot host / `models.github.ai` (model list and inference).
+  Requests carry VS Code-style editor headers (`Editor-Version`, `Copilot-Integration-Id: vscode-chat`),
+  as Copilot requires.
 - Tokens are stored by Hermes: the pool in `$HERMES_HOME/auth.json` (`hermes auth add`), env tokens in
   `$HERMES_HOME/.env`, and the exchanged Copilot token (~30 min lifetime) in
   `$HERMES_HOME/.copilot_jwt.json` (mode 0600) so a restart during a network blip can reuse it.
