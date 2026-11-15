@@ -141,7 +141,6 @@ def _model_flow_copilot(current_model):
     from hermes_cli.model_setup import persist_model_selection
 
     from .catalog import COPILOT_BASE_URL
-    from .wire import model_api_mode
 
     provider_id = "copilot"
     api_key, source = copilot_api_key()
@@ -168,9 +167,23 @@ def _model_flow_copilot(current_model):
         print("No change.")
         return
     selected = _normalize(selected)
-    persist_model_selection(selected, provider_id, base_url=effective_base,
-                            api_mode=model_api_mode(selected, catalog=catalog, api_key=api_key))
+    # No api_mode is saved: the profile derives it per model at runtime (``api_mode_for_model``), and a saved
+    # one would pin every later model and core version to the wire of the model picked today.
+    saved = persist_model_selection(selected, provider_id, base_url=effective_base)
+    if isinstance(saved, dict) and saved.get("api_mode"):
+        _drop_saved_api_mode()  # an earlier setup saved one; it would override the per-model choice
     print(f"Default model set to: {selected} (via GitHub Copilot)")
+
+
+def _drop_saved_api_mode() -> None:
+    """Remove the ``model.api_mode`` the user's own config.yaml carries (read raw, so a value from the
+    managed overlay or the defaults is never popped and re-saved)."""
+    from hermes_cli.config import read_raw_config, save_config
+
+    cfg = read_raw_config()
+    model = cfg.get("model") if isinstance(cfg, dict) else None
+    if isinstance(model, dict) and model.pop("api_mode", None) is not None:
+        save_config(cfg)
 
 
 def setup_reasoning_efforts(model: str) -> tuple:
