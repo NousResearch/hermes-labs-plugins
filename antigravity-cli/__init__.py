@@ -60,8 +60,9 @@ class AgyACPClient(ACPClient):
     placeholder_model = PLACEHOLDER_MODEL
     label = "Antigravity CLI"
     missing_command_hint = (
-        "Install the Antigravity CLI, then run `agy` once to sign in "
-        "(or point HERMES_AGY_COMMAND at the binary)."
+        "Install the Antigravity CLI, then run `agy` once to sign in. If `agy` works in your "
+        "shell but not here, this process' PATH does not include ~/.local/bin — pin the absolute "
+        "path with HERMES_AGY_COMMAND in the profile's .env."
     )
     auth_required_hint = "Run `agy` to sign in to your Google Antigravity account, then retry."
     unsupported_transport_hint = (

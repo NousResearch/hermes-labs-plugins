@@ -13,6 +13,16 @@ stdio server, and this plugin is the `external_process` provider that drives it.
   agy acp --help         # prints "Start the Agent Client Protocol (ACP) stdio server"
   ```
 
+  **Check the PATH of the process that serves you, not your shell's.** A gateway or desktop
+  app launched from the GUI (or by launchd) typically runs with `/usr/bin:/bin:/usr/sbin:/sbin`,
+  which does not include `~/.local/bin` — the provider then fails with `Could not start
+  Antigravity CLI command 'agy'` even though `agy` works in your terminal. Either install the CLI
+  somewhere already on that PATH, or pin the absolute path in the profile's `.env`:
+
+  ```
+  HERMES_AGY_COMMAND="/Users/you/.local/bin/agy"
+  ```
+
 - Signed in once, so the CLI holds the credential in the OS keyring:
 
   ```
