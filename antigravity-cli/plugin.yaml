@@ -1,0 +1,10 @@
+name: antigravity-cli
+kind: model-provider
+version: 1.0.0
+description: >
+  Google Antigravity models through your installed Antigravity CLI (`agy`) over ACP. One
+  provider — agy (aliases antigravity, antigravity-cli) — that spawns `agy acp` per request, so
+  there is no API key to store and no gateway in between. Login belongs to the CLI (browser
+  sign-in, OS keyring). Requires an `agy` build with the `acp` subcommand.
+author: "Hermes Agent"
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/antigravity-cli
