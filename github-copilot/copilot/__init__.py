@@ -34,11 +34,18 @@ class CopilotProfile(CopilotWireMixin, CopilotResponsesMixin, CopilotCatalogMixi
             if not supported:
                 return {}, {}
             if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
-                return ({}, {"reasoning_effort": "none"}) if "none" in supported else ({}, {})
-            if not reasoning_config:
-                return {}, {"reasoning_effort": clamp_github_reasoning_effort("medium", supported)}
-            # Never drop straight to medium, which inverted the ladder (ultra < high). See #74295.
-            effort = clamp_github_reasoning_effort(reasoning_config.get("effort"), supported)
+                if "none" not in supported:
+                    return {}, {}
+                effort = "none"
+            elif not reasoning_config:
+                effort = clamp_github_reasoning_effort("medium", supported)
+            else:
+                # Never drop straight to medium, which inverted the ladder (ultra < high). See #74295.
+                effort = clamp_github_reasoning_effort(reasoning_config.get("effort"), supported)
+            # Only side tasks reach here on a Responses-routed model: core's chat-to-Responses adapter takes the
+            # effort from extra_body.reasoning alone, while /chat/completions ignores it and honours top-level.
+            if self.api_mode_for_model(model) == "codex_responses":
+                return {"reasoning": {"effort": effort}}, {}
             return {}, {"reasoning_effort": effort}
         except Exception:
             return {}, {}

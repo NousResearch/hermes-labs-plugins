@@ -118,6 +118,46 @@ def offline_chat_turn(base_url: str, *, model: str = "gpt-5.4", message: str = "
     return sent
 
 
+def offline_side_task(model: str, *, reasoning_config: dict, task: str = "title_generation") -> list[SentRequest]:
+    """Run one real auxiliary ``call_llm`` side task on Copilot with the HTTP transport replaced by a stand-in
+    that answers chat and Responses requests with "ok"; return the requests as they went on the wire (a
+    Responses request is told apart by its ``input``)."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+    import openai
+
+    from agent.auxiliary_client import call_llm
+
+    sent: list[SentRequest] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        sent.append(SentRequest({k.lower(): v for k, v in request.headers.items()}, body))
+        if "input" in body:
+            item = {"id": "m", "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}]}
+            events = [{"type": "response.output_item.done", "output_index": 0, "item": item},
+                      {"type": "response.completed", "response": {"id": "r", "object": "response", "created_at": 0,
+                                                                  "model": model, "status": "completed", "output": []}}]
+            sse = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+            return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "id": "c", "object": "chat.completion", "created": 0, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+
+    def offline_openai(**kwargs):
+        return openai.OpenAI(**{**kwargs, "http_client": httpx.Client(transport=httpx.MockTransport(answer))})
+
+    with patch("agent.auxiliary_client.OpenAI", side_effect=offline_openai):
+        call_llm(task, provider="copilot", model=model, base_url="https://api.githubcopilot.com",
+                 api_key="tid=offline", messages=[{"role": "user", "content": "hi"}],
+                 reasoning_config=reasoning_config)
+    return sent
+
+
 import providers  # noqa: E402
 
 providers.get_provider_profile("openrouter")  # run discovery first: later registrations stay put

@@ -48,7 +48,7 @@ class TestCopilotReasoningEffortClamp:
         """xhigh is forwarded unchanged as top-level reasoning_effort when the catalog lists it."""
         _patch_efforts(monkeypatch, ["minimal", "low", "medium", "high", "xhigh"])
         extra_body, top_level = copilot_profile.build_api_kwargs_extras(
-            model="gpt-5.5",
+            model="claude-opus-5.5",
             reasoning_config={"effort": "xhigh"},
             supports_reasoning=True,
         )
@@ -111,7 +111,8 @@ class TestCopilotReasoningEffortClamp:
 
     def test_disabled_reasoning_emits_none_only_when_supported(self, copilot_profile, monkeypatch):
         """Auxiliary calls with enabled=False omit reasoning_effort when 'none' is unsupported
-        (Gemini 4 / Claude 5 400 on 'none') and emit 'none' when the model supports it."""
+        (Gemini 4 / Claude 5 400 on 'none') and emit 'none' when the model supports it, on the
+        carrier of the model's route (GPT-5.6 goes to the Responses API)."""
         _patch_efforts(monkeypatch, ["low", "medium", "high"])
         assert copilot_profile.build_api_kwargs_extras(
             model="gemini-4-carbon",
@@ -124,7 +125,7 @@ class TestCopilotReasoningEffortClamp:
             model="gpt-5.6-sol",
             reasoning_config={"enabled": False, "effort": "high"},
             supports_reasoning=True,
-        ) == ({}, {"reasoning_effort": "none"})
+        ) == ({"reasoning": {"effort": "none"}}, {})
 
 
 class TestCopilotOfflineAstraEfforts:
@@ -214,7 +215,8 @@ def test_main_agent_github_clamp_never_escalates(monkeypatch, effort, expected):
     from conftest import offline_chat_turn
 
     _patch_efforts(monkeypatch, ["minimal", "low", "medium", "high"])
-    requests = offline_chat_turn("https://api.githubcopilot.com",
+    # gpt-5-mini is the GPT-5 model Copilot serves on /chat/completions; the rest go to the Responses API.
+    requests = offline_chat_turn("https://api.githubcopilot.com", model="gpt-5-mini",
                                  reasoning_config={"enabled": True, "effort": effort})
     assert requests, "the turn sent no chat request"
     assert requests[0].body.get("reasoning_effort") == expected
@@ -231,3 +233,19 @@ def test_main_agent_gemini4_carbon_clamps_max_to_top_level_high(hermes_home):
     assert requests, "the turn sent no chat request"
     assert requests[0].body.get("reasoning_effort") == "high"
     assert "reasoning" not in requests[0].body
+
+
+@pytest.mark.parametrize("model, responses_route", [("gpt-6-luna", True), ("claude-opus-5.5", False)])
+def test_side_task_sends_the_configured_effort(monkeypatch, model, responses_route):
+    """A side task (title, compression, vision, ...) puts the configured effort on the wire on both Copilot
+    routes. Core sends a GPT-5+ side task through its chat-to-Responses adapter, which takes the effort from
+    ``extra_body.reasoning`` only; /chat/completions honours only the top-level ``reasoning_effort``."""
+    from conftest import offline_side_task
+
+    _patch_efforts(monkeypatch, ["none", "low", "medium", "high", "xhigh", "max"])
+    requests = offline_side_task(model, reasoning_config={"enabled": True, "effort": "xhigh"})
+    assert requests, "the side task sent no request"
+    body = requests[0].body
+    assert ("input" in body) is responses_route
+    effort = (body.get("reasoning") or {}).get("effort") if responses_route else body.get("reasoning_effort")
+    assert effort == "xhigh"
