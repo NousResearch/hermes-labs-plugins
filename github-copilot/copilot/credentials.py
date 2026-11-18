@@ -34,6 +34,11 @@ _CLASSIC_PAT_PREFIX = "ghp_"  # rejected by the Copilot API
 # to pass validation and then fail downstream with an opaque auth error (#12650).
 _SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
 COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
+# The raw GitHub token of the pool entry selected for this process (#87). Mid-turn refresh and
+# base-URL resolution must keep using it: resolving from the env alone silently switches a
+# multi-account turn to a different account, and fails outright for a pool-only login.
+_active_pool_raw_token: str = ""
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
 
@@ -54,6 +59,18 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
             "Unsupported GitHub token format for the Copilot API. "
             f"Supported token prefixes: {', '.join(_SUPPORTED_PREFIXES)}.")
     return True, "OK"
+
+
+def resolve_copilot_runtime_token() -> tuple[str, str]:
+    """Token for an already-selected route: the pool entry first, then the env (#87).
+
+    Turn start calls ``prepare_pool_entry`` on the chosen pool row; the row's raw token is pinned
+    here so a later 401/400/expiry refresh cannot drift to a different account's env token.
+    """
+    pinned = _active_pool_raw_token.strip()
+    if pinned:
+        return pinned, "credential_pool"
+    return resolve_copilot_token()
 
 
 def resolve_copilot_token() -> tuple[str, str]:
@@ -486,7 +503,7 @@ def _refresh_exchanged_token() -> Optional[tuple[str, Optional[str]]]:
     what expires mid-turn (``401 IDE token expired``), so force a fresh exchange; fall back to the
     raw token only if the exchange itself is unavailable."""
     try:
-        new_token, token_source = resolve_copilot_token()
+        new_token, token_source = resolve_copilot_runtime_token()
     except Exception as exc:  # health: allow BLE001 -- moved verbatim from core (hermes_cli/copilot_auth.py, credential_pool, client_lifecycle, auth.py)
         logger.debug("Copilot credential refresh failed: %s", exc)
         return None
@@ -509,7 +526,7 @@ def _reexchange_stale_token() -> Optional[tuple[str, Optional[str]]]:
     cached when the startup exchange degraded. Evict + re-exchange; None when still degraded (a
     rebuild would not help, so the caller's single-shot retry is not burned)."""
     try:
-        raw_token, token_source = resolve_copilot_token()
+        raw_token, token_source = resolve_copilot_runtime_token()
         if not isinstance(raw_token, str) or not raw_token.strip():
             return None
         raw_token = raw_token.strip()
@@ -533,7 +550,7 @@ def _reexchange_stale_token() -> Optional[tuple[str, Optional[str]]]:
 def _revalidate_in_memory_token() -> Optional[tuple[str, Optional[str]]]:
     """Auxiliary-client 401: drop only the in-process JWT and exchange again (a persisted, still-valid
     JWT and the negative cache are honoured); raises when the exchange fails."""
-    raw_token, _source = resolve_copilot_token()
+    raw_token, _source = resolve_copilot_runtime_token()
     if not str(raw_token or "").strip():
         return None
     _jwt_cache.pop(_token_fingerprint(raw_token), None)
@@ -558,7 +575,7 @@ class CopilotCredentialsMixin:
         from .activation import github_calls_allowed
 
         try:
-            token, source = resolve_copilot_token()
+            token, source = resolve_copilot_runtime_token()
             if token and not github_calls_allowed():
                 return token, source
             if token:
@@ -575,7 +592,7 @@ class CopilotCredentialsMixin:
 
         base_url = env_url.rstrip("/") if env_url else default
         try:
-            raw_token, _ = resolve_copilot_token()
+            raw_token, _ = resolve_copilot_runtime_token()
             if raw_token and github_calls_allowed():
                 resolved = (get_copilot_api_token(raw_token)[1] or "").strip()
                 if resolved:
@@ -595,6 +612,8 @@ class CopilotCredentialsMixin:
         if api_token == api_key and not enterprise_base_url:
             _warn_raw_degradation_once(api_key)
             return api_key
+        global _active_pool_raw_token
+        _active_pool_raw_token = api_key
         entry.access_token = api_token
         if enterprise_base_url:
             entry.base_url = enterprise_base_url
@@ -608,7 +627,7 @@ class CopilotCredentialsMixin:
         try:
             if all(s in suppressed_sources for s in _POOL_SOURCES):
                 return []
-            token, source = resolve_copilot_token()
+            token, source = resolve_copilot_runtime_token()
             if not token:
                 return []
             source_name = f"env:{source}"
