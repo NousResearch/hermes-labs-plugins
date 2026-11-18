@@ -9,6 +9,8 @@ the env vars above (``.env`` or the process environment) or a ``hermes auth add 
 
 from __future__ import annotations
 
+import os
+
 import contextlib
 import hashlib
 import json
@@ -140,6 +142,22 @@ _jwt_cache: dict[str, tuple[str, float, Optional[str]]] = {}
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 # Exchange endpoint and headers (matching VS Code / Copilot CLI)
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
+
+
+def _token_exchange_url() -> str:
+    """GHEC tokens must be exchanged on their own host (#41): api.github.com answers 401.
+
+    ``COPILOT_GH_HOST`` names the enterprise host (``<enterprise>.ghe.com``). Try its API
+    endpoint first; the plugin's callers fall back to the raw token if the exchange fails, so
+    a host without that route degrades exactly as before rather than breaking the turn.
+    """
+    host = (os.environ.get("COPILOT_GH_HOST") or "").strip().rstrip("/")
+    if not host or host.lower() == "github.com":
+        return _TOKEN_EXCHANGE_URL
+    if host.startswith(("https://", "http://")):
+        host = host.split("://", 1)[1]
+    return f"https://api.{host}/copilot_internal/v2/token"
+
 _EDITOR_VERSION = "vscode/1.104.1"
 _GITHUB_API_VERSION = "2026-08-01"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
@@ -407,7 +425,7 @@ def _exchange_copilot_token_locked(
         raise ValueError("Copilot token exchange recently failed; skipping re-attempt "
                          f"for another {int(_fail_until - time.time())}s")
     req = urllib.request.Request(
-        _TOKEN_EXCHANGE_URL, method="GET",
+        _token_exchange_url(), method="GET",
         headers={"Authorization": f"token {raw_token}", "User-Agent": _EXCHANGE_USER_AGENT,
                  "Accept": "application/json", "Editor-Version": _EDITOR_VERSION})
     data = _fetch_exchange_with_retry(req, timeout, fp)
