@@ -115,11 +115,12 @@ def _resolve_copilot_catalog_api_key() -> str:
 
 # ─── live /models catalog ───
 
-def copilot_default_headers(*, is_agent_turn: bool = True) -> dict[str, str]:
+def copilot_default_headers(
+    *, is_agent_turn: bool = True, api_key: str | None = None) -> dict[str, str]:
     """Standard headers for Copilot API requests."""
     from .credentials import copilot_request_headers
 
-    return copilot_request_headers(is_agent_turn=is_agent_turn)
+    return copilot_request_headers(is_agent_turn=is_agent_turn, api_key=api_key)
 
 
 _COPILOT_CHAT_ENDPOINTS = {"/chat/completions", "/responses", "/v1/messages"}
@@ -187,7 +188,7 @@ def fetch_github_model_catalog(
 
     attempts: list[dict[str, str]] = []
     if api_key:
-        attempts.append({**copilot_default_headers(), "Authorization": f"Bearer {api_key}"})
+        attempts.append({**copilot_default_headers(api_key=api_key), "Authorization": f"Bearer {api_key}"})
     attempts.append(copilot_default_headers())
 
     for headers in attempts:

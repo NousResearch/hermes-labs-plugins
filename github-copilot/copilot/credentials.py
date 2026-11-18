@@ -423,10 +423,23 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
 
 
 def copilot_request_headers(
-    *, is_agent_turn: bool = True, is_vision: bool = False) -> dict[str, str]:
-    """Build the standard headers for Copilot API requests."""
+    *, is_agent_turn: bool = True, is_vision: bool = False,
+    api_key: str | None = None,
+) -> dict[str, str]:
+    """Build the standard headers for Copilot API requests.
+
+    GitHub rejects ``vscode-chat`` for fine-grained PATs (``github_pat_*``): the /models endpoint
+    answers 400 "Personal Access Tokens are not supported for this endpoint", while
+    ``copilot-developer-cli`` is accepted on both public and business hosts (#63). OAuth and
+    exchanged tokens keep the historical id. The bearer is passed in so the choice follows the
+    credential actually used for this request, not the environment.
+    """
+    integration_id = "vscode-chat"
+    token = api_key if api_key is not None else resolve_copilot_token()
+    if isinstance(token, str) and token.startswith("github_pat_"):
+        integration_id = "copilot-developer-cli"
     headers: dict[str, str] = {"Editor-Version": _EDITOR_VERSION, "User-Agent": "HermesAgent/1.0",
-                               "Copilot-Integration-Id": "vscode-chat",
+                               "Copilot-Integration-Id": integration_id,
                                "Openai-Intent": "conversation-edits",
                                "x-initiator": "agent" if is_agent_turn else "user",
                                # Without a dated API version /models caps Claude/GPT-6 at 200-272K
