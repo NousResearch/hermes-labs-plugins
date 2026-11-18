@@ -21,6 +21,11 @@ _INITIATOR_HOSTS = ("api.githubcopilot.com", "models.github.ai")
 
 
 def is_copilot_host(base_url: str) -> bool:
+    host = base_url_hostname(str(base_url or "")) or ""
+    # GHEC Copilot is served from copilot-api.<enterprise>.ghe.com, not a *.githubcopilot.com
+    # host (#41). Recognise it so the required Editor-Version / integration headers are sent.
+    if host.startswith("copilot-api.") and host.endswith(".ghe.com"):
+        return True
     return base_url_host_matches(str(base_url or ""), _COPILOT_HOST)
 
 
