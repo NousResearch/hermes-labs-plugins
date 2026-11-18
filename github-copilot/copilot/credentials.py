@@ -161,8 +161,33 @@ _exchange_failure_cache: dict[str, float] = {}
 _exchange_locks: dict[str, threading.Lock] = {}
 _exchange_locks_guard = threading.Lock()
 
+# Bound the three per-token tables (#51). A rotated-away token's fingerprint is never presented
+# again, so its entries would otherwise live for the process lifetime: the JWT (including the
+# exchanged credential), a negative-cache deadline, and a Lock. The TTLs bound reuse, not
+# lifetime. Prune on write, which is the only path that can grow a table.
+_EXCHANGE_CACHE_MAX_ENTRIES = 64
+
+
+def _prune_exchange_caches() -> None:
+    now = time.time()
+    for fp, entry in list(_jwt_cache.items()):
+        if not isinstance(entry, tuple) or len(entry) < 2 or now >= float(entry[1] or 0):
+            _jwt_cache.pop(fp, None)
+    for fp, deadline in list(_exchange_failure_cache.items()):
+        if now >= float(deadline or 0):
+            _exchange_failure_cache.pop(fp, None)
+    if len(_exchange_locks) > _EXCHANGE_CACHE_MAX_ENTRIES:
+        keep = set(_jwt_cache) | set(_exchange_failure_cache)
+        for fp in list(_exchange_locks):
+            if len(_exchange_locks) <= _EXCHANGE_CACHE_MAX_ENTRIES:
+                break
+            if fp not in keep:
+                _exchange_locks.pop(fp, None)
+
+
 
 def _exchange_lock_for(fp: str) -> threading.Lock:
+    _prune_exchange_caches()
     with _exchange_locks_guard:
         lock = _exchange_locks.get(fp)
         if lock is None:
