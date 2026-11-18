@@ -654,13 +654,21 @@ class CopilotCredentialsMixin:
 
     def credential_refresh_notice(self, *, reason: str) -> str:
         if reason == "stale":
-            return "Copilot credential re-exchanged after model_not_available 400. Retrying request..."
+            return "Copilot credential re-exchanged after a stale-credential refusal (403 forbidden / 400 model_not_available). Retrying request..."
         return "Copilot credentials refreshed after 401. Retrying request..." if reason == "unauthorized" else ""
 
     def is_stale_credential_error(self, *, status_code: Optional[int], message: str) -> bool:
-        """A 400 that is really a STALE / DEGRADED credential (status 400 AND an integrator /
-        model-not-supported marker, so a wrong model name never triggers the re-exchange)."""
+        """A 400 integrator refusal or a Copilot 403 "forbidden" is a STALE / DEGRADED credential.
+
+        Enterprise/main hosts report an expired exchanged token as a bare 403 whose body is just
+        "forbidden" (#45, #47). Core only refreshes on 401 unless the profile says the error is
+        stale, so without this branch the turn fails until the token's stored expiry elapses.
+        The generic 403 text is scoped to Copilot by the profile: this method belongs to the
+        Copilot profile, so unrelated providers keep their own classification.
+        """
         lowered = (message or "").lower()
+        if status_code == 403 and ("forbidden" in lowered or "permission denied" in lowered):
+            return True
         if status_code != 400 and "error code: 400" not in lowered:
             return False
         return any(marker in lowered for marker in _STALE_CREDENTIAL_MARKERS)
