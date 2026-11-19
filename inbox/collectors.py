@@ -176,29 +176,24 @@ def collect_cron(home: Path) -> tuple[Items, Note]:
 
 
 def _session_titles(home: Path, session_ids: list[str]) -> dict[str, str]:
-    """Titles through the public read-only SessionDB attach. Titles only decorate the lines, so
-    any failure to open state.db (absent, locked, older schema) just leaves the ids."""
+    """Titles through the storage interface's read-only reader (``open_persistence_reader``: never
+    creates, migrates or repairs the store). Titles only decorate the lines, so any failure to
+    open state.db (absent, locked, older schema) just leaves the ids."""
     db = home / "state.db"
     if not session_ids or not db.exists():
         return {}
+    titles: dict[str, str] = {}
     try:
-        from hermes_state import SessionDB
+        from persistence_assembly import open_persistence_reader
 
-        sdb = SessionDB(db_path=db, read_only=True)
+        with open_persistence_reader(db) as store:
+            for sid in session_ids:
+                record = store.sessions.get(sid)
+                if record is not None and record.title:
+                    titles[sid] = record.title
     except Exception:
-        return {}
-    try:
-        titles = {}
-        for sid in session_ids:
-            try:
-                title = sdb.get_session_title(sid)
-            except Exception:
-                continue
-            if title:
-                titles[sid] = title
         return titles
-    finally:
-        sdb.close()
+    return titles
 
 
 def collect_sessions(home: Path) -> tuple[Items, Note]:
