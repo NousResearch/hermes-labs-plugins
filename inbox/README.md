@@ -38,7 +38,9 @@ $ hermes inbox
 hermes plugins install inbox
 ```
 
-It adds one CLI command (`hermes inbox`). No model tools, no hooks, nothing runs during chats. No
+It adds one CLI command (`hermes inbox`) and the same report as an in-session `/inbox` slash
+command (CLI, TUI and gateway chats; long reports are cut just under 4096 characters for messaging
+surfaces). No model tools, no hooks, nothing runs during chats unless you type `/inbox`. No
 dependencies beyond Hermes itself. The agent can still use it: ask it to run `hermes inbox --json`
 in the terminal.
 
@@ -46,6 +48,7 @@ in the terminal.
 
 ```bash
 hermes inbox            # the view above
+/inbox                   # inside a chat session: the same view (no --json)
 hermes inbox --json     # the same snapshot as JSON, for scripts and dashboards
 hermes -p work inbox    # another profile's inbox (install the plugin in that profile too)
 ```
