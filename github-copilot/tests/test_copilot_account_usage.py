@@ -199,6 +199,16 @@ def test_exchanged_session_token_resolves_matching_pooled_account_only(hermes_ho
     assert calls == []
 
 
+def test_unmatched_exchanged_token_never_falls_back_to_a_lone_env_token(hermes_home, monkeypatch):
+    """The session's exchanged token has no cached link to a raw token, and the only raw token in
+    reach is an ambient GH_TOKEN: that may be a different account, so fail open, never guess."""
+    monkeypatch.setenv("GH_TOKEN", RAW_TOKEN_1)
+    calls = _stub_user_endpoint(monkeypatch, lambda *_a: pytest.fail("should not query GitHub"))
+
+    assert fetch_account_usage("copilot", api_key="tid=sessionOfSomeOtherAccount;exp=1") is None
+    assert calls == []
+
+
 def test_pool_only_login_resolves_non_dead_entry_without_env_vars(hermes_home, monkeypatch):
     """``hermes usage`` (``api_key=None``) works for ``hermes auth add copilot`` pool-only homes and skips dead rows."""
     (hermes_home / "auth.json").write_text(json.dumps({
