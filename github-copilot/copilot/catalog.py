@@ -240,7 +240,7 @@ def _is_github_models_base_url(base_url: Optional[str]) -> bool:
 
 # ─── context windows ───
 
-# Module-level cache: {model_id: max_prompt_tokens}
+# Module-level cache: {model_id: context window tokens}
 _copilot_context_cache: dict[str, int] = {}
 _copilot_context_cache_time: float = 0.0
 _copilot_context_cache_key: Optional[str] = None  # fingerprint of the api_key the entry was fetched with
@@ -248,8 +248,12 @@ _COPILOT_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
 def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> Optional[int]:
-    """``max_prompt_tokens`` for a Copilot model from the live /models API (cached in-process 1h; a
-    miss on a fresh cache does not re-fetch), or None."""
+    """The model's context window from the live /models API (cached in-process 1h; a miss on a fresh
+    cache does not re-fetch), or None.
+
+    Prefer ``max_context_window_tokens``: the newer catalog separates the context window from the
+    prompt cap, and reporting the prompt cap understated the window (400k shown as 272k, #44).
+    ``max_prompt_tokens`` stays the fallback for older payloads that carry only that field."""
     global _copilot_context_cache, _copilot_context_cache_time, _copilot_context_cache_key
 
     # Keyed on the credential like fetch_github_model_catalog: the catalog (and its limits) is
@@ -267,9 +271,12 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
     cache: dict[str, int] = {}
     for item in catalog:
         mid = str(item.get("id") or "").strip()
-        max_prompt = ((item.get("capabilities") or {}).get("limits") or {}).get("max_prompt_tokens")
-        if mid and isinstance(max_prompt, int) and max_prompt > 0:
-            cache[mid] = max_prompt
+        limits = (item.get("capabilities") or {}).get("limits") or {}
+        window = limits.get("max_context_window_tokens")
+        if not (isinstance(window, int) and window > 0):
+            window = limits.get("max_prompt_tokens")
+        if mid and isinstance(window, int) and window > 0:
+            cache[mid] = window
     _copilot_context_cache = cache
     _copilot_context_cache_time = time.time()
     _copilot_context_cache_key = key_fp
