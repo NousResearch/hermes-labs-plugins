@@ -60,7 +60,7 @@ def build_inbox(home: Optional[Path] = None, decisions: bool = False) -> dict[st
     finished = [d for d in delegations
                 if d["state"] not in c.LIVE_DELEGATION_STATES and d["delivery_state"] == "pending"]
 
-    return {
+    data = {
         "generated_at": time.time(),
         "home": str(home),
         "attention": attention,
@@ -68,14 +68,16 @@ def build_inbox(home: Optional[Path] = None, decisions: bool = False) -> dict[st
         "finished_undelivered": finished,
         "cron": cron_jobs,
         "sessions": sessions,
-        **({"decisions": decision_items} if decisions else {}),
         "sources": {
             name: note or "read"
             for name, note in (("processes", n_proc), ("delegations", n_del), ("loops", n_loop),
                                ("cron", n_cron), ("sessions", n_sess), ("kanban", n_kan))
-            if name != "decisions"
-        } | ({"decisions": n_dec or "read"} if decisions else {}),
+        },
     }
+    if decisions:
+        data["decisions"] = decision_items
+        data["sources"]["decisions"] = n_dec or "read"
+    return data
 
 
 def fmt_age(seconds: Any) -> str:
