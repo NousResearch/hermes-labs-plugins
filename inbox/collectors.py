@@ -30,6 +30,7 @@ LOOP_META_PREFIX = "loop:"
 # A loop's driver ticks on a seconds cadence; a tick this late has no driver behind it.
 LOOP_OVERDUE_GRACE_S = 5 * 60
 LOOP_TERMINAL_STATES = ("done", "cleared")
+LOOP_LIMIT = 50
 _BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 
@@ -175,7 +176,9 @@ def collect_loops(home: Path) -> tuple[Items, Note]:
         conn = _connect_ro(db)
         try:
             rows = conn.execute(
-                "SELECT key, value FROM state_meta WHERE key LIKE ? ORDER BY key LIMIT 50",
+                # No SQL LIMIT: /loop keeps cleared rows for audit, so a cap before the status
+                # filter would let old history hide a live loop. The cap applies after it.
+                "SELECT key, value FROM state_meta WHERE key LIKE ? ORDER BY key",
                 (LOOP_META_PREFIX + "%",),
             ).fetchall()
         finally:
@@ -194,6 +197,8 @@ def collect_loops(home: Path) -> tuple[Items, Note]:
         status = str(state.get("status") or "active")
         if status in LOOP_TERMINAL_STATES:
             continue
+        if len(out) >= LOOP_LIMIT:
+            break
         next_due = state.get("next_due_at")
         awaiting = bool(state.get("awaiting_response"))
         overdue = (
