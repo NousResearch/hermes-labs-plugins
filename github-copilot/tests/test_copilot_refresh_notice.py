@@ -8,7 +8,7 @@ def test_copilot_refresh_notices_match_the_pre_seam_text():
     assert profile.credential_refresh_notice(reason="unauthorized") == (
         "Copilot credentials refreshed after 401. Retrying request...")
     assert profile.credential_refresh_notice(reason="stale") == (
-        "Copilot credential re-exchanged after model_not_available 400. Retrying request...")
+        "Copilot credential re-exchanged after a stale-credential refusal (403 forbidden / 400 model_not_available). Retrying request...")
 
 
 def test_profiles_without_a_notice_get_the_generic_wording():
