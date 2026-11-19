@@ -42,12 +42,17 @@ class TestProcesses:
 
     def test_recycled_pid_is_detected_through_the_start_time(self, hermes_home):
         """A checkpointed PID the OS has since reused is not the old process. The start
-        time in the entry is what tells them apart — the guard sessions already use."""
+        time in the entry is what tells them apart. The registry checkpoints it as
+        ``host_start_time``, the fingerprint ``gateway.status.get_process_start_time`` returns."""
+        from gateway.status import get_process_start_time
+
+        start = get_process_start_time(os.getpid())
+        assert isinstance(start, int)
         write_processes(hermes_home, [
             {"session_id": "recycled", "command": "old job", "pid": os.getpid(),
-             "pid_scope": "host", "process_start_time": own_start_time() - 5000.0},
+             "pid_scope": "host", "host_start_time": start - 5000},
             {"session_id": "same", "command": "real job", "pid": os.getpid(),
-             "pid_scope": "host", "process_start_time": own_start_time()},
+             "pid_scope": "host", "host_start_time": start},
         ])
         items, note = c.collect_processes(hermes_home)
         procs = {p["id"]: p for p in items}

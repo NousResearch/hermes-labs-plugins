@@ -49,6 +49,19 @@ def pid_alive(pid: Any, expected_start: Any = None) -> bool:
         return False
 
 
+def host_process_alive(pid: Any, host_start_time: Any = None) -> bool:
+    """Liveness for a ``processes.json`` entry. The registry records ``host_start_time`` as
+    ``gateway.status.get_process_start_time``'s fingerprint (kernel ticks on Linux, not an epoch),
+    so it is compared the same way the registry does before it trusts a PID: by equality."""
+    if not pid_alive(pid):
+        return False
+    if not isinstance(host_start_time, int) or isinstance(host_start_time, bool):
+        return True  # legacy checkpoint with no baseline: bare liveness, as the registry does
+    from gateway.status import get_process_start_time
+
+    return get_process_start_time(int(pid)) == host_start_time
+
+
 def _read_json(path: Path) -> tuple[Any, Note]:
     if not path.exists():
         return None, "absent"
@@ -87,7 +100,7 @@ def collect_processes(home: Path) -> tuple[Items, Note]:
             "id": entry.get("session_id", "?"),
             "command": str(entry.get("command", ""))[:120],
             "pid": entry.get("pid"),
-            "alive": (pid_alive(entry.get("pid"), entry.get("process_start_time"))
+            "alive": (host_process_alive(entry.get("pid"), entry.get("host_start_time"))
                       if scope == "host" else None),
             "age_seconds": max(0.0, now - float(started)) if isinstance(started, (int, float)) else None,
             "notify_on_complete": bool(entry.get("notify_on_complete")),
