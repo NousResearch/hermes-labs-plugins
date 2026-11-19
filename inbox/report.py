@@ -67,7 +67,9 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
 
 
 def fmt_age(seconds: Any) -> str:
-    if not isinstance(seconds, (int, float)):
+    # bool is an int: a JSON duration that is a flag (``true``) would otherwise print a
+    # plausible "1s" instead of the unknown marker used for real non-durations.
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
         return "?"
     s = int(max(0, seconds))
     if s < 60:
@@ -153,10 +155,10 @@ def render_inbox(data: dict[str, Any]) -> str:
     _section(lines, "Finished, result not yet delivered", data.get("finished_undelivered") or [], "✔", now)
 
     active = [j for j in data.get("cron") or [] if j.get("enabled") and not j.get("paused")]
-    if active:
-        upcoming = sorted((j for j in active if j.get("next_run_at")),
-                          key=lambda j: str(j["next_run_at"]))[:5]
-        lines.append(f"  ◆ Scheduled ({len(active)} active job(s))")
+    scheduled = [j for j in active if j.get("next_run_at")]
+    if scheduled:
+        upcoming = sorted(scheduled, key=lambda j: str(j["next_run_at"]))[:5]
+        lines.append(f"  ◆ Scheduled ({len(scheduled)} active job(s))")
         lines += [f"    ⏱ {j['name']}  next: {j['next_run_at']}" for j in upcoming]
         lines.append("")
 

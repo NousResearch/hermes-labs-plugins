@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -141,9 +142,17 @@ class BusinessModeManager:
         self._debounce_tasks: Dict[str, asyncio.Task] = {}
         self._debounce_buffers: Dict[str, Dict[str, Any]] = {}
 
-        # Owner DMs that are in "next message = edited reply" mode.
-        # Keyed by owner_chat_id → draft_id awaiting the override text.
-        self._edit_capture: Dict[str, int] = {}
+        # Owner DMs in "next message = edited reply" mode, one stack per owner chat
+        # (most recent Edit first). A plain owner_chat_id → draft_id dict lost the
+        # earlier draft when the owner tapped Edit on a second draft: only the last
+        # tap survived and the first draft was never deliverable.
+        self._edit_capture: Dict[str, List[int]] = {}
+
+        # Draft IDs with an in-flight customer send. The pending-status check in
+        # ``handle_callback`` runs before the awaited send, so a second tap on the
+        # same draft gets past it too; this claim set is what stops a double-tap
+        # from delivering the reply twice.
+        self._send_inflight: set[int] = set()
 
     # ------------------------------------------------------------------
     # BusinessConnection updates (established / edited / ended).
@@ -312,6 +321,7 @@ class BusinessModeManager:
             )
 
     async def _debounce_then_draft(self, key: str) -> None:
+        task = asyncio.current_task()
         try:
             await asyncio.sleep(self._debounce_seconds)
         except asyncio.CancelledError:
@@ -319,7 +329,12 @@ class BusinessModeManager:
         try:
             await self._run_draft(key)
         finally:
-            self._debounce_tasks.pop(key, None)
+            # Only drop our own entry: a message that arrived while we were being
+            # cancelled has already replaced the slot with its newer task, and
+            # popping blindly deleted that task's handle — after which later
+            # messages could no longer cancel it and an extra timer fired.
+            if self._debounce_tasks.get(key) is task:
+                self._debounce_tasks.pop(key, None)
 
     async def _run_draft(self, key: str) -> None:
         buf = self._debounce_buffers.pop(key, None)
@@ -469,7 +484,7 @@ class BusinessModeManager:
             return True
 
         if choice == CHOICE_EDIT:
-            self._edit_capture[str(conn["owner_chat_id"])] = draft_id
+            self._edit_capture.setdefault(str(conn["owner_chat_id"]), []).append(draft_id)
             await answer(text="✎ Send me the text to deliver")
             try:
                 await edit_message_text(
@@ -492,6 +507,13 @@ class BusinessModeManager:
                     )
                 )
                 return True
+            # A double-tap delivers two callbacks before the first await settles, so
+            # both pass the pending check and the customer would get the reply twice.
+            # First tap claims the draft; the loser stops here.
+            if draft_id in self._send_inflight:
+                await answer(text="⏳ Already sending that draft.")
+                return True
+            self._send_inflight.add(draft_id)
             try:
                 await self._send(
                     chat_id=int(draft["customer_chat_id"]),
@@ -502,7 +524,8 @@ class BusinessModeManager:
                 logger.warning("Business send failed for draft %s: %s", draft_id, exc)
                 await answer(text=f"⚠️ Send failed: {exc}")
                 return True
-
+            finally:
+                self._send_inflight.discard(draft_id)
             self._db.resolve_telegram_business_draft(
                 draft_id, status="sent", final_sent_text=draft["draft_text"],
             )
@@ -534,14 +557,18 @@ class BusinessModeManager:
         Returns True if the message was consumed by the edit-capture flow
         (so the caller shouldn't dispatch it to the normal command path).
         """
-        draft_id = self._edit_capture.pop(str(owner_chat_id), None)
+        owner_key = str(owner_chat_id)
+        capture = self._edit_capture.get(owner_key) or []
+        draft_id = capture.pop() if capture else None
+        if not capture:
+            self._edit_capture.pop(owner_key, None)
         if draft_id is None:
             return False
 
         override = (text or "").strip()
         if not override:
             # Empty edit attempt → restore capture and let the user retry.
-            self._edit_capture[str(owner_chat_id)] = draft_id
+            self._edit_capture.setdefault(owner_key, []).append(draft_id)
             try:
                 await self._send(
                     chat_id=int(owner_chat_id),
@@ -661,6 +688,17 @@ class BusinessModeManager:
 
         if sub in {"off", "on"} and len(args) >= 2:
             chat_arg = args[1].strip()
+            # ASCII digits only (``str.isdigit`` takes ``²``/Arabic-Indic digits and
+            # ``lstrip`` took ``--5``). ``on`` still removes an entry stored before this
+            # check existed, or a muted word could never be un-muted.
+            stored = any(chat_arg in (c.get("paused_chats") or []) for c in active)
+            if not re.fullmatch(r"-?[0-9]+", chat_arg) and not (sub == "on" and stored):
+                return (
+                    f"'{chat_arg}' isn't a chat id. Telegram chat ids are numbers — "
+                    "reply to the customer's message and read the id, e.g. /biz off 123456789.\n"
+                    "  /biz off <id>    — mute drafting for one customer chat\n"
+                    "  /biz on  <id>    — re-enable it"
+                )
             if not active:
                 return "You don't have any active business connections."
             updated = 0

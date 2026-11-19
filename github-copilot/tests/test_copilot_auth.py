@@ -74,6 +74,7 @@ class TestRequestHeaders:
         headers = copilot_request_headers()
         assert headers["Openai-Intent"] == "conversation-edits"
         assert headers["User-Agent"] == "HermesAgent/1.0"
+        assert headers["X-GitHub-Api-Version"] == "2026-08-01"
         assert "Editor-Version" in headers
 
 

@@ -462,6 +462,47 @@ class TestBusinessMessageDraftFlow:
         owner_dms = [c for c in sender.calls if c.get("chat_id") == 100]
         assert len(owner_dms) == 1
 
+    @pytest.mark.asyncio
+    async def test_superseded_timer_keeps_the_new_slot_handle(self, db):
+        """A timer superseded *while already running* must not pop the new slot.
+
+        The old cleanup popped the key unconditionally, so a timer that was
+        cancelled during its (slow) draft call deleted its replacement's handle:
+        a third message could then no longer cancel anything, and the slot ended
+        up pointing at a dead task.
+        """
+        gate = asyncio.Event()
+        calls = {"n": 0}
+
+        async def _draft(customer_text: str, customer_chat_id: str) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await gate.wait()  # first draft hangs until superseded
+            return "coalesced"
+
+        from telegram_business_plugin.manager import BusinessModeManager
+
+        sender = _SentRecorder()
+        mgr = BusinessModeManager(
+            session_db=db, send_message=sender, draft_generator=_draft, debounce_seconds=0.01,
+        )
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+
+        key = "conn1:200"
+        await mgr.handle_business_message(_fake_business_message(text="one"))
+        await asyncio.sleep(0.03)  # timer fired, generator is blocked
+        await mgr.handle_business_message(_fake_business_message(text="two"))
+        await asyncio.sleep(0.01)  # cancelled timer runs its cleanup
+
+        assert key in mgr._debounce_tasks
+
+        gate.set()
+        await asyncio.sleep(0.1)
+        owner_dms = [c for c in sender.calls if c.get("chat_id") == 100]
+        assert len(owner_dms) == 1
+        assert "two" in owner_dms[0]["text"]
+
 
     @pytest.mark.asyncio
     async def test_owner_outgoing_message_not_drafted(self, db):
@@ -532,6 +573,50 @@ class TestCallbackDispatch:
         assert row["final_sent_text"] == "hello there"
         # Owner DM was edited to show resolution
         assert edited and "Sent" in edited[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_double_tap_send_delivers_once(self, db):
+        """Two Send taps arrive as two callbacks before the first send settles.
+
+        The pending-status check runs before any await, so both callbacks get
+        past it; without a claim the customer gets the reply twice.
+        """
+        release = asyncio.Event()
+        calls: List[Dict[str, Any]] = []
+
+        async def _slow_send(**kw):
+            calls.append(kw)
+            if kw.get("chat_id") == 200:  # customer send: hold until released
+                await release.wait()
+            return SimpleNamespace(message_id=1)
+
+        mgr, _ = _make_manager(db, send_recorder=_slow_send)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+
+        answered: List[Dict[str, Any]] = []
+
+        async def _answer(**kw): answered.append(kw)
+        async def _edit(**kw): pass
+
+        first = asyncio.create_task(mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        ))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        ))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        sends_to_customer = [c for c in calls if c.get("chat_id") == 200]
+        assert len(sends_to_customer) == 1
+        assert any("Already sending" in str(a.get("text")) for a in answered)
+        assert db.get_telegram_business_draft(did)["status"] == "sent"
 
     @pytest.mark.asyncio
     async def test_discard_marks_status(self, db):
@@ -692,6 +777,36 @@ class TestEditCapture:
         )
         assert consumed is False
 
+    @pytest.mark.asyncio
+    async def test_two_pending_edits_are_delivered_newest_first(self, db):
+        """Tapping Edit on two drafts used to keep only the last tap: the first
+        draft's capture was overwritten and its reply could never be delivered."""
+        mgr, sender = _make_manager(db, draft_text="draft")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=201))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=202))
+        drafts = db.get_pending_telegram_business_drafts_for_owner("100")
+        by_chat = {d["customer_chat_id"]: d["draft_id"] for d in drafts}
+
+        async def _answer(**kw): pass
+        async def _edit(**kw): pass
+
+        for chat in (201, 202):
+            await mgr.handle_callback(
+                data=f"bd:edit:{by_chat[str(chat)]}", caller_user_id="42",
+                answer=_answer, edit_message_text=_edit,
+            )
+
+        sender.calls.clear()
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="for 202") is True
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="for 201") is True
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="stray") is False
+
+        to_chat = {c["chat_id"]: c["text"] for c in sender.calls if c.get("chat_id") in (201, 202)}
+        assert to_chat == {202: "for 202", 201: "for 201"}
+        assert db.get_telegram_business_draft(by_chat["201"])["status"] == "edited"
+        assert db.get_telegram_business_draft(by_chat["202"])["status"] == "edited"
+
 
 class TestBizCommand:
     @pytest.mark.asyncio
@@ -749,6 +864,39 @@ class TestBizCommand:
             owner_user_id="42", owner_chat_id="100", args=["unknown"],
         )
         assert "Usage" in reply
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arg", ["@acme", "carol", "12x", "--5", "\u0661\u0662\u0663"])
+    async def test_off_rejects_a_non_numeric_chat_id(self, db, arg):
+        """The id is echoed back as `muted`, so a word would confirm a mute with no
+        effect; reject it and point at the numeric id instead."""
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        reply = await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["off", arg],
+        )
+        assert "isn't a chat id" in reply
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == []
+
+    @pytest.mark.asyncio
+    async def test_on_still_removes_a_word_muted_before_validation(self, db):
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        db.set_telegram_business_paused_chats("conn1", ["@acme"])
+        reply = await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["on", "@acme"],
+        )
+        assert "re-enabled" in reply
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == []
+
+    @pytest.mark.asyncio
+    async def test_off_accepts_a_negative_group_id(self, db):
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="100", args=["off", "-100123"],
+        )
+        assert db.get_telegram_business_connection("conn1")["paused_chats"] == ["-100123"]
 
 
 class TestDraftTtlEnforcement:
