@@ -1,6 +1,6 @@
 [project]
 name = "hermes-yuanbao"
-version = "2.0.0"
+version = "2.0.1"
 description = "Tencent Yuanbao gateway platform and yb_* tools for Hermes Agent (Hermes Labs plugin, unsupported)"
 readme = "README.md"
 license = { text = "MIT" }

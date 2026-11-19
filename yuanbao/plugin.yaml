@@ -1,7 +1,7 @@
 name: yuanbao
 label: Yuanbao
 kind: platform
-version: 2.0.0
+version: 2.0.1
 description: >
   Tencent Yuanbao gateway adapter for Hermes Agent (Hermes Labs plugin: built by
   Nous Research, not supported). Connects to Yuanbao IM Bot over a persistent
