@@ -19,6 +19,8 @@ def board(tmp_path, monkeypatch):
             status TEXT, created_at REAL, started_at REAL, block_kind TEXT);
         CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
             author TEXT, body TEXT, created_at REAL);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
+            run_id INTEGER, kind TEXT, payload TEXT, created_at REAL);
     """)
     conn.execute("INSERT INTO tasks VALUES ('t1','Pick a DB','body question','sal','blocked',1,1,'needs_input')")
     conn.execute("INSERT INTO tasks VALUES ('t2','Waiting on dep','dep body','sal','blocked',2,2,'dependency')")
@@ -75,3 +77,20 @@ def test_render_shows_the_question(board, tmp_path):
 
 def test_render_unchanged_without_flag(board, tmp_path):
     assert "Decisions waiting on you" not in render_inbox(build_inbox(home=tmp_path))
+
+
+def test_question_from_core_kanban_block_reason(hermes_home):
+    """``kanban_block(reason=...)`` — how a worker asks — stores the question on the ``blocked``
+    event, not as a comment: seeded through core's own writer, it must be the question shown."""
+    from hermes_cli import kanban_db as kb
+
+    conn = sqlite3.connect(kb.init_db())
+    conn.row_factory = sqlite3.Row
+    tid = kb.create_task(conn, title="Pick a DB", body="build the store")
+    assert kb.block_task(conn, tid, reason="Postgres or SQLite? Reply pg or sqlite.", kind="needs_input")
+    conn.commit()
+    conn.close()
+    (item,), note = c.collect_decisions()
+    assert note is None
+    assert (item["id"], item["question"], item["question_source"]) == (
+        tid, "Postgres or SQLite? Reply pg or sqlite.", "block_reason")
