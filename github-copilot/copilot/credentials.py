@@ -544,21 +544,35 @@ _RUNTIME_REFRESHERS = {
 }
 
 
+def _pool_token() -> tuple[str, str]:
+    """The credential pool's selected Copilot row → (token, source), or ("", "")."""
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("copilot").peek()
+    token = str(getattr(entry, "access_token", "") or "").strip() if entry is not None else ""
+    return (token, "credential_pool:copilot") if token else ("", "")
+
+
 class CopilotCredentialsMixin:
     """Fills the generic credential seams of ``providers.base.ProviderProfile`` for Copilot."""
 
-    def resolve_api_key_secret(self) -> tuple[str, str] | None:
+    def resolve_api_key_secret(self) -> tuple[str, str]:
         """The exchanged Copilot token. A home that never chose Copilot gets the raw env token (it
         still reads as present) and GitHub is not called: provider listings resolve this for every
-        provider with a token in reach (``activation``). With no env token this returns None, so
-        core's generic ladder reaches the credential pool (``hermes auth add copilot``) instead of
-        reading ("", "") as a final "no key"."""
+        provider with a token in reach (``activation``). With no supported env token the pool row
+        (``hermes auth add copilot``) answers, so a pool-only login reaches aux/fallback clients.
+        Never None: core's generic env ladder would then hand back an unsupported ``ghp_``
+        ``GITHUB_TOKEN`` ahead of the pool row, since it does not know Copilot's token prefixes."""
         from .activation import github_calls_allowed
 
         try:
             token, source = resolve_copilot_token()
             if not token:
-                return None
+                token, source = _pool_token()
+            if not token:
+                return "", ""
+            if not validate_copilot_token(token)[0]:
+                return token, source  # a pool row already holding an exchanged token
             if not github_calls_allowed():
                 return token, source
             api_token, _base_url = get_copilot_api_token(token)
