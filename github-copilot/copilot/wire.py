@@ -19,6 +19,7 @@ _COPILOT_HOST = "githubcopilot.com"
 # keeps the client default ``agent`` by design; see README § Premium requests.
 _INITIATOR_HOSTS = ("api.githubcopilot.com", "models.github.ai")
 _HTTP_API_MODES = {"/chat/completions": "chat_completions", "/responses": "codex_responses"}
+_DUAL_RESPONSES_PREFIXES = ("mai-code-",)
 
 
 def is_copilot_host(base_url: str) -> bool:
@@ -30,15 +31,22 @@ def is_copilot_host(base_url: str) -> bool:
     return base_url_host_matches(str(base_url or ""), _COPILOT_HOST)
 
 
+def _prefers_dual_endpoint_responses(model_id: str) -> bool:
+    lower = model_id.lower()
+    if lower.startswith(_DUAL_RESPONSES_PREFIXES):
+        return True
+    match = re.match(r"^gpt-(\d+)", lower)
+    return bool(match) and int(match.group(1)) >= 5 and not lower.startswith("gpt-5-mini")
+
+
 def requires_responses_api(model_id: str) -> bool:
-    """Offline defaults: GPT-5+ except ``gpt-5-mini``, and Grok, use Responses.
+    """Offline defaults: GPT-5+ except ``gpt-5-mini``, MAI-Code, and Grok use Responses.
 
     Catalog HTTP endpoints take precedence when available; this also serves core's keyless hooks.
     """
     if model_id.lower().startswith("grok-"):
         return True
-    match = re.match(r"^gpt-(\d+)", model_id)
-    return bool(match) and int(match.group(1)) >= 5 and not model_id.startswith("gpt-5-mini")
+    return _prefers_dual_endpoint_responses(model_id)
 
 
 def _catalog_http_modes(model_id: str, catalog: list[dict[str, Any]]) -> set[str]:
@@ -59,7 +67,8 @@ def _catalog_http_modes(model_id: str, catalog: list[dict[str, Any]]) -> set[str
 def model_api_mode(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> str:
-    """An exclusive catalog HTTP endpoint wins; dual-endpoint models keep their existing defaults.
+    """An exclusive catalog HTTP endpoint wins; dual-endpoint models use Responses for GPT-5+
+    (except ``gpt-5-mini``) and MAI-Code, else Chat Completions.
 
     Claude stays on Copilot's OpenAI-compatible auth path, not the native Anthropic adapter.
     A WebSocket advertisement is not evidence of HTTP Responses support.
@@ -72,8 +81,8 @@ def model_api_mode(
     modes = _catalog_http_modes(normalized, catalog or [])
     if len(modes) == 1:
         return next(iter(modes))
-    if modes and not normalized.startswith("gpt-"):
-        return "chat_completions"
+    if modes:
+        return "codex_responses" if _prefers_dual_endpoint_responses(normalized) else "chat_completions"
     if normalized and requires_responses_api(normalized):
         return "codex_responses"
     return "chat_completions"
