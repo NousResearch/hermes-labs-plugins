@@ -42,3 +42,17 @@ def test_live_jwt_lock_kept():
         c._exchange_locks[f"x{i}"] = c.threading.Lock()
     c._prune_exchange_caches()
     assert "active" in c._exchange_locks
+
+
+def test_held_lock_survives_pruning():
+    """An exchange in flight holds its lock; pruning must not hand the next caller a new one."""
+    c._jwt_cache.clear(); c._exchange_failure_cache.clear(); c._exchange_locks.clear()
+    held = c._exchange_lock_for("inflight")
+    held.acquire()
+    try:
+        for i in range(200):
+            c._exchange_locks[f"y{i}"] = c.threading.Lock()
+        c._prune_exchange_caches()
+        assert c._exchange_lock_for("inflight") is held
+    finally:
+        held.release()
