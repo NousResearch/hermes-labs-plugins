@@ -427,9 +427,45 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
     return f"https://{proxy_ep}"
 
 
+# Account-host lookup for the no-exchange path, keyed by raw-token fingerprint. Introspection is
+# one extra request per account per process, not per turn.
+_account_host_cache: dict[str, Optional[str]] = {}
+_ACCOUNT_INTROSPECT_URL = "https://api.github.com/copilot_internal/user"
+
+
+def _account_api_host(raw_token: str) -> Optional[str]:
+    """The account's own Copilot API host, or None when it cannot be determined.
+
+    Individual plans have no exchange endpoint (``copilot_internal/v2/token`` answers 404) but do
+    accept the raw OAuth token on ``api.individual.githubcopilot.com``. Falling back to the raw
+    token with no host sent it to the business endpoint, which rejects it as a badly formatted
+    Authorization header (#43). ``copilot_internal/user`` reports the account's ``endpoints.api``.
+    """
+    fp = _token_fingerprint(raw_token)
+    if fp in _account_host_cache:
+        return _account_host_cache[fp]
+    host: Optional[str] = None
+    try:
+        req = urllib.request.Request(
+            _ACCOUNT_INTROSPECT_URL, method="GET",
+            headers={"Authorization": f"token {raw_token}", "User-Agent": _EXCHANGE_USER_AGENT,
+                     "Accept": "application/json", "Editor-Version": _EDITOR_VERSION})
+        with _urlopen_bounded(req, 10.0) as resp:
+            data = json.loads(resp.read().decode())
+        endpoints = data.get("endpoints") if isinstance(data, dict) else None
+        if isinstance(endpoints, dict):
+            candidate = str(endpoints.get("api") or "").strip().rstrip("/")
+            if candidate.startswith("https://"):
+                host = candidate
+    except Exception as exc:
+        logger.debug("Copilot account host lookup failed: %s", exc)
+    _account_host_cache[fp] = host
+    return host
+
+
 def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
-    """``(api_token, base_url)`` from the exchange, or ``(raw_token, None)`` when it fails
-    (accounts that don't need exchange keep working)."""
+    """``(api_token, base_url)`` from the exchange, or ``(raw_token, account_host)`` when it fails
+    (accounts that don't need exchange keep working, on their own endpoint when it is known)."""
     if not raw_token:
         return raw_token, None
     try:
@@ -437,7 +473,7 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
         return api_token, base_url
     except Exception as exc:
         logger.debug("Copilot token exchange failed, using raw token: %s", exc)
-        return raw_token, None
+        return raw_token, _account_api_host(raw_token)
 
 
 def copilot_request_headers(
