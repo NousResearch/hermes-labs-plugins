@@ -176,14 +176,17 @@ def _prune_exchange_caches() -> None:
     for fp, deadline in list(_exchange_failure_cache.items()):
         if now >= float(deadline or 0):
             _exchange_failure_cache.pop(fp, None)
-    if len(_exchange_locks) > _EXCHANGE_CACHE_MAX_ENTRIES:
+    with _exchange_locks_guard:
+        if len(_exchange_locks) <= _EXCHANGE_CACHE_MAX_ENTRIES:
+            return
         keep = set(_jwt_cache) | set(_exchange_failure_cache)
-        for fp in list(_exchange_locks):
+        for fp, lock in list(_exchange_locks.items()):
             if len(_exchange_locks) <= _EXCHANGE_CACHE_MAX_ENTRIES:
                 break
-            if fp not in keep:
+            # A held lock is an exchange in flight: dropping it would let the next caller start a
+            # second, concurrent exchange for the same token (single-flight broken).
+            if fp not in keep and not lock.locked():
                 _exchange_locks.pop(fp, None)
-
 
 
 def _exchange_lock_for(fp: str) -> threading.Lock:
