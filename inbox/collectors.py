@@ -304,7 +304,8 @@ def collect_decisions(limit: int = 20) -> tuple[Items, Note]:
     attention line becomes something a person can answer (#59). Read-only, and scoped to
     ``block_kind = 'needs_input'`` — a task blocked on a dependency is not a decision.
 
-    The question is the latest comment asking for input, falling back to the task body.
+    The question is the newer of the latest block reason (``kanban_block(reason=...)`` records it
+    on the ``blocked`` event, not as a comment) and the latest comment, falling back to the body.
     """
     db = kanban_db_location()
     if not db.exists():
@@ -321,19 +322,28 @@ def collect_decisions(limit: int = 20) -> tuple[Items, Note]:
             ).fetchall()
             out = []
             for tid, title, body, assignee, created_at in rows:
-                comment = conn.execute(
+                candidates = [(at, text, "comment", author) for text, author, at in conn.execute(
                     """SELECT body, author, created_at FROM task_comments
-                       WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1""",
-                    (tid,),
-                ).fetchone()
-                question, source = (comment[0], "comment") if comment and comment[0] else (body, "body")
+                       WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1""", (tid,))]
+                for payload, at in conn.execute(
+                        """SELECT payload, created_at FROM task_events
+                           WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1""", (tid,)):
+                    try:
+                        reason = (json.loads(payload or "{}") or {}).get("reason")
+                    except (ValueError, AttributeError):
+                        reason = None
+                    candidates.append((at, reason, "block_reason", None))
+                # Newest wins; on a tie the comment does (``hermes kanban block`` writes both).
+                asked_at, question, source, asked_by = max(
+                    [c for c in candidates if c[1]], key=lambda c: (c[0] or 0, c[2] == "comment"),
+                    default=(None, body, "body", None))
                 out.append({
                     "kind": "decision", "id": tid, "title": str(title or "")[:100],
                     "assignee": assignee, "created_at": created_at,
                     "question": str(question or "").strip()[:600],
                     "question_source": source,
-                    "asked_by": comment[1] if comment else None,
-                    "asked_at": comment[2] if comment else None,
+                    "asked_by": asked_by,
+                    "asked_at": asked_at,
                 })
         finally:
             conn.close()
