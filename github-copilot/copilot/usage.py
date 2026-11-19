@@ -134,7 +134,9 @@ def resolve_copilot_usage_token(api_key: Optional[str] = None) -> str:
         for raw in candidates:
             if _exchanged_token_matches(raw, explicit):
                 return raw
-        return candidates[0] if len(candidates) == 1 else ""
+        # No cached exchange links *explicit* to a raw token: guessing the sole candidate could
+        # report another account's quota (an ambient GH_TOKEN beside a device-code pool login).
+        return ""
 
     if not github_calls_allowed():
         return ""
