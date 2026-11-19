@@ -117,6 +117,9 @@ def slow_response_message() -> str:
 CRON_WRAPPER_HEADER_PREFIX = "Cronjob Response: "
 CRON_WRAPPER_DIVIDER = "\n-------------\n\n"
 CRON_WRAPPER_FOOTER_PREFIX = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+# Footer-style wrapper (hermes-agent#99452): ``<payload>\n\n-------------\nCronjob Response: <name>\n(job_id: <id>)``.
+# The legacy constants above stay so an already-queued header-first message still strips.
+CRON_WRAPPER_TRAILER_RE = re.compile(r"\n\n-------------\nCronjob Response: [^\n]*\n\(job_id: [^\n]*\)\Z")
 
 # Transcript anchors: [image|ybres:abc]  [file:report.pdf|ybres:xyz]  [voice|ybres:…]
 _YB_RES_REF_RE = re.compile(r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]")
@@ -2658,17 +2661,11 @@ class MessageSender:
             if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos or "\n(job_id: " not in content[:divider_pos]:
                 return content
             return content[divider_pos + len(divider):footer_pos].strip() or content
-        # Footer-style shape: payload leads, wrapper at the end.
-        footer_pos = content.rfind(CRON_WRAPPER_HEADER_PREFIX)
-        if footer_pos <= 0:
+        # Footer-style shape: payload leads, the trailer is the exact tail core appends.
+        match = CRON_WRAPPER_TRAILER_RE.search(content)
+        if match is None:
             return content
-        divider_pos = content.rfind("-------------", 0, footer_pos)
-        if divider_pos < 0 or "\n(job_id: " not in content[footer_pos:]:
-            return content
-        payload = content[:divider_pos].rstrip()
-        # trim a trailing blank line before the divider
-        payload = payload.rstrip("\n").rstrip()
-        return payload.strip() or content
+        return content[:match.start()].strip() or content
 
     async def close(self) -> None:
         self._chat_locks.clear()
