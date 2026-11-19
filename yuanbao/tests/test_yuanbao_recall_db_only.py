@@ -8,26 +8,22 @@ JSONL file gone.  When a row has no platform id (e.g. agent-processed
 @bot messages whose adapter didn't carry a msg_id, or pre-column legacy
 rows), recall falls through to content-match.
 """
-from gateway.session import SessionStore
-from gateway.config import GatewayConfig
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore
 
 
-def _pin_db(monkeypatch, tmp_path):
-    """Force SessionDB() to write into tmp_path instead of the real ~/.hermes."""
-    import hermes_state
-    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
-
-
-def test_recall_branch_a1_exact_id_match_round_trips_through_db(tmp_path, monkeypatch):
+def test_recall_branch_a1_exact_id_match_round_trips_through_db(tmp_path):
     """A user message persisted with ``message_id`` must round-trip through
-    state.db so recall can find and redact it by exact id (branch A1)."""
-    _pin_db(monkeypatch, tmp_path)
+    state.db so recall can find and redact it by exact id (branch A1).
 
-    config = GatewayConfig()
-    store = SessionStore(sessions_dir=tmp_path, config=config)
+    The session row comes from ``get_or_create_session`` — the same public verb the recall
+    guard uses — so the test holds on every core's storage backend. The conftest's per-test
+    ``HERMES_HOME`` keeps state.db under tmp_path."""
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
 
-    sid = "test-yuanbao-recall-a1"
-    store._db.create_session(session_id=sid, source="yuanbao:group:G")
+    source = SessionSource(platform=Platform("yuanbao"), chat_id="group:G", chat_type="group",
+                           user_id="U", thread_id="main")
+    sid = store.get_or_create_session(source).session_id
     store.append_to_transcript(sid, {
         "role": "user",
         "content": "sensitive content",

@@ -49,11 +49,15 @@ def test_register_shape_and_core_wiring_removed(monkeypatch):
 @pytest.mark.parametrize("module, name", [
     ("gateway.run", "_BUILTIN_ADAPTERS"),
     ("hermes_cli.gateway_setup_wizard", "_PLATFORMS"),
-    ("tools.send_message_tool", "_CHUNKED_ROUTES"),
+    ("gateway.outbound.send", "_CHUNKED_ROUTES"),
 ])
 def test_no_core_wiring_left(module, name):
-    """Core's private per-platform tables no longer name Yuanbao (skipped once core renames one)."""
-    table = getattr(importlib.import_module(module), name, None)
+    """Core's private per-platform tables no longer name Yuanbao (skipped once core moves or renames one:
+    these are core internals, so a move is not a plugin regression)."""
+    try:
+        table = getattr(importlib.import_module(module), name, None)
+    except ModuleNotFoundError:
+        table = None
     if table is None:
         pytest.skip(f"{module}.{name} is gone from this Hermes core")
     # dict keyed by Platform / route name, or the wizard's list of {"key": ...} rows.
