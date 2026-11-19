@@ -47,7 +47,8 @@ Or set a token. The first supported one wins, in the Copilot CLI's order:
 
 Supported token types: OAuth `gho_*`, GitHub App `ghu_*`, fine-grained PAT `github_pat_*` with the
 Copilot Requests permission. Classic PATs (`ghp_*`) are rejected by the Copilot API.
-`COPILOT_API_BASE_URL` overrides the API base URL.
+`COPILOT_API_BASE_URL` overrides the API base URL. On GitHub Enterprise Cloud set `COPILOT_GH_HOST` to
+`<enterprise>.ghe.com` too: the token exchange then runs on `api.<enterprise>.ghe.com`.
 
 `GH_TOKEN` and `GITHUB_TOKEN` are shared with other GitHub tools, so on their own they never make Hermes
 contact GitHub. The plugin calls GitHub (token exchange, model list) only once you have chosen Copilot:
