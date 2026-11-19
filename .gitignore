@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 .ruff_cache/
 .DS_Store
+
+# Crash dumps from headless Chrome in workflow-record tests; they can hold environment secrets.
+core.[0-9]*
