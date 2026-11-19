@@ -22,7 +22,7 @@ _STALLED_DELEGATION_STATES = ("stalling", "stalled", "unknown")
 _RUNNING_DELEGATION_STATES = ("running", "finalizing")
 
 
-def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
+def build_inbox(home: Optional[Path] = None, decisions: bool = False) -> dict[str, Any]:
     """The full snapshot as JSON-serialisable data. ``home`` defaults to the active profile's."""
     if home is None:
         from hermes_constants import get_hermes_home
@@ -33,6 +33,8 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
     cron_jobs, n_cron = c.collect_cron(home)
     sessions, n_sess = c.collect_sessions(home)
     kanban, n_kan = c.collect_kanban()
+    # Opt-in (#59): the decision text behind a blocked task, not just the fact that it is blocked.
+    decision_items, n_dec = c.collect_decisions() if decisions else ([], None)
 
     attention: list[dict[str, Any]] = []
     attention += [d for d in delegations
@@ -58,11 +60,13 @@ def build_inbox(home: Optional[Path] = None) -> dict[str, Any]:
         "finished_undelivered": finished,
         "cron": cron_jobs,
         "sessions": sessions,
+        **({"decisions": decision_items} if decisions else {}),
         "sources": {
             name: note or "read"
             for name, note in (("processes", n_proc), ("delegations", n_del), ("cron", n_cron),
                                ("sessions", n_sess), ("kanban", n_kan))
-        },
+            if name != "decisions"
+        } | ({"decisions": n_dec or "read"} if decisions else {}),
     }
 
 
@@ -153,6 +157,20 @@ def render_inbox(data: dict[str, Any]) -> str:
     _section(lines, "In progress", data.get("in_progress") or [], "◐", now,
              "nothing running in the background")
     _section(lines, "Finished, result not yet delivered", data.get("finished_undelivered") or [], "✔", now)
+    if "decisions" in data:
+        items = data.get("decisions") or []
+        lines.append("")
+        lines.append(f"  ? Decisions waiting on you ({len(items)})")
+        if not items:
+            lines.append("      nothing — no task is blocked on input")
+        for d in items:
+            lines.append(f"      • {d.get('title') or d.get('id')}")
+            question = (d.get("question") or "").strip()
+            if question:
+                for chunk in question.splitlines()[:6]:
+                    lines.append(f"          {chunk[:160]}")
+            else:
+                lines.append("          (no question recorded on the task)")
 
     active = [j for j in data.get("cron") or [] if j.get("enabled") and not j.get("paused")]
     scheduled = [j for j in active if j.get("next_run_at")]

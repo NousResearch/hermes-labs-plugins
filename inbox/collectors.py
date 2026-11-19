@@ -295,3 +295,48 @@ def collect_kanban(limit: int = 20) -> tuple[Items, Note]:
          "assignee": assignee, "started_at": started_at, "created_at": created_at}
         for tid, title, status, assignee, started_at, created_at in rows
     ], None
+
+
+def collect_decisions(limit: int = 20) -> tuple[Items, Note]:
+    """Blocked kanban tasks that are waiting on a human decision, with the question itself.
+
+    ``collect_kanban`` reports that a task is blocked; this reports *what* has to be decided, so an
+    attention line becomes something a person can answer (#59). Read-only, and scoped to
+    ``block_kind = 'needs_input'`` — a task blocked on a dependency is not a decision.
+
+    The question is the latest comment asking for input, falling back to the task body.
+    """
+    db = kanban_db_location()
+    if not db.exists():
+        return [], "absent"
+    try:
+        conn = _connect_ro(db)
+        try:
+            rows = conn.execute(
+                """SELECT id, title, body, assignee, created_at FROM tasks
+                   WHERE status = 'blocked' AND block_kind = 'needs_input'
+                   ORDER BY COALESCE(started_at, created_at) DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            out = []
+            for tid, title, body, assignee, created_at in rows:
+                comment = conn.execute(
+                    """SELECT body, author, created_at FROM task_comments
+                       WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (tid,),
+                ).fetchone()
+                question, source = (comment[0], "comment") if comment and comment[0] else (body, "body")
+                out.append({
+                    "kind": "decision", "id": tid, "title": str(title or "")[:100],
+                    "assignee": assignee, "created_at": created_at,
+                    "question": str(question or "").strip()[:600],
+                    "question_source": source,
+                    "asked_by": comment[1] if comment else None,
+                    "asked_at": comment[2] if comment else None,
+                })
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return [], f"unreadable ({exc})"
+    return out, None
