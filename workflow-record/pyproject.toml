@@ -1,6 +1,6 @@
 [project]
 name = "hermes-workflow-record"
-version = "0.1.0"
+version = "0.1.1"
 description = "hermes record: demonstrate a browser workflow once, replay it as a Hermes skill"
 requires-python = ">=3.11"
 # CDP client for the live recorder. Hermes core already ships websockets 15.x;

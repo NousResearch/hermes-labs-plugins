@@ -1,5 +1,5 @@
 name: workflow-record
-version: 0.1.0
+version: 0.1.1
 description: >
   hermes record: demonstrate a browser workflow once (clicks, field values,
   Enter presses, navigations) over CDP and save it as a recording, with
