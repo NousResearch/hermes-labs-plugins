@@ -228,11 +228,18 @@ def evict_cached_exchanged_token(raw_token: str) -> None:
     _jwt_cache.pop(fp, None)
     # Eviction = "force a fresh exchange": the negative-cache entry must go too.
     _exchange_failure_cache.pop(fp, None)
+    _evict_persisted_jwt(fp)
 
+
+def _evict_persisted_jwt(fp: str, *, only_token: Optional[str] = None) -> None:
+    """Drop ``fp``'s on-disk JWT; with ``only_token``, only while the disk still holds that token."""
     def _evict(path, store):
-        if store is not None and fp in store:
-            del store[fp]
-            atomic_json_write(path, store, indent=None, mode=0o600)
+        entry = (store or {}).get(fp)
+        if entry is None or (only_token is not None and (
+                not isinstance(entry, dict) or entry.get("api_token") != only_token)):
+            return
+        del store[fp]
+        atomic_json_write(path, store, indent=None, mode=0o600)
 
     _with_jwt_store("evict cached", _evict)
 
@@ -531,12 +538,17 @@ def _reexchange_stale_token() -> Optional[tuple[str, Optional[str]]]:
 
 
 def _revalidate_in_memory_token() -> Optional[tuple[str, Optional[str]]]:
-    """Auxiliary-client 401: drop only the in-process JWT and exchange again (a persisted, still-valid
-    JWT and the negative cache are honoured); raises when the exchange fails."""
+    """Auxiliary-client 401: drop the in-process JWT and exchange again; raises when the exchange
+    fails. The negative cache and a persisted JWT a peer process wrote since are honoured, but the
+    JWT that just failed is dropped from disk too: GitHub can revoke it before its stored
+    ``expires_at``, and reloading it would replay the refusal for the process lifetime (#47)."""
     raw_token, _source = resolve_copilot_token()
     if not str(raw_token or "").strip():
         return None
-    _jwt_cache.pop(_token_fingerprint(raw_token), None)
+    fp = _token_fingerprint(raw_token)
+    failed = _jwt_cache.pop(fp, None) or _load_jwt_from_disk(fp)
+    if failed:
+        _evict_persisted_jwt(fp, only_token=failed[0])
     api_token, _expires_at, base_url = exchange_copilot_token(raw_token)
     return api_token, base_url
 

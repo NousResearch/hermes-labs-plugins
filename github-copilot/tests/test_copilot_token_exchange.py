@@ -235,3 +235,41 @@ class TestExchangeFailureFastPath:
         mod._exchange_failure_cache[fp] = time.time() + 999
         evict_cached_exchanged_token("gho_stale")
         assert fp not in mod._exchange_failure_cache
+
+
+class TestAuxiliaryRevalidationDropsRevokedDiskJwt:
+    """#47: GitHub can revoke an exchanged JWT before its stored ``expires_at``. The auxiliary 401
+    refresher must not reload that same JWT from ``.copilot_jwt.json``."""
+
+    def _fresh_exchange(self, token):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"token": token, "expires_at": time.time() + 1800}).encode()
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _seed(self, tmp_path, monkeypatch, api_token):
+        mod = copilot_credentials
+        path = tmp_path / mod._JWT_DISK_FILENAME
+        monkeypatch.setattr(mod, "_jwt_disk_path", lambda: path)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_auxrevoked")
+        fp = mod._token_fingerprint("gho_auxrevoked")
+        mod._save_jwt_to_disk(fp, api_token, time.time() + 22 * 3600, None)
+        mod._jwt_cache[fp] = (api_token, time.time() + 22 * 3600, None)
+        return path, fp
+
+    def test_revoked_persisted_jwt_is_not_reloaded(self, tmp_path, monkeypatch):
+        mod = copilot_credentials
+        path, fp = self._seed(tmp_path, monkeypatch, "tid=revoked")
+        with patch("urllib.request.urlopen", return_value=self._fresh_exchange("tid=fresh")):
+            token, _base = mod._revalidate_in_memory_token()
+        assert token == "tid=fresh"
+        assert json.loads(path.read_text())[fp]["api_token"] == "tid=fresh"
+
+    def test_peer_written_fresher_jwt_is_adopted_without_an_exchange(self, tmp_path, monkeypatch):
+        mod = copilot_credentials
+        path, fp = self._seed(tmp_path, monkeypatch, "tid=peer")
+        mod._jwt_cache[fp] = ("tid=revoked", time.time() + 22 * 3600, None)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("no exchange expected")):
+            token, _base = mod._revalidate_in_memory_token()
+        assert token == "tid=peer"
