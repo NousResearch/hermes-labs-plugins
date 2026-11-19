@@ -139,6 +139,16 @@ class TestLoops:
         db.close()
         assert c.collect_loops(hermes_home) == ([], None)
 
+    def test_cleared_history_does_not_hide_a_live_loop(self, hermes_home):
+        """/loop keeps cleared rows for audit; a profile with many of them still shows the live
+        loop whose session id sorts after them."""
+        now = time.time()
+        add_loops(hermes_home, [(f"a{i:03d}", {"prompt": "old", "status": "cleared"}) for i in range(60)]
+                  + [("zz-live", {"prompt": "watch", "status": "active", "next_due_at": now - 3600})])
+        items, note = c.collect_loops(hermes_home)
+        assert note is None
+        assert [i["id"] for i in items] == ["zz-live"]
+
 
 class TestCron:
     def test_failed_paused_and_healthy_jobs(self, hermes_home):
