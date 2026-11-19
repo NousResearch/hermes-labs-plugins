@@ -9,8 +9,6 @@ the env vars above (``.env`` or the process environment) or a ``hermes auth add 
 
 from __future__ import annotations
 
-import os
-
 import contextlib
 import hashlib
 import json
@@ -151,7 +149,9 @@ def _token_exchange_url() -> str:
     endpoint first; the plugin's callers fall back to the raw token if the exchange fails, so
     a host without that route degrades exactly as before rather than breaking the turn.
     """
-    host = (os.environ.get("COPILOT_GH_HOST") or "").strip().rstrip("/")
+    # get_secret, not os.environ: the host lives in the profile's .env next to the token, and one
+    # gateway process serves many profiles.
+    host = (get_secret("COPILOT_GH_HOST") or "").strip().rstrip("/")
     if not host or host.lower() == "github.com":
         return _TOKEN_EXCHANGE_URL
     if host.startswith(("https://", "http://")):
