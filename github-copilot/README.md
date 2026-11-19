@@ -73,13 +73,16 @@ user turn on the exact host `api.githubcopilot.com` (and GitHub Models, `models.
 When core passes an API key to the per-model hook (runtime resolution and `/model`), the plugin uses
 that account's catalog `supported_endpoints`: an exclusive HTTP `/responses` or `/chat/completions`
 endpoint wins over the model-name default. If both are advertised, GPT-5+ keeps Responses except
-`gpt-5-mini`, and non-GPT models keep Chat Completions. Claude does not switch to the native Anthropic
-adapter just because the catalog advertises `/v1/messages`.
+`gpt-5-mini`, `mai-code-*` models also prefer Responses (`mai-code-2` and `mai-code-2-flash` advertise
+both endpoints in `/models` while `/chat/completions` rejects requests with
+`no_available_model_endpoints`), and other families keep Chat Completions. Claude does not switch to
+the native Anthropic adapter just because the catalog advertises `/v1/messages`.
 
 Core's keyless hooks (direct agent init, auxiliary clients and fallback) must not perform I/O or borrow
 another account's catalog. They normalize model aliases and use offline defaults: GPT-5+ except
-`gpt-5-mini`, and Grok, use Responses; other families use Chat Completions. Unknown Responses-only
-models need credentialed resolution or an explicit `api_mode: codex_responses` on those keyless paths.
+`gpt-5-mini`, `mai-code-*`, and Grok use Responses; other families use Chat Completions. Unknown
+Responses-only models need credentialed resolution or an explicit `api_mode: codex_responses` on those
+keyless paths.
 Explicit API-mode overrides remain core's responsibility; the plugin cannot change a mode on a path
 that bypasses its hook.
 
