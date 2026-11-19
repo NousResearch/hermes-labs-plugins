@@ -21,6 +21,8 @@ def offline_credentials(monkeypatch):
 @pytest.mark.parametrize("provider", ["copilot", "github-copilot"])
 @pytest.mark.parametrize("model, endpoints, expected", [
     ("grok-4.7", ["/responses"], "codex_responses"),
+    ("mai-code-2", ["/chat/completions", "/responses"], "codex_responses"),
+    ("mai-code-2-flash", ["/chat/completions", "/responses"], "codex_responses"),
     ("new-vendor-model", ["/responses"], "codex_responses"),
     ("gpt-6-luna", ["/chat/completions"], "chat_completions"),
 ])
@@ -69,6 +71,8 @@ def test_saved_grok_mode_is_not_silently_changed(
 @pytest.mark.parametrize("model, expected", [
     ("grok-4.7", "codex_responses"),
     ("x-ai/grok-4.7", "codex_responses"),
+    ("mai-code-2", "codex_responses"),
+    ("microsoft/mai-code-2-flash", "codex_responses"),
     ("gpt-5-mini", "chat_completions"),
     ("claude-opus-4.6", "chat_completions"),
 ])
