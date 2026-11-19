@@ -1,5 +1,5 @@
 name: telegram-business
-version: 1.0.0
+version: 1.0.1
 description: >
   Observe-with-approval Telegram Business Mode (secretary bot). Drafts
   replies to incoming customer messages on a connected Telegram Business
