@@ -274,8 +274,15 @@ def auth_handler(action: str, args: Any) -> bool:
         raise SystemExit(msg)
     pool = load_pool("copilot")
     label = (getattr(args, "label", None) or "").strip() or f"github-device-{len(pool.entries()) + 1}"
+    # Each account needs its own priority (#87): a hardcoded 0 makes every new credential
+    # outrank the earlier ones, so a multi-account gateway silently changes which account
+    # serves turns. Skip taken priorities so a gap cannot reuse one either.
+    taken = {getattr(e, "priority", None) for e in pool.entries()}
+    priority = 0
+    while priority in taken:
+        priority += 1
     pool.add_entry(PooledCredential(
-        provider="copilot", id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_API_KEY, priority=0,
+        provider="copilot", id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_API_KEY, priority=priority,
         source="manual:device_code", access_token=token, base_url=COPILOT_BASE_URL))
     print(f'Added copilot credential #{len(pool.entries())}: "{label}"')
     return True
