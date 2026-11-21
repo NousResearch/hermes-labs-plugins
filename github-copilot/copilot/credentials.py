@@ -117,8 +117,16 @@ def _post_form(url: str, fields: dict, timeout: float) -> dict:
 
 
 def copilot_device_code_login(
-    *, host: str = "github.com", timeout_seconds: float = 300) -> Optional[str]:
-    """Run the GitHub OAuth device code flow for Copilot."""
+    *, host: Optional[str] = None, timeout_seconds: float = 300) -> Optional[str]:
+    """Run the GitHub OAuth device code flow for Copilot.
+
+    With no explicit host, use the profile's ``COPILOT_GH_HOST`` so a self-hosted Enterprise Server
+    logs in on its own instance (#39) instead of being sent to github.com.
+    """
+    if not host:
+        host = (get_secret("COPILOT_GH_HOST") or "").strip() or "github.com"
+    if host.startswith(("https://", "http://")):
+        host = host.split("://", 1)[1]
     domain = host.rstrip("/")
     try:
         device_data = _post_form(f"https://{domain}/login/device/code",
@@ -178,9 +186,10 @@ _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 def _token_exchange_url() -> str:
     """GHEC tokens must be exchanged on their own host (#41): api.github.com answers 401.
 
-    ``COPILOT_GH_HOST`` names the enterprise host (``<enterprise>.ghe.com``). Try its API
-    endpoint first; the plugin's callers fall back to the raw token if the exchange fails, so
-    a host without that route degrades exactly as before rather than breaking the turn.
+    ``COPILOT_GH_HOST`` names the enterprise host. GitHub Enterprise Cloud (``<host>.ghe.com``)
+    exchanges on ``api.<host>``; a self-hosted Enterprise Server exchanges under ``/api/v3`` (#39).
+    Callers fall back to the raw token if the exchange fails, so a host without that route degrades
+    exactly as before rather than breaking the turn.
     """
     # get_secret, not os.environ: the host lives in the profile's .env next to the token, and one
     # gateway process serves many profiles.
@@ -189,7 +198,12 @@ def _token_exchange_url() -> str:
         return _TOKEN_EXCHANGE_URL
     if host.startswith(("https://", "http://")):
         host = host.split("://", 1)[1]
-    return f"https://api.{host}/copilot_internal/v2/token"
+    host = host.rstrip("/")
+    if host.lower().endswith(".ghe.com"):
+        # GHE Cloud: the exchange lives on api.<enterprise>.ghe.com (#41).
+        return f"https://api.{host}/copilot_internal/v2/token"
+    # Self-hosted GHE Server exposes the same route under /api/v3 on its own host (#39).
+    return f"https://{host}/api/v3/copilot_internal/v2/token"
 
 _EDITOR_VERSION = "vscode/1.104.1"
 _GITHUB_API_VERSION = "2026-08-01"
