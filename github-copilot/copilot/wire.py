@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from agent.secret_scope import get_secret
+
 from .helpers import base_url_host_matches, base_url_hostname
 
 # Copilot's own API host family (individual, business and enterprise subdomains).
@@ -27,6 +29,11 @@ def is_copilot_host(base_url: str) -> bool:
     # GHEC Copilot is served from copilot-api.<enterprise>.ghe.com, not a *.githubcopilot.com
     # host (#41). Recognise it so the required Editor-Version / integration headers are sent.
     if host.startswith("copilot-api.") and host.endswith(".ghe.com"):
+        return True
+    # Self-hosted GHE Server serves Copilot from copilot-api.<configured host> (#39).
+    configured = (get_secret("COPILOT_GH_HOST") or "").strip().strip("/").lower()
+    configured = configured.split("://", 1)[-1]
+    if configured and configured != "github.com" and host == f"copilot-api.{configured}":
         return True
     return base_url_host_matches(str(base_url or ""), _COPILOT_HOST)
 
