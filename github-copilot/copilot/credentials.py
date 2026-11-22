@@ -168,8 +168,12 @@ def copilot_device_code_login(
     return None
 
 
-# In-process cache: raw_token_fingerprint -> (api_token, expires_at_epoch, base_url).
+# In-process cache: _token_fingerprint(raw_token) -> (api_token, expires_at_epoch, base_url).
 _jwt_cache: dict[str, tuple[str, float, Optional[str]]] = {}
+# Most recent exchange result keyed by minted api_token -> (expires_at_epoch, base_url), so
+# runtime_base_url() and fetch_github_model_catalog() resolve that token's exact endpoint (including
+# an explicit None for individual accounts) without re-exchanging or borrowing another account's URL.
+_token_base_url_cache: dict[str, tuple[float, Optional[str]]] = {}
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 # Exchange endpoint and headers (matching VS Code / Copilot CLI)
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
@@ -224,6 +228,9 @@ def _prune_exchange_caches() -> None:
     for fp, entry in list(_jwt_cache.items()):
         if not isinstance(entry, tuple) or len(entry) < 2 or now >= float(entry[1] or 0):
             _jwt_cache.pop(fp, None)
+    for tok, entry in list(_token_base_url_cache.items()):
+        if not isinstance(entry, tuple) or len(entry) < 2 or now >= float(entry[0] or 0):
+            _token_base_url_cache.pop(tok, None)
     for fp, deadline in list(_exchange_failure_cache.items()):
         if now >= float(deadline or 0):
             _exchange_failure_cache.pop(fp, None)
@@ -257,7 +264,22 @@ _EXCHANGE_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404})
 
 def _token_fingerprint(raw_token: str) -> str:
     """Short fingerprint of a raw token for cache keying (avoids storing full token)."""
-    return hashlib.sha256(raw_token.encode()).hexdigest()[:16]
+    host = (get_secret("COPILOT_GH_HOST") or "").strip().lower().rstrip("/")
+    if host.startswith(("https://", "http://")):
+        host = host.split("://", 1)[1]
+    scoped = raw_token if not host or host == "github.com" else f"{host}\0{raw_token}"
+    return hashlib.sha256(scoped.encode()).hexdigest()[:16]
+
+
+def _record_token_base_url(api_token: str, expires_at: float, base_url: Optional[str]) -> None:
+    cleaned = str(api_token or "").strip()
+    if not cleaned:
+        return
+    if len(_token_base_url_cache) >= _EXCHANGE_CACHE_MAX_ENTRIES:
+        _prune_exchange_caches()
+        if len(_token_base_url_cache) >= _EXCHANGE_CACHE_MAX_ENTRIES:
+            _token_base_url_cache.pop(next(iter(_token_base_url_cache)), None)
+    _token_base_url_cache[cleaned] = (expires_at, base_url)
 
 
 def _read_jwt_store(path: Path) -> Optional[dict]:
@@ -304,7 +326,12 @@ def evict_cached_exchanged_token(raw_token: str) -> None:
     if not raw_token:
         return
     fp = _token_fingerprint(raw_token)
-    _jwt_cache.pop(fp, None)
+    evicted = _jwt_cache.pop(fp, None)
+    if evicted and evicted[0]:
+        _token_base_url_cache.pop(evicted[0], None)
+    disk_entry = _load_jwt_from_disk(fp)
+    if disk_entry and disk_entry[0]:
+        _token_base_url_cache.pop(disk_entry[0], None)
     # Eviction = "force a fresh exchange": the negative-cache entry must go too.
     _exchange_failure_cache.pop(fp, None)
     _evict_persisted_jwt(fp)
@@ -458,6 +485,7 @@ def _exchange_copilot_token_locked(
         cached = lookup(fp)
         if _cache_entry_fresh(cached):
             _jwt_cache[fp] = cached
+            _record_token_base_url(cached[0], cached[1], cached[2])
             return cached
     # Negative cache: fail fast so provider discovery / picker opens don't block.
     _fail_until = _exchange_failure_cache.get(fp, 0.0)
@@ -476,13 +504,27 @@ def _exchange_copilot_token_locked(
     # ``endpoints.api`` is authoritative (Copilot Enterprise / proxied accounts); else derive from
     # the token's ``proxy-ep``. Individual accounts have neither → None (registry default).
     endpoints = data.get("endpoints")
-    base_url: Optional[str] = (
-        str(endpoints.get("api") or "").strip().rstrip("/") if isinstance(endpoints, dict) else ""
-    ) or _derive_base_url_from_proxy_ep(api_token)
+    raw_ep = str(endpoints.get("api") or "").strip().rstrip("/") if isinstance(endpoints, dict) else ""
+    base_url: Optional[str] = _trusted_copilot_api_base_url(raw_ep) or _derive_base_url_from_proxy_ep(api_token)
     _jwt_cache[fp] = (api_token, expires_at, base_url)
+    _record_token_base_url(api_token, expires_at, base_url)
     _save_jwt_to_disk(fp, api_token, expires_at, base_url)
     logger.debug("Copilot token exchanged, expires_at=%s, base_url=%s", expires_at, base_url)
     return api_token, expires_at, base_url
+
+
+def _trusted_copilot_api_base_url(url: Optional[str]) -> Optional[str]:
+    """Return normalized ``https://...`` Copilot API base URL when *url* targets a trusted Copilot
+    API host (``*.githubcopilot.com`` or ``copilot-api.<tenant>.ghe.com``), else None."""
+    from .wire import is_copilot_host
+
+    cleaned = str(url or "").strip().rstrip("/")
+    if not cleaned:
+        return None
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    return cleaned if is_copilot_host(cleaned) else None
 
 
 def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
@@ -492,7 +534,47 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
         return None
     proxy_ep = re.sub(r"^https?://", "", m.group(1), count=1).rstrip("/")
     proxy_ep = re.sub(r"^proxy\.", "api.", proxy_ep, count=1)
-    return f"https://{proxy_ep}"
+    return _trusted_copilot_api_base_url(f"https://{proxy_ep}")
+
+
+def _exchange_record_for_token(token: Optional[str]) -> tuple[bool, Optional[str]]:
+    """``(found, base_url)`` for an exchanged *token* from fresh in-process or persisted state."""
+    cleaned = str(token or "").strip()
+    if not cleaned:
+        return False, None
+    now = time.time()
+    for entry in list(_jwt_cache.values()):
+        if _cache_entry_fresh(entry) and entry[0] == cleaned:
+            return True, _trusted_copilot_api_base_url(entry[2])
+    memo = _token_base_url_cache.get(cleaned)
+    if memo is not None and now < float(memo[0] or 0) - _JWT_REFRESH_MARGIN_SECONDS:
+        return True, _trusted_copilot_api_base_url(memo[1])
+
+    def _from_disk(_path, store):
+        disk_now = time.time()
+        for entry in (store or {}).values():
+            if not isinstance(entry, dict) or entry.get("api_token") != cleaned:
+                continue
+            if float(entry.get("expires_at", 0) or 0) <= disk_now + _JWT_REFRESH_MARGIN_SECONDS:
+                continue
+            return True, _trusted_copilot_api_base_url(entry.get("base_url"))
+        return None
+
+    disk_hit = _with_jwt_store("lookup base_url for", _from_disk)
+    if disk_hit is not None:
+        return disk_hit
+    derived = _derive_base_url_from_proxy_ep(cleaned)
+    return (True, derived) if derived else (False, None)
+
+
+def exchanged_base_url_for_token(token: Optional[str]) -> Optional[str]:
+    """Account-specific Copilot API base URL recorded for an exchanged *token*, or None.
+
+    Matches *token* against fresh in-process / persisted exchange entries first (which carry
+    authoritative ``endpoints.api`` hosts such as ``https://api.enterprise.githubcopilot.com`` or
+    ``https://copilot-api.<tenant>.ghe.com``), then falls back to any embedded ``proxy-ep`` field.
+    """
+    return _exchange_record_for_token(token)[1]
 
 
 def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
@@ -643,6 +725,8 @@ def _revalidate_in_memory_token() -> Optional[tuple[str, Optional[str]]]:
     fp = _token_fingerprint(raw_token)
     failed = _jwt_cache.pop(fp, None) or _load_jwt_from_disk(fp)
     if failed:
+        if failed[0]:
+            _token_base_url_cache.pop(failed[0], None)
         _evict_persisted_jwt(fp, only_token=failed[0])
     api_token, _expires_at, base_url = exchange_copilot_token(raw_token)
     return api_token, base_url
@@ -686,7 +770,9 @@ class CopilotCredentialsMixin:
                 return token, source  # a pool row already holding an exchanged token
             if not github_calls_allowed():
                 return token, source
-            api_token, _base_url = get_copilot_api_token(token)
+            api_token, base_url = get_copilot_api_token(token)
+            if api_token:
+                _record_token_base_url(api_token, time.time() + 1800, base_url)
             return api_token, source
         except Exception:  # health: allow BLE001 S110 -- moved verbatim from core (hermes_cli/copilot_auth.py, credential_pool, client_lifecycle, auth.py)
             pass
@@ -697,12 +783,23 @@ class CopilotCredentialsMixin:
         authoritative for Enterprise / proxied accounts; falls back to the registry default."""
         from .activation import github_calls_allowed
 
+        if env_url:
+            return env_url.rstrip("/")
+        cleaned_key = str(api_key or "").strip()
+        found, exchanged_base = _exchange_record_for_token(cleaned_key)
+        if found:
+            return exchanged_base or default
         base_url = env_url.rstrip("/") if env_url else default
         try:
             raw_token, _ = resolve_copilot_token()
-            if raw_token and github_calls_allowed():
-                resolved = (get_copilot_api_token(raw_token)[1] or "").strip()
-                if resolved:
+            if not raw_token:
+                raw_token, _ = _pool_token()
+            if raw_token and validate_copilot_token(raw_token)[0] and github_calls_allowed():
+                exchanged_key, resolved_url = get_copilot_api_token(raw_token)
+                if exchanged_key:
+                    _record_token_base_url(exchanged_key, time.time() + 1800, resolved_url)
+                resolved = (_trusted_copilot_api_base_url(resolved_url) or "")
+                if resolved and (not cleaned_key or cleaned_key in (raw_token, exchanged_key)):
                     base_url = resolved
         except Exception as exc:  # health: allow BLE001 -- moved verbatim from core (hermes_cli/copilot_auth.py, credential_pool, client_lifecycle, auth.py)
             logger.debug("Copilot base URL resolution fell back to default: %s", exc)
@@ -713,16 +810,23 @@ class CopilotCredentialsMixin:
         copilot is merely discovered (ambient gh login, not in config). Here copilot IS the runtime
         target, and a raw token routes to the language-server integrator whose allowlist omits
         enterprise-only models (400 model_not_available_for_integrator)."""
+        env_override = (get_secret("COPILOT_API_BASE_URL") or "").strip().rstrip("/")
         if not api_key or not validate_copilot_token(api_key)[0]:
+            if env_override:
+                entry.base_url = env_override
             return api_key  # already an exchanged API token
         api_token, enterprise_base_url = get_copilot_api_token(api_key)
+        if api_token:
+            _record_token_base_url(api_token, time.time() + 1800, enterprise_base_url)
         if api_token == api_key and not enterprise_base_url:
             if not _is_fine_grained_pat(api_key):
                 _warn_raw_degradation_once(api_key)
+            if env_override:
+                entry.base_url = env_override
             return api_key
         entry.access_token = api_token
-        if enterprise_base_url:
-            entry.base_url = enterprise_base_url
+        if env_override or enterprise_base_url:
+            entry.base_url = env_override or enterprise_base_url
         return api_token
 
     def seed_pool_credentials(self, *, suppressed_sources: frozenset,
