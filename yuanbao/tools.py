@@ -17,7 +17,6 @@ import functools
 import logging
 from contextlib import suppress
 from pathlib import Path
-from typing import Tuple
 
 from tools.registry import tool_result
 
@@ -249,9 +248,11 @@ async def send_dm(args) -> dict:
     chat_id = f"direct:{resolved_user_id}"
     last_result = None
     errors: list[str] = []
+    text_failed = False
     if message and message.strip():
         last_result = await adapter.send_dm(resolved_user_id, message, group_code=group_code)
         if not last_result.success:
+            text_failed = True
             errors.append(last_result.error or "text send failed")
 
     for media_path, _is_voice in media_files:
@@ -262,7 +263,9 @@ async def send_dm(args) -> dict:
 
     if last_result is None:
         raise _YbError("No deliverable text or media remained")
-    if errors and not last_result.success:
+    # A later media success must not turn a failed primary text into a reported success:
+    # otherwise the agent believes a customer-facing DM was delivered when it was not.
+    if text_failed or (errors and not last_result.success):
         raise _YbError("; ".join(errors))
 
     note = f'DM sent to "{resolved_nickname}" successfully.'
