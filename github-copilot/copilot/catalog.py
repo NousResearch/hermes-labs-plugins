@@ -261,8 +261,10 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
     from .credentials import _token_fingerprint
 
     key_fp = _token_fingerprint(api_key) if api_key else None
+    # Monotonic, like the catalog cache above: an NTP correction or suspend/resume must not
+    # make a stale per-account window look fresh (clock back) or refetch on every call (clock forward).
     if (_copilot_context_cache and _copilot_context_cache_key == key_fp
-            and (time.time() - _copilot_context_cache_time < _COPILOT_CONTEXT_CACHE_TTL)):
+            and (time.monotonic() - _copilot_context_cache_time < _COPILOT_CONTEXT_CACHE_TTL)):
         return _copilot_context_cache.get(model_id)
 
     catalog = fetch_github_model_catalog(api_key=api_key)
@@ -278,7 +280,7 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
         if mid and isinstance(window, int) and window > 0:
             cache[mid] = window
     _copilot_context_cache = cache
-    _copilot_context_cache_time = time.time()
+    _copilot_context_cache_time = time.monotonic()
     _copilot_context_cache_key = key_fp
     return cache.get(model_id)
 
