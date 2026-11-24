@@ -63,7 +63,7 @@ def test_secondary_profile_child_uses_its_own_key_not_defaults(two_profiles):
     assert env["BRV_API_KEY"] == "PROFILE-B-KEY"
     assert env["HERMES_HOME"] == str(prof_b)
     assert "HERMES_MODEL" not in env  # launch profile's .env residue is stripped too
-    assert env["PATH"].startswith("/opt/brv/bin")
+    assert env["PATH"].startswith(str(Path("/opt/brv/bin/brv").parent))  # "\\opt\\brv\\bin" on Windows
 
 
 def test_secondary_without_key_gets_no_key_never_defaults(two_profiles):
