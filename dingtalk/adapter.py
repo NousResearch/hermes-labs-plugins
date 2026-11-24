@@ -1,5 +1,5 @@
-"""DingTalk platform adapter (Stream Mode via dingtalk-stream >=0.20; replies via session webhook markdown or AI Cards).
-Requires ``pip install "dingtalk-stream>=0.20" httpx``. config.yaml ``platforms.dingtalk``: ``enabled``, group gating
+"""DingTalk platform adapter (Stream Mode via dingtalk-stream; replies via session webhook markdown or AI Cards).
+The SDKs install with the plugin (its ``pyproject.toml``). config.yaml ``platforms.dingtalk``: ``enabled``, group gating
 (``require_mention``, ``free_response_chats``, ``mention_patterns``, ``allowed_users``/``allowed_chats``) and
 ``extra.client_id`` / ``extra.client_secret`` (or DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET)."""
 
@@ -10,8 +10,8 @@ import re
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone, UTC
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, UTC
+from typing import Any, Optional
 
 # Optional SDKs: catch broad Exception, not just ImportError — their transitive cryptography
 # dependency can raise AttributeError on version skew; a broken optional SDK must degrade gracefully.
@@ -48,18 +48,22 @@ except Exception:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
-from agent.i18n import t
 from gateway.platforms.base import BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction
 from gateway.platforms.event import MessageEvent
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret, send_error
 )
-from gateway.platforms.send_targets import StandaloneSendPolicy
-from plugins.platforms.dingtalk.inbound import collect_download_codes, extract_media, extract_text
+
+from ._i18n import t
+from .inbound import collect_download_codes, extract_media, extract_text
 
 
 logger = logging.getLogger(__name__)
+
+# ``Platform("dingtalk")`` resolves only once the registry knows the platform (the plugin registers it),
+# so the member is looked up at call time, never at import.
+PLATFORM_NAME = "dingtalk"
 
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
@@ -150,10 +154,10 @@ def dingtalk_deps_present() -> bool:
 
 
 def ensure_dingtalk_deps() -> bool:
-    """ACTIVE deps-only installer (registry ``ensure_deps_fn``); rebinds module globals. Deliberately does NOT
+    """ACTIVE deps-only check (registry ``ensure_deps_fn``); rebinds module globals. Deliberately does NOT
     check credentials: an ``extra``-configured platform would otherwise be vetoed before ever installing (deadlock).
 
-    Lazy-installs dingtalk-stream/httpx and rebinds module globals. Deliberately does NOT check credentials
+    Re-imports dingtalk-stream/httpx (installed with the plugin) and rebinds module globals. Deliberately does NOT check credentials
     — ``ensure_deps_fn``'s contract is deps-only ("Returns True once deps are importable"); credentials are
     gated by ``is_connected``/``validate_config``. Otherwise a platform configured via
     ``PlatformConfig.extra`` (which ``_is_connected`` accepts) would pass enablement, reach
@@ -163,10 +167,9 @@ def ensure_dingtalk_deps() -> bool:
     global DINGTALK_STREAM_AVAILABLE, dingtalk_stream, ChatbotMessage, CallbackMessage, AckMessage, HTTPX_AVAILABLE, httpx
     if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
         return True
-    try:
-        from pm.extras import ensure_import
-        ensure_import("dingtalk")
-        import dingtalk_stream as _ds, httpx as _httpx
+    try:  # the SDKs come with the plugin's own dependencies; a missing one stays missing
+        import dingtalk_stream as _ds
+        import httpx as _httpx
         from dingtalk_stream import ChatbotMessage as _CM
         from dingtalk_stream.frames import CallbackMessage as _CBM, AckMessage as _AM
     except Exception:
@@ -186,7 +189,7 @@ def _credentials(extra: Optional[dict]) -> tuple:
 
 
 def check_dingtalk_requirements() -> bool:
-    """Combined deps (lazy-installed) + credentials check for setup/status callers."""
+    """Combined deps + credentials check for setup/status callers."""
     return ensure_dingtalk_deps() and all(_credentials(None))
 
 
@@ -204,7 +207,7 @@ class DingTalkAdapter(BasePlatformAdapter):
     REQUIRES_EDIT_FINALIZE = SUPPORTS_MESSAGE_EDITING  # AI Cards need an explicit ``finalize=True`` edit to close the streaming indicator
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform.DINGTALK)
+        super().__init__(config, Platform(PLATFORM_NAME))
         extra = config.extra or {}
         self._client_id, self._client_secret = _credentials(extra)
         # Group-chat gating; mention state is the SDK's structured ``is_in_at_list``, not text parsing.
@@ -224,8 +227,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to DingTalk via Stream Mode."""
-        for ok, problem in ((DINGTALK_STREAM_AVAILABLE, "dingtalk-stream not installed. Run: pip install 'dingtalk-stream>=0.20'"),
-                            (HTTPX_AVAILABLE, "httpx not installed. Run: pip install httpx"),
+        for ok, problem in ((DINGTALK_STREAM_AVAILABLE, "dingtalk-stream not installed. Reinstall the plugin: hermes plugins update dingtalk"),
+                            (HTTPX_AVAILABLE, "httpx not installed (a Hermes core dependency)"),
                             (self._client_id and self._client_secret, "DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required")):
             if not ok:
                 logger.warning("[%s] " + problem, self.name)
@@ -326,8 +329,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not _is_sdk_incompat(exc) or getattr(self, "_fatal_error_code", None) == "dingtalk_stream_error":
             return
         msg = (f"dingtalk-stream cannot open its websocket with the installed websockets package ({exc}). "
-               "Hermes pins dingtalk-stream==0.24.3 with websockets==15.0.1; reinstall the dingtalk extra "
-               "so those versions are used (e.g. `pip install 'hermes-agent[dingtalk]'`).")
+               "The dingtalk plugin pins dingtalk-stream==0.24.3 with websockets==15.0.1; reinstall the plugin "
+               "so those versions are used (`hermes plugins update dingtalk`, or uninstall and "
+               "`hermes plugins install dingtalk`).")
         logger.error("[%s] %s", self.name, msg)
         # Not retryable: only a reinstall + restart fixes it, and connect() returns True before the
         # socket exists, so a gateway reconnect would re-fail every watcher tick forever.
@@ -768,11 +772,17 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
             return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
         return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
     except Exception as e:  # httpx reads HTTPS_PROXY itself: the text may echo it
-        try:  # send_message_tool._error redacts access_token from webhook URLs (lazy import avoids a circular)
-            from gateway.outbound.send import _error as _redact_error
-            return _redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
-        except Exception:
-            return send_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
+        # The webhook URL carries the robot's access_token; the error text may echo it.
+        return send_error(_redact_access_token(
+            f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}"))
+
+
+_ACCESS_TOKEN_RE = re.compile(r"(access_token)\s*=\s*[^&#\s,;]+", re.IGNORECASE)
+
+
+def _redact_access_token(text: str) -> str:
+    """``access_token=<value>`` -> ``access_token=***`` (the robot webhook's credential)."""
+    return _ACCESS_TOKEN_RE.sub(r"\1=***", text)
 
 
 def interactive_setup() -> None:
@@ -780,15 +790,15 @@ def interactive_setup() -> None:
     from hermes_cli.config import save_env_value
     from hermes_cli.setup import prompt_choice
     from hermes_cli.cli_output import prompt, print_header, print_success, print_warning
-    from hermes_cli.setup_platforms import declines_reconfigure
+    from hermes_cli.gateway_setup_wizard import confirm_reconfigure
     print_header("DingTalk")
-    if declines_reconfigure("DingTalk", "Reconfigure DingTalk?", "DINGTALK_CLIENT_ID"):
+    if not confirm_reconfigure("DingTalk", "DINGTALK_CLIENT_ID"):
         return
     choices = ["QR Code Scan (Recommended, auto-obtain Client ID and Client Secret)", "Manual Input (Client ID and Client Secret)"]
     result = None
     if prompt_choice("Choose setup method", choices, default=0) == 0:
         try:
-            from hermes_cli.dingtalk_auth import dingtalk_qr_auth
+            from .dingtalk_auth import dingtalk_qr_auth
             result = dingtalk_qr_auth()
             if result is None:
                 print_warning("QR auth incomplete, falling back to manual input.")
@@ -840,27 +850,6 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
     return _apply_yaml_bridge(cfg, _YAML_BRIDGE)
 
 
-
 def _is_connected(config) -> bool:
     """Connected when client_id + client_secret are present (PlatformConfig.extra first, then env)."""
     return all(_credentials(getattr(config, "extra", {})))
-
-
-
-def register(ctx) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
-    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
-    ctx.register_platform(
-        standalone_send=StandaloneSendPolicy(text_direct=True),
-        name="dingtalk", label="DingTalk", adapter_factory=DingTalkAdapter, check_fn=dingtalk_deps_present,
-        dashboard_description="Connect Hermes to DingTalk groups (钉钉).",
-        docs_url="https://open.dingtalk.com/document/orgapp/the-robot-development-process",
-        dashboard_env_vars=("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
-        ensure_deps_fn=ensure_dingtalk_deps, is_connected=_is_connected, validate_config=_is_connected,
-        required_env=["DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"], install_hint="pip install 'dingtalk-stream>=0.20' httpx",
-        setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, cron_deliver_env_var="DINGTALK_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send, emoji="🐳", allow_update_command=True,
-        display_tier="low",
-        env_overrides=gateway_env.ENV_OVERRIDES,
-        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
-    )

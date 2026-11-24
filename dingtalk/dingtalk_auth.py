@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import sys
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
 import requests
 
@@ -100,16 +99,12 @@ def wait_for_registration_success(
 
 
 def _ensure_qrcode_installed() -> bool:
-    """Enable DingTalk dependencies; only render QR codes importable in this process."""
-    with contextlib.suppress(ImportError):
-        import qrcode
-        return True
-    import pm
-    with contextlib.suppress(pm.InstallError, OSError, ValueError):
-        pm.sync_venv(["dingtalk"], explicit=True)
-    # PM selects a new generation for the next launch, never this process.
-    # The authorization link works without qrcode, so no restart is required here.
-    return False
+    """True when ``qrcode`` (a plugin dependency) is importable; the authorization link works without it."""
+    try:
+        import qrcode  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def render_qr_to_terminal(url: str) -> bool:
@@ -133,7 +128,7 @@ def render_qr_to_terminal(url: str) -> bool:
 
 def dingtalk_qr_auth() -> Optional[tuple[str, str]]:
     """Run the interactive QR-code device-flow authorization (setup wizard entry point)."""
-    from hermes_cli.setup import print_info, print_success, print_warning, print_error
+    from hermes_cli.cli_output import print_error, print_info, print_success, print_warning
     print()
     print_info("  Initializing DingTalk device authorization...")
     print_info("  Note: the scan page is branded 'OpenClaw' — DingTalk's")

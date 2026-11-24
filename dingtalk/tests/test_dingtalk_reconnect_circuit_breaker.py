@@ -9,10 +9,10 @@ import pytest
 
 def _adapter():
     from gateway.config import Platform
-    from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+    from dingtalk_plugin.adapter import DingTalkAdapter
 
     adapter = DingTalkAdapter.__new__(DingTalkAdapter)
-    adapter.platform = Platform.DINGTALK
+    adapter.platform = Platform("dingtalk")
     adapter._running = True
     adapter._stream_client = MagicMock()
     adapter._stream_task = None
@@ -49,7 +49,7 @@ async def test_repeated_identical_error_trips_breaker_and_stays_silent(caplog):
 @pytest.mark.asyncio
 async def test_real_sdk_start_with_issue_type_error_is_bounded_and_fatal(caplog):
     dingtalk_stream = pytest.importorskip("dingtalk_stream")
-    import websockets.exceptions
+    import websockets.exceptions  # noqa: F401 -- loaded so the SDK's except clause resolves it (#24851)
 
     adapter = _adapter()
     client = dingtalk_stream.DingTalkStreamClient(dingtalk_stream.Credential("id", "secret"))

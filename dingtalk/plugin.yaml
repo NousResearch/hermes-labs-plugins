@@ -1,14 +1,16 @@
-name: dingtalk-platform
+name: dingtalk
 label: DingTalk
 kind: platform
-version: 1.0.0
+version: 2.0.0
 description: >
-  DingTalk gateway adapter for Hermes Agent.
-  Connects to DingTalk via the dingtalk-stream SDK (Stream Mode) and relays
-  messages between DingTalk chats and the Hermes agent. Supports text, images,
-  audio, video, rich text, files, group @mention gating, free-response chats,
-  and per-user allowlists.
+  DingTalk (钉钉) gateway adapter for Hermes Agent (Hermes Labs plugin: built by
+  Nous Research, not supported). Connects to DingTalk via the dingtalk-stream SDK
+  (Stream Mode) and relays messages between DingTalk chats and the Hermes agent.
+  Supports text, images, audio, video, rich text, files, AI Cards streaming,
+  group @mention gating, free-response chats, per-user/per-chat allowlists, QR-code
+  app setup and cron delivery through a robot webhook. Formerly built into Hermes core.
 author: NousResearch
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/dingtalk
 requires_env:
   - name: DINGTALK_CLIENT_ID
     description: "DingTalk app key (Client ID)"
@@ -28,6 +30,26 @@ optional_env:
   - name: DINGTALK_ALLOWED_USERS
     description: "Comma-separated staff/sender IDs allowed to talk to the bot (* = any)"
     prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: DINGTALK_ALLOW_ALL_USERS
+    description: "Allow any DingTalk user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: DINGTALK_REQUIRE_MENTION
+    description: "Require an @mention before the bot answers in group chats"
+    prompt: "Require @mention in groups? (true/false)"
+    password: false
+  - name: DINGTALK_MENTION_PATTERNS
+    description: "JSON list (or comma-separated) regexes that also count as a mention"
+    prompt: "Mention patterns"
+    password: false
+  - name: DINGTALK_FREE_RESPONSE_CHATS
+    description: "Comma-separated conversation IDs where the bot answers without an @mention"
+    prompt: "Free-response chats (comma-separated)"
+    password: false
+  - name: DINGTALK_ALLOWED_CHATS
+    description: "Comma-separated conversation IDs the bot listens in (empty = all)"
+    prompt: "Allowed chats (comma-separated)"
     password: false
   - name: DINGTALK_HOME_CHANNEL
     description: "Default conversation ID for cron / notification delivery"
