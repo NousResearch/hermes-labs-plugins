@@ -4,11 +4,9 @@ import sqlite3
 from unittest.mock import MagicMock
 
 import agent.file_safety as fs
-
 import pytest
-
-from plugins.memory import retaindb
-from plugins.memory.retaindb import RetainDBMemoryProvider
+import retaindb_plugin as retaindb
+from retaindb_plugin import RetainDBMemoryProvider
 
 
 def test_write_queue_closes_owner_connection(tmp_path):
@@ -96,8 +94,7 @@ def test_upload_file_allows_regular_file(tmp_path):
 def _capture_initialized_client(monkeypatch, tmp_path):
     """Patch _Client/_WriteQueue/get_hermes_home; return a dict capturing args."""
     import hermes_constants
-
-    import plugins.memory.retaindb as retaindb_module
+    import retaindb_plugin as retaindb_module
 
     captured: dict = {}
 

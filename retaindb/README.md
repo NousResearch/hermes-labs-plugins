@@ -1,4 +1,19 @@
+<p align="center"><img src="../assets/retaindb.jpg" alt="RetainDB, a Hermes Labs plugin" width="100%"></p>
+
 # RetainDB Memory Provider
+
+> **Labs plugin: works, but unsupported.** RetainDB is now a Hermes Labs plugin: built by Nous Research, not supported, and likely not maintained going forward. Fixes from the community are welcome. See [what "labs" means](../README.md#what-labs-means).
+
+Part of [Hermes Labs Plugins](../README.md): built by Nous Research, **not supported**. Formerly built into
+[hermes-agent](https://github.com/NousResearch/hermes-agent) core (`plugins/memory/retaindb`); this directory carries its full history.
+Profiles that had `memory.provider: retaindb` get this plugin installed automatically by `hermes update` or the next agent start.
+
+## Install
+
+```bash
+hermes plugins install retaindb
+hermes config set memory.provider retaindb
+```
 
 Cloud memory API with hybrid search (Vector + BM25 + Reranking) and 7 memory types.
 

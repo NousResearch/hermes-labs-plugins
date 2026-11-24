@@ -1,6 +1,13 @@
 name: retaindb
-version: 1.0.0
-description: "RetainDB — cloud memory API with hybrid search and 7 memory types."
+label: RetainDB
+version: 2.0.0
+description: >
+  RetainDB memory provider for Hermes Agent (Hermes Labs plugin: built by Nous Research,
+  not supported): a cloud memory API with hybrid search (vector + BM25 + reranking) over
+  seven memory types, a stable user profile, remember/forget tools and a shared file store.
+  Needs a RetainDB account (RETAINDB_API_KEY). Formerly built into Hermes core.
+author: NousResearch
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/retaindb
 requires_env:
   - RETAINDB_API_KEY
 config_keys:
