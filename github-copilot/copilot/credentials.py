@@ -209,12 +209,32 @@ _JWT_DISK_MAX_BYTES = 1_048_576  # 1 MiB cap on the persisted JWT store read
 _exchange_failure_cache: dict[str, float] = {}
 # Single-flight per fingerprint: concurrent callers (dashboard polls every few seconds) wait on
 # the ONE in-flight exchange instead of each spawning a hung resolver thread during a DNS outage.
-_exchange_locks: dict[str, threading.Lock] = {}
+
+
+class _ExchangeLease:
+    """A per-fingerprint exchange lock plus a count of outstanding handouts.
+
+    #107: the table entry used to be pruned whenever it was merely unlocked — but a caller
+    that has just been handed the lock has not acquired it yet, and a waiter queued behind
+    the holder has not acquired it at all. Evicting the entry in that window let the next
+    lookup mint a second lock for the same token, so two exchanges could run concurrently
+    (single-flight broken, redundant token burns). ``refs`` counts handouts; pruning keeps
+    an entry while ``refs`` or the underlying lock says it is in use.
+    """
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refs = 0
+
+
+_exchange_locks: dict[str, _ExchangeLease] = {}
 _exchange_locks_guard = threading.Lock()
 
 # Bound the three per-token tables (#51). A rotated-away token's fingerprint is never presented
 # again, so its entries would otherwise live for the process lifetime: the JWT (including the
-# exchanged credential), a negative-cache deadline, and a Lock. The TTLs bound reuse, not
+# exchanged credential), a negative-cache deadline, and the lock lease. The TTLs bound reuse, not
 # lifetime. Prune on write, which is the only path that can grow a table.
 _EXCHANGE_CACHE_MAX_ENTRIES = 64
 
@@ -231,22 +251,49 @@ def _prune_exchange_caches() -> None:
         if len(_exchange_locks) <= _EXCHANGE_CACHE_MAX_ENTRIES:
             return
         keep = set(_jwt_cache) | set(_exchange_failure_cache)
-        for fp, lock in list(_exchange_locks.items()):
+        for fp, lease in list(_exchange_locks.items()):
             if len(_exchange_locks) <= _EXCHANGE_CACHE_MAX_ENTRIES:
                 break
-            # A held lock is an exchange in flight: dropping it would let the next caller start a
-            # second, concurrent exchange for the same token (single-flight broken).
-            if fp not in keep and not lock.locked():
+            # A held lock is an exchange in flight; an outstanding handout is a caller between
+            # lookup and acquire or queued behind the holder (#107). Dropping either would let
+            # the next caller start a second, concurrent exchange for the same token
+            # (single-flight broken).
+            if fp not in keep and not lease.lock.locked() and lease.refs <= 0:
                 _exchange_locks.pop(fp, None)
 
 
-def _exchange_lock_for(fp: str) -> threading.Lock:
+def _exchange_lock_for(fp: str) -> _ExchangeLease:
     _prune_exchange_caches()
     with _exchange_locks_guard:
-        lock = _exchange_locks.get(fp)
-        if lock is None:
-            lock = _exchange_locks[fp] = threading.Lock()
-        return lock
+        lease = _exchange_locks.get(fp)
+        if lease is None:
+            lease = _exchange_locks[fp] = _ExchangeLease()
+        # Count the handout: while the caller holds this object — between lookup and acquire,
+        # or queued behind the holder — the table entry must survive pruning (#107). Paired
+        # with ``_release_exchange_lock`` by ``_exchange_lock_lease``.
+        lease.refs += 1
+        return lease
+
+
+def _release_exchange_lock(lease: _ExchangeLease) -> None:
+    with _exchange_locks_guard:
+        lease.refs -= 1
+
+
+@contextlib.contextmanager
+def _exchange_lock_lease(fp: str):
+    """Acquire the fingerprint's exchange lock, keeping its table entry alive throughout.
+
+    The single-flight lock must be looked up, handed out and eventually released as one
+    unit: the handout registered by ``_exchange_lock_for`` pins the entry until the
+    acquisition has finished and the caller is done (#107).
+    """
+    lease = _exchange_lock_for(fp)
+    try:
+        with lease.lock:
+            yield lease
+    finally:
+        _release_exchange_lock(lease)
 
 
 _EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS = 60.0     # network blips: retry soon
@@ -445,7 +492,7 @@ def exchange_copilot_token(
                          f"for another {int(_fail_until - time.time())}s")
     # Note: a waiter's own ``timeout`` is not honoured across the lock wait — by design of
     # single-flight, it observes the holder's outcome instead.
-    with _exchange_lock_for(fp):
+    with _exchange_lock_lease(fp):
         return _exchange_copilot_token_locked(raw_token, fp, timeout=timeout)
 
 
