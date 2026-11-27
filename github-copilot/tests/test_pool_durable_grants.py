@@ -181,6 +181,34 @@ def test_normal_preparation_keeps_same_account_raw_fallback(monkeypatch, caplog)
     assert "degraded to RAW token" in caplog.text
 
 
+@pytest.mark.parametrize("reason", ["unauthorized", "stale", "auxiliary_unauthorized"])
+def test_forced_renewal_declines_a_fine_grained_pat_before_any_io(hermes_home, monkeypatch, reason):
+    """A fine-grained PAT is the bearer itself and is never exchanged: there is nothing to renew."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+    from providers import get_provider_profile
+
+    pat = "github_pat_fake_fine_grained"
+    row = PooledCredential(id="pat", label="PAT", priority=0, provider="copilot", auth_type="api_key",
+                           source="manual", access_token=pat, base_url="https://api.githubcopilot.com")
+    pool = CredentialPool("copilot", [row])
+    fp = credentials._token_fingerprint(pat)
+    cached = ("tid=sentinel", 4102444800, URL)
+    credentials._jwt_cache[fp] = cached
+    credentials._save_jwt_to_disk(fp, *cached)
+    credentials._exchange_failure_cache[fp] = 4102444800
+    calls = []
+    monkeypatch.setattr(credentials, "_urlopen_bounded", lambda req, timeout: calls.append(req.full_url))
+    monkeypatch.setattr(credentials, "exchange_copilot_token", lambda *a, **k: calls.append("exchange"))
+
+    assert get_provider_profile("copilot").refresh_pool_runtime_credentials(row, reason=reason) is None
+    assert pool.try_refresh_runtime_matching(credential_id="pat", api_key_hint=pat, reason=reason) is None
+    assert calls == []
+    assert credentials._jwt_cache[fp] == cached
+    assert credentials._load_jwt_from_disk(fp) == cached
+    assert credentials._exchange_failure_cache[fp] == 4102444800
+    assert row.access_token == pat and row.runtime_api_key == pat
+
+
 def test_forced_renewal_declines_exchange_that_returns_same_raw_grant(monkeypatch):
     from types import SimpleNamespace
     from providers import get_provider_profile

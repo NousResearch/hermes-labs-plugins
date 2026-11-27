@@ -729,6 +729,8 @@ class CopilotCredentialsMixin:
         raw_token = entry.access_token
         if not isinstance(raw_token, str) or not validate_copilot_token(raw_token)[0]:
             return None
+        if _is_fine_grained_pat(raw_token):
+            return None  # never exchanged by design: the PAT is the bearer, nothing to renew
         try:
             evict_cached_exchanged_token(raw_token)
             api_token, _expires_at, base_url = exchange_copilot_token(raw_token)
