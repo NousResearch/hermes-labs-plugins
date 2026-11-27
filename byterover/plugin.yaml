@@ -1,6 +1,7 @@
 name: byterover
 label: ByteRover
 version: 2.0.0
+requires_hermes: ">=0.22.0"  # oldest tested release: spawn_context_thread, strip_launch_profile_env
 description: >
   ByteRover memory provider for Hermes Agent (Hermes Labs plugin: built by Nous Research,
   not supported): a persistent knowledge tree with tiered retrieval (fuzzy text, then
