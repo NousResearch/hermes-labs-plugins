@@ -62,6 +62,31 @@ def _register() -> bool:
     return True
 
 
+def _opt_into_relay_aware_catalog() -> None:
+    """Keep the picker's live catalog reachable when a Copilot plan host is configured.
+
+    Core skips a provider's ``picker_catalog`` hook whenever ``model.base_url`` differs from
+    the profile URL, unless the provider is in ``_RELAY_AWARE_CATALOG_FETCHERS``. Copilot's
+    per-plan hosts (``api.individual.githubcopilot.com`` and siblings) are first-party
+    endpoints, not user relays, so the old rule would pin the picker to its stale curated
+    list. Opt in from the plugin rather than patching core, which no longer ships Copilot.
+    """
+    try:
+        import hermes_cli.models as models
+        # Core can import this plugin while ``hermes_cli.models`` is still initializing —
+        # the constant is defined later in that module. Read it defensively: a missing
+        # attribute must never fail the whole provider registration.
+        aware = getattr(models, "_RELAY_AWARE_CATALOG_FETCHERS", None)
+        if aware is None:
+            return
+        if "copilot" not in aware:
+            models._RELAY_AWARE_CATALOG_FETCHERS = aware | {"copilot"}
+    except Exception:
+        return
+
+
 # pytest imports this file bare (no parent package) while collecting tests/; registering then
 # would need the relative imports above, and the suite loads the package itself (tests/conftest.py).
 ACTIVE = _register() if __package__ else False
+if ACTIVE:
+    _opt_into_relay_aware_catalog()
