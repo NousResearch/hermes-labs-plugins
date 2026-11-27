@@ -96,6 +96,35 @@ def test_strings_follow_the_profile_language(monkeypatch, lang, thinking):
     assert t("platform.dingtalk.emotion.thinking") == thinking
 
 
+@pytest.mark.parametrize("alias, canonical", [("jp", "ja"), ("deutsch", "de")])
+def test_strings_keep_core_language_aliases(monkeypatch, tmp_path, alias, canonical):
+    from agent.i18n import reset_language_cache
+    from dingtalk_plugin._i18n import t
+
+    # Model the post-removal core: these keys only exist in the plugin's defaults.
+    monkeypatch.setenv("HERMES_BUNDLED_LOCALES", str(tmp_path))
+    reset_language_cache()
+    key = "platform.dingtalk.emotion.thinking"
+    monkeypatch.setenv("HERMES_LANGUAGE", canonical)
+    expected = t(key)
+    monkeypatch.setenv("HERMES_LANGUAGE", alias)
+    assert t(key) == expected
+
+
+def test_strings_keep_profile_locale_overrides(monkeypatch):
+    from agent.i18n import reset_language_cache
+    from dingtalk_plugin._i18n import t
+    from hermes_constants import get_hermes_home
+
+    key = "platform.dingtalk.emotion.thinking"
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    locales = get_hermes_home() / "locales"
+    locales.mkdir()
+    (locales / "en.yaml").write_text(f"{key}: Working on it\n", encoding="utf-8")
+    reset_language_cache()
+    assert t(key) == "Working on it"
+
+
 def test_manifest_name_and_optional_env():
     lines = (_ROOT / "plugin.yaml").read_text(encoding="utf-8").splitlines()
     assert "name: dingtalk" in lines and "kind: platform" in lines

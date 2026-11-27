@@ -1,14 +1,16 @@
 """The adapter's user-facing strings, in every language Hermes core shipped them in.
 
-Core carried these keys in its bundled ``locales/*.yaml`` until DingTalk left core; the plugin keeps the
-same text and the same language choice (``HERMES_LANGUAGE`` from the profile's secrets, else
-``display.language`` from its config.yaml, else English) without importing core's private i18n module.
+Core carried these keys in its bundled ``locales/*.yaml`` until DingTalk left core. The plugin
+keeps those texts as defaults and honors the core catalog's profile-specific translations.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+
+from agent.i18n import resolve_language_id
+from agent.i18n import t as core_t
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +112,7 @@ def _language_setting() -> str:
 def language() -> str:
     """The active profile's language id among the ones this module carries, else ``en``."""
     key = _language_setting().strip().lower().replace("_", "-")
-    key = _ALIASES.get(key, key)
+    key = resolve_language_id(key) or _ALIASES.get(key, key)
     if key in _MESSAGES:
         return key
     base = key.split("-", 1)[0]
@@ -118,8 +120,10 @@ def language() -> str:
 
 
 def t(key: str, **format_kwargs) -> str:
-    """``key`` in the active language (English fallback, then the bare key), ``str.format``-ed."""
-    value = _MESSAGES.get(language(), {}).get(key) or _MESSAGES["en"].get(key, key)
+    """Honor the core catalog before falling back to DingTalk's bundled defaults."""
+    value = core_t(key)
+    if value == key:
+        value = _MESSAGES.get(language(), {}).get(key) or _MESSAGES["en"].get(key, key)
     if not format_kwargs:
         return value
     try:
