@@ -273,9 +273,9 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
         mid = str(item.get("id") or "").strip()
         limits = (item.get("capabilities") or {}).get("limits") or {}
         window = limits.get("max_context_window_tokens")
-        if not (isinstance(window, int) and window > 0):
+        if not (isinstance(window, int) and not isinstance(window, bool) and window > 0):
             window = limits.get("max_prompt_tokens")
-        if mid and isinstance(window, int) and window > 0:
+        if mid and isinstance(window, int) and not isinstance(window, bool) and window > 0:
             cache[mid] = window
     _copilot_context_cache = cache
     _copilot_context_cache_time = time.time()

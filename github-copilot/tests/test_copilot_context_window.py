@@ -42,3 +42,20 @@ def test_no_limits_yields_none(monkeypatch):
     _reset()
     monkeypatch.setattr(cat, "fetch_github_model_catalog", lambda **k: _catalog({}))
     assert cat.get_copilot_model_context("gpt-5.5") is None
+
+
+def test_boolean_window_falls_back(monkeypatch):
+    # bool is a subclass of int, so a bare isinstance check would accept True
+    # as a context window of one token. Both fields must reject booleans.
+    for bad in (True, False):
+        _reset()
+        monkeypatch.setattr(cat, "fetch_github_model_catalog", lambda **k: _catalog(
+            {"max_context_window_tokens": bad, "max_prompt_tokens": 272000}))
+        assert cat.get_copilot_model_context("gpt-5.5") == 272000
+
+
+def test_boolean_prompt_cap_yields_none(monkeypatch):
+    _reset()
+    monkeypatch.setattr(cat, "fetch_github_model_catalog", lambda **k: _catalog(
+        {"max_prompt_tokens": True}))
+    assert cat.get_copilot_model_context("gpt-5.5") is None
