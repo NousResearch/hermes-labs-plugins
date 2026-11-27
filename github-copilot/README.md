@@ -67,8 +67,9 @@ starts `copilot --acp --stdio` per request; point it elsewhere with `HERMES_COPI
 
 Pool rows retain the durable GitHub grant. After a row is selected, its exchanged Copilot bearer
 and account endpoint are transient runtime credentials, never replacements in `auth.json`.
-On a 401 or stale-integrator 400, Hermes renews only the row that supplied the failed request:
-its memory, disk and failure-cache entries are evicted before a fresh exchange of that same grant.
+On a 401 or a stale-credential refusal (400 integrator, bare 403), Hermes renews only the row that
+supplied the failed request: its memory, disk and failure-cache entries are evicted before a fresh
+exchange of that same grant. A fine-grained PAT is never exchanged, so its row is not renewed.
 Failed forced renewal returns no replacement; it never substitutes an ambient account or raw token.
 Normal initial resolution still permits the existing same-account raw-token fallback.
 
@@ -77,6 +78,11 @@ Runtime endpoint changes are restricted to these exact HTTPS origins:
 `https://api.business.githubcopilot.com`, and `https://api.enterprise.githubcopilot.com`.
 Custom relays, alternate ports, path-prefixed URLs and lookalike domains are not authorized account
 endpoint transitions. Catalog source ordering and fallback policy are unchanged.
+
+GitHub Enterprise Cloud (`copilot-api.<enterprise>.ghe.com`) is not one of these origins yet: core
+cannot admit a per-profile enterprise origin for pool rows. An env token with `COPILOT_GH_HOST` and
+`COPILOT_API_BASE_URL` set as above keeps working through core's env resolution, which re-exchanges
+it after a 401, but without pool rotation. `hermes auth add copilot` rows are not supported on GHEC.
 
 ## Premium requests
 

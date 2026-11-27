@@ -152,6 +152,7 @@ def test_selected_pair_is_transient_for_every_official_origin(monkeypatch, endpo
     "http://api.githubcopilot.com",
     "https://api.githubcopilot.com/relay",
     "https://api.githubcopilot.com:8443",
+    "https://copilot-api.acme.ghe.com",  # GHEC is not a pool origin yet (README § Credential-pool recovery)
 ])
 def test_foreign_exchange_route_cannot_retarget_pool(monkeypatch, endpoint):
     from agent.credential_pool import PooledCredential, CredentialPool
@@ -163,6 +164,54 @@ def test_foreign_exchange_route_cannot_retarget_pool(monkeypatch, endpoint):
     monkeypatch.setattr(credentials, "get_copilot_api_token", lambda token: (BEARER, endpoint))
     assert CredentialPool("copilot", [row]).prepare_runtime_entry(row) is None
     assert row.to_dict() == before
+
+
+@pytest.mark.parametrize("endpoint", ["https://copilot-api.acme.ghe.com", "https://api.githubcopilot.com.evil.example"])
+def test_renewal_cannot_retarget_pool_to_a_foreign_route(monkeypatch, endpoint):
+    from agent.credential_pool import PooledCredential, CredentialPool
+
+    row = PooledCredential(id="one", label="One", priority=0, provider="copilot",
+                           auth_type="api_key", source="manual", access_token=GRANT,
+                           base_url="https://api.githubcopilot.com")
+    before = row.to_dict()
+    monkeypatch.setattr(credentials, "exchange_copilot_token", lambda token: (BEARER, 4102444800, endpoint))
+    pool = CredentialPool("copilot", [row])
+
+    assert pool.try_refresh_runtime_matching(credential_id="one", api_key_hint=GRANT, reason="unauthorized") is None
+    assert (row.runtime_api_key, row.runtime_base_url) == (GRANT, "https://api.githubcopilot.com")
+    assert row.to_dict() == before
+
+
+def test_ghec_env_token_keeps_its_enterprise_endpoint_outside_the_pool(hermes_home, monkeypatch):
+    """GHEC is not a pool origin yet (README): the documented env setup still reaches its enterprise
+    endpoint through core's env resolution, and the pooled grant stays raw."""
+    ghec = "https://copilot-api.acme.ghe.com"
+    (hermes_home / "config.yaml").write_text("model:\n  provider: copilot\n  default: gpt-4.1\n")
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    monkeypatch.setenv("COPILOT_GH_HOST", "acme.ghe.com")
+    monkeypatch.setenv("COPILOT_API_BASE_URL", ghec)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", GRANT)
+    exchanged_at = []
+
+    def exchange(req, timeout, fp):
+        exchanged_at.append(req.full_url)
+        return {"token": BEARER, "expires_at": 4102444800, "endpoints": {"api": ghec}}
+
+    monkeypatch.setattr(credentials, "_fetch_exchange_with_retry", exchange)
+    monkeypatch.setattr(wire, "model_api_mode", lambda *a, **k: "chat_completions")
+
+    resolved = runtime_provider.resolve_runtime_provider(requested="copilot", target_model="gpt-4.1")
+
+    assert (resolved["api_key"], resolved["base_url"]) == (BEARER, ghec)
+    assert resolved.get("credential_pool") is None
+    assert set(exchanged_at) == {"https://api.acme.ghe.com/copilot_internal/v2/token"}
+    assert load_pool("copilot").entries()[0].access_token == GRANT
+    before_refresh = len(exchanged_at)
+    from providers import get_provider_profile
+
+    assert get_provider_profile("copilot").refresh_runtime_credentials(reason="unauthorized") == (BEARER, ghec)
+    assert len(exchanged_at) == before_refresh + 1
 
 
 def test_normal_preparation_keeps_same_account_raw_fallback(monkeypatch, caplog):
