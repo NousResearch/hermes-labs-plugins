@@ -2,7 +2,8 @@
 
 Fills the generic ProviderProfile wire seams (``providers/base.py`` L1 block). Every hook here is
 pure and answers from the arguments alone, except ``api_mode_for_model`` with an ``api_key``, which
-may read the account's cached live catalog to normalize the model id and choose its HTTP wire.
+may read the account's cached live catalog to normalize the model id and choose its HTTP wire (a
+pooled GitHub grant reads it through its exchanged bearer).
 """
 
 from __future__ import annotations
@@ -99,7 +100,15 @@ class CopilotWireMixin:
 
     def api_mode_for_model(self, model: str, *, api_key: str | None = None) -> str | None:
         # Keyless init/aux/fallback hooks are pure: normalize IDs but never borrow another account's cache.
-        return model_api_mode(model, catalog=[] if api_key is None else None, api_key=api_key)
+        if api_key is None:
+            return model_api_mode(model, catalog=[])
+        from .credentials import get_copilot_api_token, validate_copilot_token
+
+        # A pool row reaches this hook with its durable GitHub grant before core prepares the row. Read
+        # the catalog with the bearer the request will carry (the same cached exchange preparation uses).
+        if validate_copilot_token(api_key)[0]:
+            api_key = get_copilot_api_token(api_key)[0]
+        return model_api_mode(model, api_key=api_key)
 
     def client_headers(
         self, *, base_url: str, api_key: str = "", has_images: bool = False,
