@@ -141,7 +141,8 @@ def _send_target_kwargs(supported: set) -> dict[str, Any]:
 _OPTIONAL_ENTRY_KWARGS: dict[str, Any] = {
     "dashboard_label": "Yuanbao (元宝)",
     "dashboard_description": "Connect Hermes to Tencent Yuanbao.",
-    "dashboard_required_env": (),
+    # The adapter refuses to start without both, so the Channels card must ask for them before Enable.
+    "dashboard_required_env": ("YUANBAO_APP_ID", "YUANBAO_APP_SECRET"),
     "config_connected_fn": config_connected_extra("app_id", "app_secret"),
     "env_enable_credentials": gateway_env.ENV_ENABLE_CREDENTIALS,
     **gateway_env.AUTHZ,

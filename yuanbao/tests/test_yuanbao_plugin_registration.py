@@ -46,6 +46,20 @@ def test_register_shape_and_core_wiring_removed(monkeypatch):
     assert kw["standalone_send"].media is True
 
 
+def test_channels_card_requires_app_id_and_secret(monkeypatch):
+    """Desktop and the dashboard mark a card configured from its required env; an empty set told them
+    Yuanbao needs no credentials, so Enable started an adapter that could only fail."""
+    register_mod = importlib.import_module("yuanbao_plugin.register")
+    from gateway.platform_registry import PlatformEntry
+    from hermes_cli.web_server_messaging import _build_catalog_entry
+
+    monkeypatch.setattr(register_mod, "core_ships_yuanbao", lambda: False)
+    ctx = _Ctx()
+    register_mod.register(ctx)
+    card = _build_catalog_entry("yuanbao", PlatformEntry(**ctx.kwargs, source="plugin"))
+    assert set(card["required_env"]) == {"YUANBAO_APP_ID", "YUANBAO_APP_SECRET"}
+
+
 @pytest.mark.parametrize("module, name", [
     ("gateway.run", "_BUILTIN_ADAPTERS"),
     ("hermes_cli.gateway_setup_wizard", "_PLATFORMS"),
