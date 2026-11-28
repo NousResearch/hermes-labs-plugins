@@ -1,0 +1,19 @@
+[project]
+name = "hermes-dingtalk"
+version = "2.0.0"
+description = "DingTalk gateway platform for Hermes Agent (Hermes Labs plugin, unsupported)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nous Research" }]
+requires-python = ">=3.11"
+dependencies = [
+  # Same pins Hermes core's former ``dingtalk`` extra carried.
+  "dingtalk-stream==0.24.3",
+  "alibabacloud-dingtalk==2.2.65",
+  "qrcode==7.4.2",
+  # dingtalk-stream 0.24.3 cannot open its socket on websockets 16 (#24851); same pin core carried.
+  "websockets>=15.0.1,<16",
+]
+
+[project.urls]
+Homepage = "https://github.com/NousResearch/hermes-labs-plugins/tree/main/dingtalk"
