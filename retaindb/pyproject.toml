@@ -1,0 +1,15 @@
+[project]
+name = "hermes-retaindb"
+version = "2.0.0"
+description = "RetainDB memory provider for Hermes Agent (Hermes Labs plugin, unsupported)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nous Research" }]
+requires-python = ">=3.11"
+dependencies = [
+  # The provider's HTTP client. Hermes core ships requests too; the bound keeps an install resolvable against it.
+  "requests>=2.31,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/NousResearch/hermes-labs-plugins/tree/main/retaindb"
