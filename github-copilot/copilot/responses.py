@@ -8,9 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .helpers import base_url_host_matches
-
-_COPILOT_HOST = "githubcopilot.com"  # api.githubcopilot.com plus the api.<plan>.githubcopilot.com variants
+from .wire import is_copilot_host as _is_copilot_host
 
 
 def _is_connection_bound_replay_error(status_code: int | None, message: str) -> bool:
@@ -48,10 +46,6 @@ RESPONSES_PROFILE_FIELDS: dict[str, Any] = {
     # Copilot's Gemini models take tool-call ``extra_content`` signatures back like the native Gemini API.
     "replays_tool_call_signatures": True,
 }
-
-
-def _is_copilot_host(base_url: str) -> bool:
-    return base_url_host_matches(str(base_url or ""), _COPILOT_HOST)
 
 
 class CopilotResponsesMixin:

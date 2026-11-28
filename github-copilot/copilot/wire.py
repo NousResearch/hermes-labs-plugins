@@ -114,4 +114,6 @@ class CopilotWireMixin:
 
     def max_tokens_param(self, *, base_url: str, model: str = "") -> str | None:
         host = base_url_hostname(str(base_url or "")) or ""
-        return "max_completion_tokens" if host.endswith("." + _COPILOT_HOST) else None
+        if host.endswith("." + _COPILOT_HOST) or (host.startswith("copilot-api.") and host.endswith(".ghe.com")):
+            return "max_completion_tokens"
+        return None

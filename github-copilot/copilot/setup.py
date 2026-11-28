@@ -52,21 +52,43 @@ def _copilot_catalog(api_key: str):
 def copilot_api_key() -> tuple[str, str]:
     """``(Copilot API token, source env var)`` for a setup flow: the first supported env token,
     exchanged (the raw token when the exchange is unavailable); ``("", "")`` when there is none."""
-    from .credentials import get_copilot_api_token, resolve_copilot_token
+    import time
+
+    from .credentials import (
+        _record_token_base_url,
+        get_copilot_api_token,
+        resolve_copilot_token,
+    )
     raw, source = resolve_copilot_token()
-    return (get_copilot_api_token(raw)[0], source) if raw else ("", "")
+    if not raw:
+        return "", ""
+    api_token, base_url = get_copilot_api_token(raw)
+    if api_token:
+        _record_token_base_url(api_token, time.time() + 1800, base_url)
+    return api_token, source
 
 
 def _raw_model_ids(api_key: str) -> list:
     """Every id ``/models`` lists for this token (no chat filtering): the last resort when the
-    filtered catalog came back empty."""
-    from .catalog import COPILOT_MODELS_URL, _payload_items
+    filtered catalog fetch failed."""
+    from .catalog import _payload_items, copilot_catalog_models_url, copilot_default_headers
+    headers = copilot_default_headers(api_key=api_key)
+    if api_key:
+        headers = {**headers, "Authorization": f"Bearer {api_key}"}
     try:
-        items = _payload_items(get_json(COPILOT_MODELS_URL, timeout=5.0,
-                                        headers={"Authorization": f"Bearer {api_key}"} if api_key else {}))
+        items = _payload_items(get_json(copilot_catalog_models_url(api_key), timeout=5.0, headers=headers))
     except Exception:  # the picker falls back to the curated list
         return []
-    return [str(item.get("id")) for item in items if item.get("id")]
+    ids: list[str] = []
+    for item in items:
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            continue
+        policy = item.get("policy")
+        if isinstance(policy, dict) and str(policy.get("state") or "").strip().lower() == "disabled":
+            continue
+        ids.append(mid)
+    return ids
 
 
 def pick_model_or_prompt(model_list, prompt: str, **kwargs):
@@ -138,9 +160,10 @@ def model_flow_copilot(config, current_model="", args=None):
 
 
 def _model_flow_copilot(current_model):
+    from agent.secret_scope import get_secret
     from hermes_cli.model_setup import persist_model_selection
 
-    from .catalog import COPILOT_BASE_URL
+    from .catalog import _copilot_catalog_base_url
     from .wire import model_api_mode
 
     provider_id = "copilot"
@@ -156,9 +179,10 @@ def _model_flow_copilot(current_model):
         else:
             say("  GitHub token: ✓", "")
 
-    effective_base = COPILOT_BASE_URL
+    env_base = str(get_secret("COPILOT_API_BASE_URL") or "").strip().rstrip("/")
+    effective_base = env_base or _copilot_catalog_base_url(api_key)
     catalog, live_models, _normalize = _copilot_catalog(api_key)
-    if not catalog:
+    if catalog is None:
         live_models = _raw_model_ids(api_key)
 
     selected = pick_model_or_prompt(
@@ -168,6 +192,9 @@ def _model_flow_copilot(current_model):
         print("No change.")
         return
     selected = _normalize(selected)
+    # Persist the resolved Copilot base URL (explicit COPILOT_API_BASE_URL, exchanged enterprise
+    # base_url, or COPILOT_BASE_URL) so switching from another provider always overwrites any stale
+    # model.base_url left in config.yaml (core's persist_model_selection omits base_url only on None).
     persist_model_selection(selected, provider_id, base_url=effective_base,
                             api_mode=model_api_mode(selected, catalog=catalog, api_key=api_key))
     print(f"Default model set to: {selected} (via GitHub Copilot)")

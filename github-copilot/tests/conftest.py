@@ -178,14 +178,17 @@ def _reset_plugin_caches():
 
     def reset():
         credentials._jwt_cache.clear()
+        credentials._token_base_url_cache.clear()
         credentials._exchange_failure_cache.clear()
         credentials._reset_raw_degradation_warned()
         catalog._github_model_catalog_cache = None
         catalog._github_model_catalog_cache_key = None
+        catalog._github_model_catalog_cache_url = None
         catalog._github_model_catalog_cache_time = 0.0
         catalog._copilot_context_cache = {}
         catalog._copilot_context_cache_time = 0.0
         catalog._copilot_context_cache_key = None
+        catalog._copilot_context_cache_url = None
         with contextlib.suppress(Exception):
             from agent import provider_route_hooks
             provider_route_hooks._PURE_MEMO.clear()

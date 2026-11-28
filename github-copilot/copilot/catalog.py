@@ -125,6 +125,15 @@ def copilot_default_headers(*, is_agent_turn: bool = True, api_key: str = "") ->
 _COPILOT_CHAT_ENDPOINTS = {"/chat/completions", "/responses", "/v1/messages"}
 
 
+def _normalize_catalog_endpoint(endpoint: Any) -> str:
+    if not isinstance(endpoint, str):
+        return ""
+    cleaned = endpoint.strip().lower().rstrip("/")
+    if cleaned.startswith("/v1/") and cleaned != "/v1/messages":
+        cleaned = cleaned[3:]
+    return cleaned
+
+
 def _payload_items(payload: Any) -> list[dict[str, Any]]:
     data = payload.get("data", []) if isinstance(payload, dict) else payload
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
@@ -133,6 +142,9 @@ def _payload_items(payload: Any) -> list[dict[str, Any]]:
 def _copilot_catalog_item_is_text_model(
     item: dict[str, Any], *, ignore_picker_flag: bool = False) -> bool:
     if not str(item.get("id") or "").strip():
+        return False
+    policy = item.get("policy")
+    if isinstance(policy, dict) and str(policy.get("state") or "").strip().lower() == "disabled":
         return False
     if not ignore_picker_flag and item.get("model_picker_enabled") is False:
         return False
@@ -143,7 +155,7 @@ def _copilot_catalog_item_is_text_model(
             return False
     supported_endpoints = item.get("supported_endpoints")
     if isinstance(supported_endpoints, list):
-        endpoints = {e for endpoint in supported_endpoints if (e := str(endpoint).strip())}
+        endpoints = {e for endpoint in supported_endpoints if (e := _normalize_catalog_endpoint(endpoint))}
         if endpoints and not endpoints & _COPILOT_CHAT_ENDPOINTS:
             return False
     return True
@@ -169,18 +181,71 @@ def _copilot_text_models(items: list[dict[str, Any]], *, ignore_picker_flag: boo
 # previous account's catalog; monotonic clock; lock-free (a race at worst duplicates one fetch).
 _github_model_catalog_cache: Optional[list[dict[str, Any]]] = None
 _github_model_catalog_cache_key: Optional[str] = None
+_github_model_catalog_cache_url: Optional[str] = None
 _github_model_catalog_cache_time: float = 0.0
 _GITHUB_MODEL_CATALOG_CACHE_TTL = 300  # 5 minutes
 
 
+def _copilot_catalog_base_url(
+    api_key: Optional[str] = None, *, base_url: Optional[str] = None) -> str:
+    """Base URL whose ``/models`` endpoint serves *api_key*'s Copilot catalog.
+
+    Precedence: a Copilot API *base_url* passed by the caller (e.g. an enterprise/GHEC host), then
+    ``COPILOT_API_BASE_URL`` from the profile's secret scope, then the exchanged ``base_url``
+    associated with *api_key*, else ``COPILOT_BASE_URL``. GitHub Models inference hosts
+    (``models.github.ai``, ``models.inference.ai.azure.com``) share the Copilot metadata space
+    rather than serving Copilot's ``/models`` catalog at their own root, so they fall through.
+    """
+    from agent.secret_scope import get_secret
+
+    from .credentials import _trusted_copilot_api_base_url, exchanged_base_url_for_token
+
+    if trusted_explicit := _trusted_copilot_api_base_url(base_url):
+        return trusted_explicit
+    env_base = str(get_secret("COPILOT_API_BASE_URL") or "").strip().rstrip("/")
+    if env_base:
+        return env_base
+    if api_key and (exchanged_base := exchanged_base_url_for_token(api_key)):
+        return exchanged_base
+    return COPILOT_BASE_URL
+
+
+def copilot_catalog_models_url(
+    api_key: Optional[str] = None, *, base_url: Optional[str] = None) -> str:
+    """``/models`` URL for *api_key* / *base_url*."""
+    resolved_base = _copilot_catalog_base_url(api_key, base_url=base_url)
+    return resolved_base if resolved_base.endswith("/models") else f"{resolved_base}/models"
+
+
+def invalidate_copilot_catalog_cache() -> None:
+    """Drop in-process Copilot ``/models`` and context-window caches (``/model --refresh``)."""
+    global _github_model_catalog_cache, _github_model_catalog_cache_key
+    global _github_model_catalog_cache_url, _github_model_catalog_cache_time
+    global _copilot_context_cache, _copilot_context_cache_time, _copilot_context_cache_key
+    global _copilot_context_cache_url
+    _github_model_catalog_cache = None
+    _github_model_catalog_cache_key = None
+    _github_model_catalog_cache_url = None
+    _github_model_catalog_cache_time = 0.0
+    _copilot_context_cache = {}
+    _copilot_context_cache_time = 0.0
+    _copilot_context_cache_key = None
+    _copilot_context_cache_url = None
+
+
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0) -> Optional[list[dict[str, Any]]]:
+    api_key: Optional[str] = None, timeout: float = 5.0, *,
+    base_url: Optional[str] = None, force_refresh: bool = False,
+) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
     global _github_model_catalog_cache, _github_model_catalog_cache_key
-    global _github_model_catalog_cache_time
+    global _github_model_catalog_cache_url, _github_model_catalog_cache_time
+    models_url = copilot_catalog_models_url(api_key, base_url=base_url)
     if (
-        _github_model_catalog_cache is not None
+        not force_refresh
+        and _github_model_catalog_cache is not None
         and _github_model_catalog_cache_key == api_key
+        and (_github_model_catalog_cache_url in (None, models_url))
         and (time.monotonic() - _github_model_catalog_cache_time) < _GITHUB_MODEL_CATALOG_CACHE_TTL
     ):
         return copy.deepcopy(_github_model_catalog_cache)  # deep: callers must not mutate cached dicts
@@ -192,21 +257,29 @@ def fetch_github_model_catalog(
 
     for headers in attempts:
         try:
-            items = _payload_items(get_json(COPILOT_MODELS_URL, timeout=timeout, headers=headers))
+            items = _payload_items(get_json(models_url, timeout=timeout, headers=headers))
         except Exception:
             continue
-        models = _copilot_text_models(items)
-        if not models and items:
-            # GitHub has been observed returning ``model_picker_enabled: false`` for EVERY model on
-            # some accounts, which would strand the picker on the stale curated fallback. The flag
-            # is a display hint, not an availability contract — retry without it (chat/endpoint
-            # checks still apply).
-            models = _copilot_text_models(items, ignore_picker_flag=True)
+        # ``model_picker_enabled: false`` is VS Code's UI hint for folding secondary/legacy models
+        # out of its primary dropdown, not an API availability gate: accounts regularly serve
+        # callable chat models (e.g. ``gpt-5.4-nano``, ``gpt-4.1``, ``gpt-4o``) with the flag set
+        # to ``false`` alongside ``true`` rows. Keep ``true`` rows first, then append remaining
+        # chat-capable rows (org-disabled ``policy.state == "disabled"`` entries stay excluded).
+        primary_models = _copilot_text_models(items)
+        seen_ids = {str(m.get("id") or "").strip() for m in primary_models}
+        secondary_models = [
+            m for m in _copilot_text_models(items, ignore_picker_flag=True)
+            if str(m.get("id") or "").strip() not in seen_ids
+        ]
+        models = primary_models + secondary_models
         if models:
             _github_model_catalog_cache = copy.deepcopy(models)
             _github_model_catalog_cache_key = api_key
+            _github_model_catalog_cache_url = models_url
             _github_model_catalog_cache_time = time.monotonic()
             return models
+        if items:
+            return []
     return None
 
 
@@ -220,10 +293,13 @@ def copilot_picker_catalog(force_refresh: bool = False) -> Optional[list[str]]:
     ``static_models``) marked as a placeholder, never cached as the account's catalog."""
     from .activation import github_calls_allowed
 
+    if force_refresh:
+        invalidate_copilot_catalog_cache()
     try:
         # Provider listings (``hermes status``, pickers, Desktop) warm every listed provider's
         # catalog; a home that never chose Copilot keeps the curated list and GitHub is not called.
-        # Raw fallbacks are sent only to COPILOT_MODELS_URL; the first account that lists models wins.
+        # Raw fallbacks carry no exchanged base_url so they resolve to COPILOT_MODELS_URL (or an
+        # explicit COPILOT_API_BASE_URL); the first account that lists models wins.
         for api_key in (_resolve_copilot_catalog_api_key_candidates() or [""]) if github_calls_allowed() else ():
             if live := _fetch_github_models(api_key):
                 return live
@@ -234,8 +310,12 @@ def copilot_picker_catalog(force_refresh: bool = False) -> Optional[list[str]]:
 
 def _is_github_models_base_url(base_url: Optional[str]) -> bool:
     # Host match (never a URL prefix): the plan hosts api.<plan>.githubcopilot.com share the account's
-    # catalog, and ``https://api.githubcopilot.com.example`` is not GitHub.
-    return any(base_url_host_matches(str(base_url or "").strip(), host) for host in _CATALOG_HOSTS)
+    # catalog, GHEC serves copilot-api.<enterprise>.ghe.com, and ``https://api.githubcopilot.com.example``
+    # is not GitHub.
+    from .wire import is_copilot_host
+
+    cleaned = str(base_url or "").strip()
+    return is_copilot_host(cleaned) or any(base_url_host_matches(cleaned, host) for host in _CATALOG_HOSTS)
 
 
 # ─── context windows ───
@@ -244,10 +324,13 @@ def _is_github_models_base_url(base_url: Optional[str]) -> bool:
 _copilot_context_cache: dict[str, int] = {}
 _copilot_context_cache_time: float = 0.0
 _copilot_context_cache_key: Optional[str] = None  # fingerprint of the api_key the entry was fetched with
+_copilot_context_cache_url: Optional[str] = None
 _COPILOT_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
-def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> Optional[int]:
+def get_copilot_model_context(
+    model_id: str, api_key: Optional[str] = None, *, base_url: Optional[str] = None,
+) -> Optional[int]:
     """The model's context window from the live /models API (cached in-process 1h; a miss on a fresh
     cache does not re-fetch), or None.
 
@@ -255,23 +338,29 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
     prompt cap, and reporting the prompt cap understated the window (400k shown as 272k, #44).
     ``max_prompt_tokens`` stays the fallback for older payloads that carry only that field."""
     global _copilot_context_cache, _copilot_context_cache_time, _copilot_context_cache_key
+    global _copilot_context_cache_url
 
     # Keyed on the credential like fetch_github_model_catalog: the catalog (and its limits) is
     # per-account, so another profile's token must not be served this entry.
     from .credentials import _token_fingerprint
 
     key_fp = _token_fingerprint(api_key) if api_key else None
+    models_url = copilot_catalog_models_url(api_key, base_url=base_url)
     if (_copilot_context_cache and _copilot_context_cache_key == key_fp
+            and (_copilot_context_cache_url in (None, models_url))
             and (time.time() - _copilot_context_cache_time < _COPILOT_CONTEXT_CACHE_TTL)):
         return _copilot_context_cache.get(model_id)
 
-    catalog = fetch_github_model_catalog(api_key=api_key)
+    catalog = fetch_github_model_catalog(api_key=api_key, **({"base_url": base_url} if base_url else {}))
     if not catalog:
         return None
     cache: dict[str, int] = {}
     for item in catalog:
         mid = str(item.get("id") or "").strip()
-        limits = (item.get("capabilities") or {}).get("limits") or {}
+        caps = item.get("capabilities")
+        limits = caps.get("limits") if isinstance(caps, dict) else None
+        if not isinstance(limits, dict):
+            continue
         window = limits.get("max_context_window_tokens")
         if not (isinstance(window, int) and window > 0):
             window = limits.get("max_prompt_tokens")
@@ -280,6 +369,7 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
     _copilot_context_cache = cache
     _copilot_context_cache_time = time.time()
     _copilot_context_cache_key = key_fp
+    _copilot_context_cache_url = models_url
     return cache.get(model_id)
 
 
@@ -404,7 +494,7 @@ class CopilotCatalogMixin:
     """Catalog/metadata hooks for the Copilot profiles."""
 
     def live_context_length(self, model: str, *, api_key: str = "", base_url: str = "") -> int | None:
-        return get_copilot_model_context(model, api_key=api_key)
+        return get_copilot_model_context(model, api_key=api_key, base_url=base_url or None)
 
     def normalize_model_id(self, model: str, *, api_key: str = "") -> str | None:
         return normalize_copilot_model_id(model, api_key=api_key or None)
@@ -414,4 +504,17 @@ class CopilotCatalogMixin:
     ) -> tuple[list[str] | None, str, str] | None:
         if not _is_github_models_base_url(base_url):
             return None
-        return _fetch_github_models(api_key=api_key, timeout=timeout), COPILOT_MODELS_URL, COPILOT_BASE_URL
+        resolved_base = _copilot_catalog_base_url(api_key, base_url=base_url)
+        models_url = copilot_catalog_models_url(api_key, base_url=base_url)
+        if _fetch_github_models is _DEFAULT_FETCH_GITHUB_MODELS:
+            catalog = fetch_github_model_catalog(api_key=api_key, timeout=timeout, base_url=base_url)
+            models = [item.get("id", "") for item in catalog if item.get("id")] if catalog else None
+        else:
+            models = _fetch_github_models(api_key=api_key, timeout=timeout)
+        return models, models_url, resolved_base
+
+    def invalidate_catalog_cache(self) -> None:
+        invalidate_copilot_catalog_cache()
+
+
+_DEFAULT_FETCH_GITHUB_MODELS = _fetch_github_models
