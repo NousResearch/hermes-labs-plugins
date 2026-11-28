@@ -1,0 +1,18 @@
+name: byterover
+label: ByteRover
+version: 2.0.0
+requires_hermes: ">=0.22.0"  # oldest tested release: spawn_context_thread, strip_launch_profile_env
+description: >
+  ByteRover memory provider for Hermes Agent (Hermes Labs plugin: built by Nous Research,
+  not supported): a persistent knowledge tree with tiered retrieval (fuzzy text, then
+  LLM-driven search) through the external brv CLI, local-first with optional cloud sync.
+  Tools brv_query, brv_curate, brv_status. Formerly built into Hermes core.
+author: NousResearch
+homepage: https://github.com/NousResearch/hermes-labs-plugins/tree/main/byterover
+external_dependencies:
+  - name: brv
+    install: "npm install -g byterover-cli"  # or the install script documented at byterover.dev
+    check: "brv --version"
+config_keys:
+  - memory.byterover
+  - memory.provider_config  # legacy block name early docs used
